@@ -113,6 +113,25 @@ pub async fn sync_account<S: MailSource>(
     Ok(report)
 }
 
+/// Brings only the inbox up to date: its new messages, then its flags
+/// and deletions. For when the server reported flag changes or deletions
+/// there: the other folders are not looked at. Without a known inbox
+/// yet, the whole account is synchronised (see [`sync_account`]).
+pub async fn sync_inbox<S: MailSource>(
+    store: &Store,
+    source: &mut S,
+    account: AccountId,
+    mut on_progress: impl FnMut(&SyncReport),
+) -> Result<SyncReport, SyncError> {
+    let Some(folder) = store.folder_by_role(account, FolderRole::Inbox)? else {
+        return sync_account(store, source, account, on_progress).await;
+    };
+    let mut report = SyncReport::default();
+    sync_folder(store, source, &folder, &mut report, &mut on_progress).await?;
+    report.folders = 1;
+    Ok(report)
+}
+
 /// Fetches again, [`BATCH`] at a time and newest first, the headers of
 /// the folder's messages stored before Avero kept the threading and
 /// mailing-list headers, so that they join their conversations. Selects
@@ -779,6 +798,34 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(roles, vec![FolderRole::Inbox, FolderRole::Sent]);
         assert_eq!(total_rows(&store, account), 4);
+    }
+
+    #[tokio::test]
+    async fn inbox_sync_leaves_the_other_folders_alone() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        // Before any sync: the whole account.
+        source.add_folder("INBOX", &[], 1, vec![1, 2, 3]);
+        source.add_folder("Sent", &["\\Sent"], 1, vec![1]);
+        let report = sync_inbox(&store, &mut source, account, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(report.folders, 2);
+
+        source.folder("INBOX").seen.push(2);
+        source.folder("INBOX").uids.retain(|&uid| uid != 3);
+        source.folder("Sent").uids.push(2);
+        source.selects.clear();
+        let report = sync_inbox(&store, &mut source, account, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(source.selects, vec!["INBOX"]);
+        assert_eq!((report.folders, report.new_messages), (1, 0));
+        let inbox = store
+            .unified(FolderRole::Inbox, AccountFilter::Only(account), 10, 0)
+            .unwrap();
+        let seen: Vec<bool> = inbox.iter().map(|item| item.seen).collect();
+        assert_eq!(seen, vec![true, false]);
     }
 
     #[tokio::test]

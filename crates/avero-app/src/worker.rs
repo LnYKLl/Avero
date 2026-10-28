@@ -25,7 +25,7 @@ use avero_sync::parse::{guarded, parse_body};
 use avero_sync::search::{SEARCH_LIMIT, ServerHits, search_server};
 use avero_sync::smtp::{self, Outgoing, SendError};
 use avero_sync::source::{MailSource, SyncError};
-use avero_sync::sync::{Arrival, SyncReport, sync_account};
+use avero_sync::sync::{Arrival, SyncReport, sync_account, sync_inbox};
 use avero_sync::watch::{Change, InboxWatch};
 use iced::futures::stream::{self, BoxStream};
 use iced::futures::{Stream, StreamExt};
@@ -41,17 +41,27 @@ use tokio::sync::oneshot;
 pub const PREFETCH: usize = 30;
 
 /// How long the inbox watcher waits before connecting again after a
-/// failure: `first`, doubled after each new failure, at most `max`.
+/// failure: `first`, doubled after each new failure, at most `max`. And
+/// `updates`: how long the worker waits, after the server reported flag
+/// changes or deletions in the inbox, before syncing it (the ones that
+/// come meanwhile join that sync).
 #[derive(Debug, Clone, Copy)]
 struct Retry {
     first: Duration,
     max: Duration,
+    updates: Duration,
 }
 
 const WATCH_RETRY: Retry = Retry {
     first: Duration::from_secs(10),
     max: Duration::from_secs(10 * 60),
+    updates: Duration::from_secs(10),
 };
+
+/// For how long after the worker changed the inbox (flags, moves,
+/// deletions) the flag changes and deletions the server reports are
+/// taken for the echo of that change, and not synced.
+const OWN_ECHO: Duration = Duration::from_secs(10);
 
 /// Where the worker sends what happens to one job.
 pub type Reply = UnboundedSender<Event>;
@@ -696,12 +706,23 @@ async fn once_more_if_busy<T>(
     }
 }
 
+/// What a sync brings up to date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncScope {
+    /// Every folder synced (see `sync_account`).
+    Account,
+    /// The inbox only (see `sync_inbox`): after flag changes or
+    /// deletions there.
+    Inbox,
+}
+
 /// What a sync thread needs.
 struct SyncTask<C> {
     account: Account,
     db_path: PathBuf,
     login: Arc<Login<C>>,
     listeners: Listeners,
+    scope: SyncScope,
 }
 
 impl<C: Connector> SyncTask<C> {
@@ -738,6 +759,7 @@ impl<C: Connector> SyncTask<C> {
             }
         };
         let id = self.account.id;
+        let scope = self.scope;
         let listeners = &self.listeners;
         let mut session = None;
         let mut arrivals: Vec<Arrival> = Vec::new();
@@ -758,8 +780,9 @@ impl<C: Connector> SyncTask<C> {
                             let _ = reply.send(Event::Progress);
                         }
                     };
-                    let result = once_more_if_busy(BUSY_RETRY, async || {
-                        sync_account(store, session, id, &mut progress).await
+                    let result = once_more_if_busy(BUSY_RETRY, async || match scope {
+                        SyncScope::Account => sync_account(store, session, id, &mut progress).await,
+                        SyncScope::Inbox => sync_inbox(store, session, id, &mut progress).await,
                     })
                     .await;
                     // A retried attempt may fetch a batch again.
@@ -783,8 +806,8 @@ struct WatchTask<C> {
     account: Account,
     login: Arc<Login<C>>,
     retry: Retry,
-    /// Gets `()` each time the inbox changes.
-    changed: UnboundedSender<()>,
+    /// Gets each change of the inbox.
+    changed: UnboundedSender<Change>,
 }
 
 impl<C: Connector> WatchTask<C> {
@@ -816,7 +839,7 @@ impl<C: Connector> WatchTask<C> {
                 Ok(mut watcher) => {
                     while let Ok(change) = watcher.wait().await {
                         delay = self.retry.first;
-                        if change == Change::Changed && self.changed.send(()).is_err() {
+                        if change != Change::Quiet && self.changed.send(change).is_err() {
                             return;
                         }
                     }
@@ -834,9 +857,9 @@ impl<C: Connector> WatchTask<C> {
 
 /// An inbox watcher running on its own thread.
 struct RunningWatch {
-    /// `()` each time the inbox changes; closed when the watcher ends
-    /// on its own (credentials refused).
-    changes: UnboundedReceiver<()>,
+    /// Each change of the inbox; closed when the watcher ends on its own
+    /// (credentials refused).
+    changes: UnboundedReceiver<Change>,
     /// Dropping it (or sending) stops the watcher.
     cancel: Option<oneshot::Sender<()>>,
     /// Closed when the watcher's thread is done.
@@ -859,7 +882,9 @@ enum Wake {
     Job(Option<Job>),
     Synced(SyncEnd),
     /// The inbox changed (`Some`), or the watcher ended (`None`).
-    Watch(Option<()>),
+    Watch(Option<Change>),
+    /// The time to sync the inbox after flag changes came.
+    Updates,
 }
 
 /// Waits for the running sync to end; never ends when none runs.
@@ -872,8 +897,16 @@ async fn sync_end(sync: &mut Option<RunningSync>) -> SyncEnd {
     }
 }
 
+/// Waits until `due`; never ends when it is `None`.
+async fn wait_until(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Waits for news from the watcher; never ends when none runs.
-async fn watch_news(watch: &mut Option<RunningWatch>) -> Option<()> {
+async fn watch_news(watch: &mut Option<RunningWatch>) -> Option<Change> {
     match watch {
         Some(running) => running.changes.recv().await,
         None => std::future::pending().await,
@@ -905,6 +938,12 @@ struct Worker<C: Connector> {
     prefetch: VecDeque<MessageRef>,
     prefetch_replies: Vec<Reply>,
     prefetched: usize,
+    /// When the inbox is synced after the flag changes or deletions the
+    /// server reported (see `Retry::updates`).
+    updates_due: Option<tokio::time::Instant>,
+    /// Until when those reports are the echo of the worker's own changes
+    /// of the inbox (see `OWN_ECHO`).
+    own_echo_until: Option<tokio::time::Instant>,
 }
 
 impl<C: Connector> Worker<C> {
@@ -929,6 +968,8 @@ impl<C: Connector> Worker<C> {
             prefetch: VecDeque::new(),
             prefetch_replies: Vec::new(),
             prefetched: 0,
+            updates_due: None,
+            own_echo_until: None,
         }
     }
 
@@ -938,16 +979,20 @@ impl<C: Connector> Worker<C> {
     /// prefetch.
     async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
         loop {
+            let updates_due = self.updates_due;
             let wake = if self.prefetch.is_empty() {
                 tokio::select! {
                     job = jobs.recv() => Wake::Job(job),
                     end = sync_end(&mut self.sync) => Wake::Synced(end),
                     news = watch_news(&mut self.watch) => Wake::Watch(news),
+                    () = wait_until(updates_due) => Wake::Updates,
                 }
             } else if let Some(end) = self.sync_ended() {
                 Wake::Synced(end)
             } else if let Some(news) = self.watch_news_now() {
                 Wake::Watch(news)
+            } else if updates_due.is_some_and(|due| due <= tokio::time::Instant::now()) {
+                Wake::Updates
             } else {
                 match jobs.try_recv() {
                     Ok(job) => Wake::Job(Some(job)),
@@ -966,7 +1011,11 @@ impl<C: Connector> Worker<C> {
                 }
                 Wake::Job(None) => break,
                 Wake::Synced(end) => self.finish_sync(end).await,
-                Wake::Watch(Some(())) => self.sync_after_change(),
+                Wake::Watch(Some(change)) => self.inbox_changed(change),
+                Wake::Updates => {
+                    self.updates_due = None;
+                    self.sync_after_change(SyncScope::Inbox);
+                }
                 // The watcher ended on its own (credentials refused).
                 Wake::Watch(None) => self.watch = None,
             }
@@ -984,10 +1033,10 @@ impl<C: Connector> Worker<C> {
     }
 
     /// The watcher's news if there is some, without waiting.
-    fn watch_news_now(&mut self) -> Option<Option<()>> {
+    fn watch_news_now(&mut self) -> Option<Option<Change>> {
         let running = self.watch.as_mut()?;
         match running.changes.try_recv() {
-            Ok(()) => Some(Some(())),
+            Ok(change) => Some(Some(change)),
             Err(mpsc::error::TryRecvError::Empty) => None,
             Err(mpsc::error::TryRecvError::Disconnected) => Some(None),
         }
@@ -1146,10 +1195,42 @@ impl<C: Connector> Worker<C> {
         }
     }
 
+    /// The watcher reported a change of the inbox. New mail: a sync at
+    /// once. Flag changes or deletions: the inbox is synced a little
+    /// later (those that come meanwhile join), unless the worker just
+    /// changed the inbox itself (the server tells every session, the
+    /// watcher's too).
+    fn inbox_changed(&mut self, change: Change) {
+        let now = tokio::time::Instant::now();
+        match change {
+            Change::Arrived => {
+                // The whole sync covers the inbox's flags too.
+                self.updates_due = None;
+                self.sync_after_change(SyncScope::Account);
+            }
+            Change::Updated => {
+                let echo = self.own_echo_until.is_some_and(|until| now < until);
+                if !echo && self.updates_due.is_none() {
+                    self.updates_due = Some(now + self.retry.updates);
+                }
+            }
+            Change::Quiet => {}
+        }
+    }
+
+    /// Notes that the worker changes the inbox (see `OWN_ECHO`); for
+    /// changes of another folder, nothing to note (only the inbox is
+    /// watched).
+    fn changing(&mut self, folder: &str) {
+        if folder.eq_ignore_ascii_case("INBOX") {
+            self.own_echo_until = Some(tokio::time::Instant::now() + OWN_ECHO);
+        }
+    }
+
     /// The inbox changed: a sync must start after this moment. The one
     /// running may have passed the inbox already, so instead of joining
     /// it, the watch subscriber gets one more sync right after it.
-    fn sync_after_change(&mut self) {
+    fn sync_after_change(&mut self, scope: SyncScope) {
         let Some(events) = self.events.clone() else {
             return;
         };
@@ -1160,7 +1241,7 @@ impl<C: Connector> Worker<C> {
                     running.next.push(events);
                 }
             }
-            None => self.start_sync(vec![events]),
+            None => self.start_sync(vec![events], scope),
         }
     }
 
@@ -1223,10 +1304,10 @@ impl<C: Connector> Worker<C> {
             }
             return;
         }
-        self.start_sync(vec![reply]);
+        self.start_sync(vec![reply], SyncScope::Account);
     }
 
-    fn start_sync(&mut self, replies: Vec<Reply>) {
+    fn start_sync(&mut self, replies: Vec<Reply>, scope: SyncScope) {
         let listeners: Listeners = Arc::new(Mutex::new(replies));
         let (cancel, cancelled) = oneshot::channel();
         let (finished, done) = oneshot::channel();
@@ -1235,6 +1316,7 @@ impl<C: Connector> Worker<C> {
             db_path: self.db_path.clone(),
             login: self.login.clone(),
             listeners: listeners.clone(),
+            scope,
         };
         // If the thread cannot start, `finished` is dropped and the
         // listeners get `sync_stopped`.
@@ -1293,7 +1375,7 @@ impl<C: Connector> Worker<C> {
             }
         }
         if !running.next.is_empty() {
-            self.start_sync(running.next);
+            self.start_sync(running.next, SyncScope::Account);
         }
     }
 
@@ -1379,6 +1461,7 @@ impl<C: Connector> Worker<C> {
     async fn set_seen(&mut self, targets: &[MessageRef], seen: bool) -> Result<(), AccountError> {
         let mut result = Ok(());
         for (folder, (uids, _rows)) in by_folder(targets) {
+            self.changing(&folder);
             result = self
                 .with_session(async |session, _store| {
                     session.select(&folder).await?;
@@ -1403,6 +1486,7 @@ impl<C: Connector> Worker<C> {
     ) -> Result<(), AccountError> {
         let mut result = Ok(());
         for (folder, (uids, _rows)) in by_folder(targets) {
+            self.changing(&folder);
             result = self
                 .with_session(async |session, _store| {
                     session.select(&folder).await?;
@@ -1438,6 +1522,7 @@ impl<C: Connector> Worker<C> {
                 self.show(&rows);
                 continue;
             }
+            self.changing(&folder);
             let done = self
                 .with_session(async |session, _store| {
                     session.select(&folder).await?;
@@ -2227,6 +2312,8 @@ mod tests {
         /// Signalled when a folder list starts (the sync is running).
         listing: tokio::sync::Notify,
         lists: AtomicUsize,
+        /// SELECTs of a folder (a sync of the inbox alone lists nothing).
+        selects: AtomicUsize,
         connects: AtomicUsize,
         dropped: AtomicUsize,
         inbox: tokio::sync::Mutex<UnboundedReceiver<Result<Change, ()>>>,
@@ -2316,6 +2403,7 @@ mod tests {
             Ok(Vec::new())
         }
         async fn select(&mut self, _path: &str) -> Result<FolderStatus, SyncError> {
+            self.0.selects.fetch_add(1, Ordering::SeqCst);
             Ok(FolderStatus {
                 uid_validity: 1,
                 uid_next: Some(2),
@@ -2460,6 +2548,7 @@ mod tests {
             open: gate,
             listing: tokio::sync::Notify::new(),
             lists: AtomicUsize::new(0),
+            selects: AtomicUsize::new(0),
             connects: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             inbox: tokio::sync::Mutex::new(changes),
@@ -2483,6 +2572,7 @@ mod tests {
             Retry {
                 first: Duration::from_millis(10),
                 max: Duration::from_millis(40),
+                updates: Duration::from_millis(150),
             },
         );
         Fake {
@@ -2694,7 +2784,7 @@ mod tests {
         let mut events = fake.worker.watch();
         fake.server.watching.notified().await;
         assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
-        fake.inbox.send(Ok(Change::Changed)).unwrap();
+        fake.inbox.send(Ok(Change::Arrived)).unwrap();
         let event = next_final(&mut events).await;
         assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
         assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
@@ -2707,6 +2797,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flag_changes_bring_one_inbox_sync_a_little_later() {
+        let fake = fake_worker("watchflags");
+        fake.open.send(true).unwrap();
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        let started = std::time::Instant::now();
+        // Three changes in a row (read, starred, moved elsewhere).
+        for _ in 0..3 {
+            fake.inbox.send(Ok(Change::Updated)).unwrap();
+            fake.server.watching.notified().await;
+        }
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), 0);
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        // The inbox alone, once.
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_echo_of_avero_s_own_changes_brings_no_sync() {
+        let fake = fake_worker("watchecho");
+        fake.open.send(true).unwrap();
+        let _events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        // The user marks a message of the inbox read; the server tells
+        // the watcher's session too.
+        let target = fake.target.clone();
+        let _: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetSeen {
+                targets: vec![target],
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        let selected = fake.server.selects.load(Ordering::SeqCst);
+        fake.inbox.send(Ok(Change::Updated)).unwrap();
+        fake.server.watching.notified().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), selected);
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn inbox_change_during_a_sync_gets_a_sync_after_it() {
         let fake = fake_worker("watchsync");
         let mut events = fake.worker.watch();
@@ -2714,7 +2855,7 @@ mod tests {
         // A sync is running (it may have passed the inbox already).
         let first = start_sync(&fake.worker);
         fake.server.listing.notified().await;
-        fake.inbox.send(Ok(Change::Changed)).unwrap();
+        fake.inbox.send(Ok(Change::Arrived)).unwrap();
         // The watcher sent the change and waits again; give the worker
         // a moment to take it while the sync still runs.
         fake.server.watching.notified().await;
@@ -2744,7 +2885,7 @@ mod tests {
         assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 4);
         assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
         // The new connection still reports changes.
-        fake.inbox.send(Ok(Change::Changed)).unwrap();
+        fake.inbox.send(Ok(Change::Arrived)).unwrap();
         let event = next_final(&mut events).await;
         assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
     }

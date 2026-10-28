@@ -564,7 +564,7 @@ async fn idle_wakes_up_when_a_mail_arrives() {
     let waiting = tokio::time::timeout(Duration::from_secs(60), watch.wait());
     let (woken, ()) = tokio::join!(waiting, send);
     let change = woken.expect("woken up within a minute").unwrap();
-    assert_eq!(change, Change::Changed);
+    assert_eq!(change, Change::Arrived);
 
     let report = sync_account(&store, &mut source, account, |_| {})
         .await

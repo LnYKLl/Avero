@@ -4,13 +4,13 @@
 
 use crate::parse::HEADER_FIELDS;
 use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncError};
-use crate::watch::{Change, IDLE_RENEW, InboxWatch, POLL_EVERY};
+use crate::watch::{Change, IDLE_RENEW, InboxCount, InboxNews, InboxWatch, POLL_EVERY};
 use async_imap::error::Error as ImapError;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{
     AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
 };
-use async_imap::types::NameAttribute;
+use async_imap::types::{NameAttribute, UnsolicitedResponse};
 use async_imap::{Authenticator, Client, Session};
 use avero_core::model::{Credentials, Security, ServerConfig, ServerFlags};
 use futures::TryStreamExt;
@@ -828,6 +828,8 @@ pub struct ImapWatch {
     /// failed half-way).
     session: Option<Session<TlsStream<TcpStream>>>,
     idle: bool,
+    /// The size of the inbox as last seen (with IDLE).
+    count: InboxCount,
     /// What the last poll saw (without IDLE).
     last: Option<InboxState>,
 }
@@ -837,12 +839,14 @@ impl ImapWatch {
     /// inbox is opened read-only (EXAMINE) to be watched.
     pub async fn connect(cfg: &ServerConfig, creds: &Credentials) -> Result<ImapWatch, SyncError> {
         let ImapSource { mut session, caps } = ImapSource::connect(cfg, creds).await?;
+        let mut count = InboxCount::default();
         if caps.idle {
-            examine_inbox(&mut session).await?;
+            count = examine_inbox(&mut session).await?;
         }
         Ok(ImapWatch {
             session: Some(session),
             idle: caps.idle,
+            count,
             last: None,
         })
     }
@@ -859,7 +863,7 @@ impl InboxWatch for ImapWatch {
             return Err(SyncError::Connect("connection given up".to_string()));
         };
         let change = if self.idle {
-            let (back, change) = idle_once(session, IDLE_RENEW).await?;
+            let (back, change) = idle_once(session, IDLE_RENEW, &mut self.count).await?;
             session = back;
             change
         } else {
@@ -870,38 +874,79 @@ impl InboxWatch for ImapWatch {
     }
 }
 
-/// Opens the inbox read-only, so that IDLE reports its changes.
-async fn examine_inbox<T>(session: &mut Session<T>) -> Result<(), SyncError>
+/// Opens the inbox read-only, so that IDLE reports its changes. Returns
+/// its size.
+async fn examine_inbox<T>(session: &mut Session<T>) -> Result<InboxCount, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
     let examining = async { session.examine("INBOX").await.map_err(command_error) };
-    with_timeout(COMMAND_TIMEOUT, "EXAMINE", examining)
-        .await
-        .map(|_| ())
+    let mailbox = with_timeout(COMMAND_TIMEOUT, "EXAMINE", examining).await?;
+    Ok(InboxCount {
+        exists: mailbox.exists,
+        recent: mailbox.recent,
+    })
+}
+
+/// What a response of the server says about the watched inbox.
+fn news_of(response: &Response) -> InboxNews {
+    match response {
+        Response::MailboxData(MailboxDatum::Exists(n)) => InboxNews::Exists(*n),
+        Response::MailboxData(MailboxDatum::Recent(n)) => InboxNews::Recent(*n),
+        Response::Expunge(_) | Response::Vanished { .. } => InboxNews::Expunge,
+        Response::Fetch(..) => InboxNews::Fetch,
+        _ => InboxNews::Other,
+    }
+}
+
+/// The responses the library set aside (those that came with a command,
+/// or after the first piece of news of an IDLE), in order.
+fn set_aside<T>(session: &mut Session<T>) -> Vec<InboxNews>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let mut news = Vec::new();
+    while let Ok(response) = session.unsolicited_responses.try_recv() {
+        news.push(match response {
+            UnsolicitedResponse::Exists(n) => InboxNews::Exists(n),
+            UnsolicitedResponse::Recent(n) => InboxNews::Recent(n),
+            UnsolicitedResponse::Expunge(_) => InboxNews::Expunge,
+            UnsolicitedResponse::Other(data) => news_of(data.parsed()),
+            _ => InboxNews::Other,
+        });
+    }
+    news
 }
 
 /// Sends IDLE and waits for any news from the server, at most `limit`
 /// (the server's keep-alive lines are not news), then sends DONE. Gives
-/// the session back for the next round.
+/// the session back for the next round. What the news mean is judged
+/// against `count`, the size of the inbox seen so far (see
+/// `InboxCount::change`), which is kept up to date.
 async fn idle_once<T>(
-    session: Session<T>,
+    mut session: Session<T>,
     limit: Duration,
+    count: &mut InboxCount,
 ) -> Result<(Session<T>, Change), SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
+    // News that came between two rounds.
+    let before = count.change(&set_aside(&mut session));
+    if before != Change::Quiet {
+        return Ok((session, before));
+    }
     let mut handle = session.idle();
     let starting = async { handle.init().await.map_err(command_error) };
     with_timeout(COMMAND_TIMEOUT, "IDLE", starting).await?;
-    let change = {
+    let mut news = {
         // Dropping `_stop` would end the wait at once: keep it alive.
         let (waiting, _stop) = handle.wait_with_timeout(limit);
         // The library's own limit starts again after every keep-alive
         // line; this one makes sure IDLE is renewed in time.
         match timeout(limit, waiting).await {
-            Err(_) | Ok(Ok(IdleResponse::Timeout)) => Change::Quiet,
-            Ok(Ok(IdleResponse::NewData(_))) => Change::Changed,
+            Err(_) | Ok(Ok(IdleResponse::Timeout)) => Vec::new(),
+            Ok(Ok(IdleResponse::NewData(data))) => vec![news_of(data.parsed())],
             // Since `_stop` is kept, only the end of the connection
             // stops the wait this way.
             Ok(Ok(IdleResponse::ManualInterrupt)) => {
@@ -913,8 +958,10 @@ where
         }
     };
     let ending = async { handle.done().await.map_err(command_error) };
-    let session = with_timeout(COMMAND_TIMEOUT, "DONE", ending).await?;
-    Ok((session, change))
+    let mut session = with_timeout(COMMAND_TIMEOUT, "DONE", ending).await?;
+    // What came after the first piece of news, until DONE was answered.
+    news.extend(set_aside(&mut session));
+    Ok((session, count.change(&news)))
 }
 
 /// What a STATUS of the inbox says, compared from one poll to the next.
@@ -958,10 +1005,25 @@ where
     }
     tokio::time::sleep(every).await;
     let now = inbox_state(session).await?;
-    if last.replace(now) == Some(now) {
-        Ok(Change::Quiet)
+    let Some(before) = last.replace(now) else {
+        return Ok(Change::Quiet);
+    };
+    Ok(compare_states(before, now))
+}
+
+/// What changed in the inbox between two polls: new mail if it holds
+/// more messages, got a new UID or new UIDs altogether; otherwise a
+/// deletion if its size changed.
+fn compare_states(before: InboxState, now: InboxState) -> Change {
+    if now.uid_validity != before.uid_validity
+        || now.exists > before.exists
+        || now.uid_next > before.uid_next
+    {
+        Change::Arrived
+    } else if now != before {
+        Change::Updated
     } else {
-        Ok(Change::Changed)
+        Change::Quiet
     }
 }
 
@@ -1743,10 +1805,39 @@ mod tests {
             "{tag} OK IDLE terminated\r\n",
         ])
         .await;
-        let (session, change) = idle_once(session, IDLE_RENEW).await.unwrap();
-        assert_eq!(change, Change::Changed);
+        let mut count = InboxCount {
+            exists: 4,
+            recent: 0,
+        };
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Arrived);
+        assert_eq!(count.exists, 5);
         let sent = commands(session, server).await;
         assert_eq!(sent, vec!["IDLE", "DONE"]);
+    }
+
+    #[tokio::test]
+    async fn idle_tells_flag_changes_from_new_mail() {
+        // Marked read elsewhere (or by Avero's own session), then a
+        // message expunged and one arrived while DONE was on its way.
+        let (session, server) = session_recording(vec![
+            "+ idling\r\n* 2 FETCH (FLAGS (\\Seen))\r\n",
+            "{tag} OK IDLE terminated\r\n",
+            "+ idling\r\n* 3 EXPUNGE\r\n",
+            "* 5 EXISTS\r\n{tag} OK IDLE terminated\r\n",
+        ])
+        .await;
+        let mut count = InboxCount {
+            exists: 5,
+            recent: 0,
+        };
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Updated);
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Arrived);
+        assert_eq!(count.exists, 5);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["IDLE", "DONE", "IDLE", "DONE"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1757,7 +1848,8 @@ mod tests {
             "{tag} OK IDLE terminated\r\n",
         ])
         .await;
-        let (session, change) = idle_once(session, IDLE_RENEW).await.unwrap();
+        let mut count = InboxCount::default();
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
         assert_eq!(change, Change::Quiet);
         let sent = commands(session, server).await;
         assert_eq!(sent, vec!["IDLE", "DONE"]);
@@ -1783,7 +1875,7 @@ mod tests {
         let mut client = Client::new(client_side);
         client.read_response().await.unwrap().unwrap();
         let session = login(client, "user", "pw").await.unwrap();
-        let result = idle_once(session, IDLE_RENEW).await;
+        let result = idle_once(session, IDLE_RENEW, &mut InboxCount::default()).await;
         assert!(
             matches!(result, Err(SyncError::Connect(_))),
             "{:?}",
@@ -1798,8 +1890,9 @@ mod tests {
                 "* STATUS INBOX (MESSAGES {messages} UIDNEXT {next} UIDVALIDITY 1)\r\n{{tag}} OK\r\n"
             )
         };
-        let (first, same, more) = (status(2, 10), status(2, 10), status(3, 11));
-        let (mut session, server) = session_recording(vec![&first, &same, &more]).await;
+        let (first, same, more, fewer) =
+            (status(2, 10), status(2, 10), status(3, 11), status(2, 11));
+        let (mut session, server) = session_recording(vec![&first, &same, &more, &fewer]).await;
         let mut last = None;
         let quiet = poll_once(&mut session, &mut last, POLL_EVERY)
             .await
@@ -1808,11 +1901,15 @@ mod tests {
         let changed = poll_once(&mut session, &mut last, POLL_EVERY)
             .await
             .unwrap();
-        assert_eq!(changed, Change::Changed);
+        assert_eq!(changed, Change::Arrived);
+        let deleted = poll_once(&mut session, &mut last, POLL_EVERY)
+            .await
+            .unwrap();
+        assert_eq!(deleted, Change::Updated);
         let sent = commands(session, server).await;
         assert_eq!(
             sent,
-            vec!["STATUS \"INBOX\" (MESSAGES UIDNEXT UIDVALIDITY)"; 3]
+            vec!["STATUS \"INBOX\" (MESSAGES UIDNEXT UIDVALIDITY)"; 4]
         );
     }
 
