@@ -33,8 +33,8 @@ pub enum Field {
     SmtpPort,
 }
 
-/// The state of the add-account card.
-#[derive(Debug, Clone)]
+/// The state of the add-account card. `Debug` hides the password.
+#[derive(Clone)]
 pub struct AccountForm {
     pub stage: Stage,
     pub email: String,
@@ -58,6 +58,24 @@ pub struct AccountForm {
     pub error: Option<String>,
     /// Bumped on every new background job, to ignore stale answers.
     pub generation: u64,
+}
+
+impl std::fmt::Debug for AccountForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountForm")
+            .field("stage", &self.stage)
+            .field("email", &self.email)
+            .field("password", &"***")
+            .field("username", &self.username)
+            .field("imap_host", &self.imap_host)
+            .field("imap_port", &self.imap_port)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_security", &self.smtp_security)
+            .field("error", &self.error)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AccountForm {
@@ -98,7 +116,12 @@ impl AccountForm {
             Field::ImapHost => self.imap_host = value,
             Field::ImapPort => self.imap_port = value,
             Field::SmtpHost => self.smtp_host = value,
-            Field::SmtpPort => self.smtp_port = value,
+            Field::SmtpPort => {
+                if let Some(security) = security_for_port(&value) {
+                    self.smtp_security = security;
+                }
+                self.smtp_port = value;
+            }
         }
     }
 
@@ -289,6 +312,16 @@ pub fn default_name(email: &str) -> String {
     }
 }
 
+/// The SMTP encryption a typed port implies: 465 is implicit TLS, 587
+/// STARTTLS; any other port keeps the user's choice.
+pub fn security_for_port(port: &str) -> Option<Security> {
+    match port.trim() {
+        "465" => Some(Security::Tls),
+        "587" => Some(Security::StartTls),
+        _ => None,
+    }
+}
+
 fn parse_port(text: &str) -> Option<u16> {
     text.trim().parse::<u16>().ok().filter(|&p| p >= 1)
 }
@@ -309,6 +342,28 @@ mod tests {
         form.set(Field::Email, " jean@gmail.com ".into());
         form.apply_detection(avero_autoconfig::known("jean@gmail.com"), oauth_configured);
         form
+    }
+
+    #[test]
+    fn smtp_security_follows_a_typed_port() {
+        let mut form = AccountForm::new();
+        form.set(Field::SmtpPort, "587".into());
+        assert_eq!(form.smtp_security, Security::StartTls);
+        form.set(Field::SmtpPort, " 465 ".into());
+        assert_eq!(form.smtp_security, Security::Tls);
+        // Another port keeps the choice made with the toggle.
+        form.smtp_security = Security::StartTls;
+        form.set(Field::SmtpPort, "2525".into());
+        assert_eq!(form.smtp_security, Security::StartTls);
+        assert_eq!(form.smtp_port, "2525");
+    }
+
+    #[test]
+    fn debug_never_shows_the_password() {
+        let mut form = AccountForm::new();
+        form.set(Field::Password, "Sup3r-Secret!".into());
+        let debug = format!("{form:?}");
+        assert!(!debug.contains("Sup3r-Secret!"), "{debug}");
     }
 
     #[test]

@@ -12,14 +12,31 @@ use std::time::Duration;
 /// Maximum time for each step of the SMTP exchange.
 const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A message to send. Addresses are `addr@host` or `Name <addr@host>`.
+/// One recipient: a bare address and an optional display name, kept
+/// apart so a name holding `@`, `:`, `(` or a comma is never re-parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recipient {
+    pub name: Option<String>,
+    pub addr: String,
+}
+
+impl Recipient {
+    pub fn new(name: Option<&str>, addr: &str) -> Recipient {
+        Recipient {
+            name: name.map(str::to_string),
+            addr: addr.to_string(),
+        }
+    }
+}
+
+/// A message to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
     pub from_name: Option<String>,
     pub from_addr: String,
-    pub to: Vec<String>,
-    pub cc: Vec<String>,
-    pub bcc: Vec<String>,
+    pub to: Vec<Recipient>,
+    pub cc: Vec<Recipient>,
+    pub bcc: Vec<Recipient>,
     pub subject: String,
     /// Plain text.
     pub body: String,
@@ -66,6 +83,19 @@ pub async fn send(
     let transport = transport(cfg, creds)?;
     transport.send(message).await.map_err(send_error)?;
     Ok(raw)
+}
+
+/// Connects to the SMTP server and logs in, without sending anything:
+/// checks the settings of a new account.
+pub async fn check(cfg: &ServerConfig, creds: &Credentials) -> Result<(), SendError> {
+    let transport = transport(cfg, creds)?;
+    match transport.test_connection().await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SendError::Connect(
+            "le serveur ne répond plus après la connexion".to_string(),
+        )),
+        Err(error) => Err(send_error(error)),
+    }
 }
 
 /// The SMTP connection settings: TLS from the first byte, or STARTTLS
@@ -165,11 +195,21 @@ pub fn build_message(msg: &Outgoing) -> Result<Message, SendError> {
     built.map_err(|e| SendError::InvalidAddress(e.to_string()))
 }
 
-/// Parses one recipient (`addr` or `Name <addr>`).
-fn mailbox(text: &str) -> Result<Mailbox, SendError> {
-    text.trim()
+/// A lettre mailbox built from the name and address as they are (the
+/// name is encoded by lettre, never parsed).
+fn mailbox(recipient: &Recipient) -> Result<Mailbox, SendError> {
+    let addr = recipient
+        .addr
+        .trim()
         .parse()
-        .map_err(|_| SendError::InvalidAddress(text.to_string()))
+        .map_err(|_| SendError::InvalidAddress(recipient.addr.clone()))?;
+    let name = recipient
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    Ok(Mailbox::new(name, addr))
 }
 
 /// A unique `<random@domain>` Message-ID, on the sender's domain (the
@@ -201,9 +241,12 @@ mod tests {
         Outgoing {
             from_name: Some("Marie Durand".into()),
             from_addr: "marie@ex.com".into(),
-            to: vec!["Paul <paul@ex.com>".into(), "zoe@ex.com".into()],
-            cc: vec!["chef@ex.com".into()],
-            bcc: vec!["secret@ex.com".into()],
+            to: vec![
+                Recipient::new(Some("Paul"), "paul@ex.com"),
+                Recipient::new(None, "zoe@ex.com"),
+            ],
+            cc: vec![Recipient::new(None, "chef@ex.com")],
+            bcc: vec![Recipient::new(None, "secret@ex.com")],
             subject: "Réunion de jeudi".into(),
             body: "Bonjour,\n\nÀ jeudi.".into(),
             in_reply_to: None,
@@ -297,7 +340,7 @@ mod tests {
     #[test]
     fn invalid_addresses_are_errors() {
         let mut msg = outgoing();
-        msg.to.push("pas une adresse".into());
+        msg.to.push(Recipient::new(None, "pas une adresse"));
         let error = build_message(&msg).unwrap_err();
         assert!(matches!(&error, SendError::InvalidAddress(a) if a == "pas une adresse"));
 
@@ -319,6 +362,29 @@ mod tests {
     }
 
     #[test]
+    fn names_with_special_characters_are_kept_whole() {
+        let mut msg = outgoing();
+        msg.to = vec![
+            Recipient::new(Some("Dupont, Jean (RH): jean@old.fr"), "j@ex.com"),
+            Recipient::new(Some("Zoé \"la chef\""), "zoe@ex.com"),
+        ];
+        let raw = formatted(&msg);
+        let parsed = parse_body(&raw);
+        let to: Vec<(Option<&str>, &str)> = parsed
+            .to
+            .iter()
+            .map(|a| (a.name.as_deref(), a.addr.as_str()))
+            .collect();
+        assert_eq!(
+            to,
+            vec![
+                (Some("Dupont, Jean (RH): jean@old.fr"), "j@ex.com"),
+                (Some("Zoé \"la chef\""), "zoe@ex.com"),
+            ]
+        );
+    }
+
+    #[test]
     fn message_ids_are_unique() {
         let a = new_message_id("a@ex.com");
         let b = new_message_id("a@ex.com");
@@ -335,6 +401,21 @@ mod tests {
             security: Security::Tls,
         };
         let result = send(&cfg, &Credentials::Password("hunter2".into()), &outgoing()).await;
+        match result {
+            Err(SendError::Connect(text)) => assert!(!text.contains("hunter2"), "{text}"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_reports_an_unreachable_server() {
+        let cfg = ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: "u".into(),
+            security: Security::Tls,
+        };
+        let result = check(&cfg, &Credentials::Password("hunter2".into())).await;
         match result {
             Err(SendError::Connect(text)) => assert!(!text.contains("hunter2"), "{text}"),
             other => panic!("unexpected result: {other:?}"),

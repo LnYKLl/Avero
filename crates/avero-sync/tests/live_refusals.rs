@@ -4,7 +4,7 @@
 
 use avero_core::model::{Credentials, Security, ServerConfig};
 use avero_sync::imap::ImapSource;
-use avero_sync::smtp::{Outgoing, SendError, send};
+use avero_sync::smtp::{Outgoing, Recipient, SendError, check, send};
 use avero_sync::source::SyncError;
 
 fn server(host: &str, port: u16, security: Security) -> ServerConfig {
@@ -27,7 +27,7 @@ fn message() -> Outgoing {
     Outgoing {
         from_name: None,
         from_addr: "avero.test.nobody@gmail.com".to_string(),
-        to: vec!["avero.test.nobody@gmail.com".to_string()],
+        to: vec![Recipient::new(None, "avero.test.nobody@gmail.com")],
         cc: Vec::new(),
         bcc: Vec::new(),
         subject: "test".to_string(),
@@ -96,4 +96,20 @@ async fn gmail_smtp_starttls_refuses_bad_oauth_token() {
         "{:?}",
         result.err()
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn gmail_smtp_check_refuses_wrong_password() {
+    let cfg = server("smtp.gmail.com", 465, Security::Tls);
+    let result = check(&cfg, &Credentials::Password("wrong".into())).await;
+    assert!(matches!(result, Err(SendError::Auth(_))), "{result:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn gmail_smtp_check_starttls_refuses_wrong_password() {
+    let cfg = server("smtp.gmail.com", 587, Security::StartTls);
+    let result = check(&cfg, &Credentials::Password("wrong".into())).await;
+    assert!(matches!(result, Err(SendError::Auth(_))), "{result:?}");
 }

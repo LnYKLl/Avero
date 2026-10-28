@@ -2,7 +2,7 @@
 //! attachment limits and the final `Outgoing` sent by SMTP.
 
 use avero_sync::parse::{Address, ParsedBody};
-use avero_sync::smtp::{Outgoing, OutgoingAttachment};
+use avero_sync::smtp::{Outgoing, OutgoingAttachment, Recipient};
 use chrono::{Local, TimeZone};
 use std::sync::Arc;
 
@@ -56,7 +56,14 @@ fn prefixed(subject: &str, prefix: &str, known: &[&str]) -> String {
     }
 }
 
-/// `Name <addr>`, quoting the name when it holds a comma or quote.
+/// Characters that force a display name into quotes (RFC 5322 specials).
+const NAME_SPECIALS: [char; 13] = [
+    ',', '"', ';', '<', '>', '@', ':', '(', ')', '[', ']', '\\', '.',
+];
+
+/// `Name <addr>` as shown in the address fields, quoting the name (with
+/// `\"` and `\\` escapes) when it holds a special character, so that
+/// [`split_addresses`] and [`parse_recipient`] give it back unchanged.
 pub fn format_address(address: &Address) -> String {
     match address
         .name
@@ -64,8 +71,9 @@ pub fn format_address(address: &Address) -> String {
         .map(str::trim)
         .filter(|n| !n.is_empty())
     {
-        Some(name) if name.contains([',', '"', ';', '<', '>']) => {
-            format!("\"{}\" <{}>", name.replace('"', "'"), address.addr)
+        Some(name) if name.contains(NAME_SPECIALS) => {
+            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\" <{}>", address.addr)
         }
         Some(name) => format!("{name} <{}>", address.addr),
         None => address.addr.clone(),
@@ -73,13 +81,23 @@ pub fn format_address(address: &Address) -> String {
 }
 
 /// Splits `a@x, "Dupont, Jean" <j@y>; b@z` into addresses, honouring
-/// quotes. Empty entries are dropped.
+/// quotes (and `\"` inside them). Empty entries are dropped.
 pub fn split_addresses(input: &str) -> Vec<String> {
     let mut list = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
+    let mut escaped = false;
     for c in input.chars() {
+        if escaped {
+            escaped = false;
+            current.push(c);
+            continue;
+        }
         match c {
+            '\\' if quoted => {
+                escaped = true;
+                current.push(c);
+            }
             '"' => {
                 quoted = !quoted;
                 current.push(c);
@@ -102,12 +120,48 @@ fn push_trimmed(list: &mut Vec<String>, entry: &str) {
     }
 }
 
+/// Reads one entry of an address field: `addr`, `Name <addr>` or
+/// `"Quoted, Name" <addr>`. The name is unquoted and unescaped; it is
+/// never parsed again (lettre encodes it as it is).
+pub fn parse_recipient(entry: &str) -> Recipient {
+    let entry = entry.trim();
+    let (Some(start), true) = (entry.rfind('<'), entry.ends_with('>')) else {
+        return Recipient {
+            name: None,
+            addr: entry.to_string(),
+        };
+    };
+    let addr = entry[start + 1..entry.len() - 1].trim().to_string();
+    let raw_name = entry[..start].trim();
+    let name = match raw_name
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(quoted) => unescape(quoted),
+        None => raw_name.to_string(),
+    };
+    Recipient {
+        name: Some(name).filter(|n| !n.trim().is_empty()),
+        addr,
+    }
+}
+
+/// Removes the backslashes of a quoted string (`\"` → `"`).
+fn unescape(quoted: &str) -> String {
+    let mut out = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// The bare address inside `Name <addr>` (or the entry itself).
 pub fn bare_address(entry: &str) -> String {
-    match (entry.rfind('<'), entry.rfind('>')) {
-        (Some(start), Some(end)) if start < end => entry[start + 1..end].trim().to_string(),
-        _ => entry.trim().to_string(),
-    }
+    parse_recipient(entry).addr
 }
 
 /// Whether an address looks deliverable (`x@y.z`, no spaces).
@@ -329,12 +383,13 @@ pub fn build(draft: Draft<'_>) -> Result<Outgoing, String> {
             human_size(MAX_ATTACHMENTS)
         ));
     }
+    let recipients = |list: Vec<String>| list.iter().map(|e| parse_recipient(e)).collect();
     Ok(Outgoing {
         from_name: Some(draft.from_name.to_string()).filter(|n| !n.trim().is_empty()),
         from_addr: draft.from_addr.to_string(),
-        to,
-        cc,
-        bcc,
+        to: recipients(to),
+        cc: recipients(cc),
+        bcc: recipients(bcc),
         subject: draft.subject.trim().to_string(),
         body: draft.body,
         in_reply_to: draft.in_reply_to,
@@ -468,6 +523,47 @@ mod tests {
     }
 
     #[test]
+    fn odd_names_survive_the_address_field() {
+        for name in [
+            "Dupont, Jean",
+            "jean@old.fr",
+            "Service: RH (Paris)",
+            "Zoé \"la chef\"",
+            "C:\\dossier",
+            "J. Martin",
+        ] {
+            let formatted = format_address(&addr(Some(name), "j@y.fr"));
+            let typed = format!("a@x.fr, {formatted}; b@z.fr");
+            let entries = split_addresses(&typed);
+            assert_eq!(entries.len(), 3, "{typed}");
+            assert_eq!(
+                parse_recipient(&entries[1]),
+                Recipient::new(Some(name), "j@y.fr"),
+                "{formatted}"
+            );
+            assert!(looks_valid(&entries[1]));
+        }
+    }
+
+    #[test]
+    fn typed_recipients_are_read_robustly() {
+        assert_eq!(
+            parse_recipient("  Jean Dupont <j@y.fr> "),
+            Recipient::new(Some("Jean Dupont"), "j@y.fr")
+        );
+        assert_eq!(parse_recipient("<j@y.fr>"), Recipient::new(None, "j@y.fr"));
+        assert_eq!(parse_recipient("j@y.fr"), Recipient::new(None, "j@y.fr"));
+        assert_eq!(
+            split_addresses("\"a, b\" <a@x.fr>, \"c \\\" d, e\" <c@x.fr>"),
+            vec!["\"a, b\" <a@x.fr>", "\"c \\\" d, e\" <c@x.fr>"]
+        );
+        assert_eq!(
+            parse_recipient("\"c \\\" d, e\" <c@x.fr>").name.as_deref(),
+            Some("c \" d, e")
+        );
+    }
+
+    #[test]
     fn address_validation() {
         assert!(looks_valid("a@x.fr"));
         assert!(looks_valid("Jean <j@y.fr>"));
@@ -502,8 +598,14 @@ mod tests {
             build(draft("a@x.fr, oops", &[])).unwrap_err(),
             "Adresse invalide : oops"
         );
-        let out = build(draft("a@x.fr", &[])).unwrap();
-        assert_eq!(out.to, vec!["a@x.fr"]);
+        let out = build(draft("a@x.fr, \"Dupont, Jean\" <j@y.fr>", &[])).unwrap();
+        assert_eq!(
+            out.to,
+            vec![
+                Recipient::new(None, "a@x.fr"),
+                Recipient::new(Some("Dupont, Jean"), "j@y.fr")
+            ]
+        );
         assert_eq!(out.subject, "Salut");
         assert_eq!(out.from_name.as_deref(), Some("Moi"));
     }
