@@ -102,7 +102,35 @@ pub struct ParsedBody {
 /// HTML is turned into plain text locally; nothing is ever fetched from
 /// the network (no images, no style sheets).
 pub fn parse_body(raw: &[u8]) -> ParsedBody {
-    let mut body = ParsedBody {
+    match MessageParser::default().parse(raw) {
+        Some(message) => body_of(&message),
+        None => empty_body(),
+    }
+}
+
+/// Like [`parse_body`], and also decodes every attachment in the same
+/// pass: `data[i]` holds the bytes of `body.attachments[i]`.
+pub fn parse_with_attachments(raw: &[u8]) -> (ParsedBody, Vec<Vec<u8>>) {
+    let Some(message) = MessageParser::default().parse(raw) else {
+        return (empty_body(), Vec::new());
+    };
+    let body = body_of(&message);
+    let data = message
+        .attachments()
+        .map(|part| part.contents().to_vec())
+        .collect();
+    (body, data)
+}
+
+/// Runs a parsing job, turning a panic of the MIME or HTML libraries
+/// into a readable error instead of bringing the caller down.
+pub fn guarded<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .map_err(|_| "Ce message n'a pas pu être analysé".to_string())
+}
+
+fn empty_body() -> ParsedBody {
+    ParsedBody {
         from: None,
         to: Vec::new(),
         cc: Vec::new(),
@@ -113,11 +141,11 @@ pub fn parse_body(raw: &[u8]) -> ParsedBody {
         references: None,
         text: String::new(),
         attachments: Vec::new(),
-    };
-    let Some(message) = MessageParser::default().parse(raw) else {
-        return body;
-    };
+    }
+}
 
+fn body_of(message: &mail_parser::Message<'_>) -> ParsedBody {
+    let mut body = empty_body();
     body.from = message.from().and_then(|a| addresses(a).into_iter().next());
     body.to = message.to().map(addresses).unwrap_or_default();
     body.cc = message.cc().map(addresses).unwrap_or_default();
@@ -128,7 +156,7 @@ pub fn parse_body(raw: &[u8]) -> ParsedBody {
     }
     body.message_id = message.message_id().map(|id| format!("<{id}>"));
     body.references = id_list(message.references()).or_else(|| id_list(message.in_reply_to()));
-    body.text = normalize_text(&readable_text(&message));
+    body.text = normalize_text(&readable_text(message));
     body.attachments = message
         .attachments()
         .enumerate()
@@ -490,6 +518,17 @@ JVBERi0xLjQKJcOkw7zDtsOfCg==\r\n\
             Some(&pdf_bytes[..])
         );
         assert_eq!(attachment_data(MIXED_WITH_PDF.as_bytes(), 1), None);
+
+        let (again, data) = parse_with_attachments(MIXED_WITH_PDF.as_bytes());
+        assert_eq!(again, body);
+        assert_eq!(data, vec![pdf_bytes.to_vec()]);
+    }
+
+    #[test]
+    fn guarded_turns_a_panic_into_an_error() {
+        assert_eq!(guarded(|| 2 + 2), Ok(4));
+        let error = guarded(|| -> u8 { panic!("html2text exploded") }).unwrap_err();
+        assert_eq!(error, "Ce message n'a pas pu être analysé");
     }
 
     #[test]
