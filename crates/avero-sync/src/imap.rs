@@ -1,11 +1,13 @@
-//! The real IMAP client: TLS on port 993 (or whatever the account says).
+//! The real IMAP client: implicit TLS on port 993 (or whatever the account
+//! says), logged in with a password (LOGIN) or an OAuth2 token
+//! (AUTHENTICATE XOAUTH2).
 
 use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncError};
 use async_imap::error::Error as ImapError;
 use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
 use async_imap::types::NameAttribute;
-use async_imap::{Client, Session};
-use avero_core::model::ServerConfig;
+use async_imap::{Authenticator, Client, Session};
+use avero_core::model::{Credentials, Security, ServerConfig};
 use futures::TryStreamExt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -21,26 +23,49 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring};
 
 /// Maximum time for TCP connect + TLS handshake + server greeting.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Maximum time for LOGIN, LIST and SELECT.
+/// Maximum time for LOGIN, LIST, SELECT, STORE, MOVE...
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maximum time for one UID FETCH (one batch of up to 500 headers).
+/// Maximum time for one UID FETCH of headers or flags (one batch).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum time to download or upload one full message (attachments
+/// included).
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Optional server features we use, read once after login.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ServerCaps {
+    /// `UID MOVE` (RFC 6851).
+    move_command: bool,
+    /// `UID EXPUNGE` (RFC 4315).
+    uidplus: bool,
+}
 
 /// A logged-in connection to an IMAP server.
+///
+/// Folder-scoped operations (`fetch_headers`, `fetch_flags`, `fetch_body`,
+/// `set_seen`, `move_to`) act on the folder chosen by the last `select`.
 pub struct ImapSource {
     session: Session<TlsStream<TcpStream>>,
+    caps: ServerCaps,
 }
 
 impl ImapSource {
-    /// Connects over TLS and logs in.
-    pub async fn connect(cfg: &ServerConfig, password: &str) -> Result<ImapSource, SyncError> {
+    /// Connects over implicit TLS, logs in and reads the server's
+    /// capabilities. IMAP over STARTTLS is refused.
+    pub async fn connect(cfg: &ServerConfig, creds: &Credentials) -> Result<ImapSource, SyncError> {
+        if cfg.security == Security::StartTls {
+            return Err(SyncError::Connect(
+                "IMAP exige le TLS implicite (STARTTLS n'est pas pris en charge)".to_string(),
+            ));
+        }
         let connecting = open_client(cfg);
         let client = match timeout(CONNECT_TIMEOUT, connecting).await {
             Ok(result) => result?,
             Err(_) => return Err(SyncError::Connect("connection timed out".to_string())),
         };
-        let session = login(client, &cfg.username, password).await?;
-        Ok(ImapSource { session })
+        let mut session = authenticate(client, &cfg.username, creds).await?;
+        let caps = read_caps(&mut session).await?;
+        Ok(ImapSource { session, caps })
     }
 }
 
@@ -92,6 +117,24 @@ async fn with_timeout<T>(
     }
 }
 
+/// Logs in with whatever the credentials hold: LOGIN with `username` for
+/// a password, AUTHENTICATE XOAUTH2 with the token's own user for OAuth2.
+async fn authenticate<T>(
+    client: Client<T>,
+    username: &str,
+    creds: &Credentials,
+) -> Result<Session<T>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    match creds {
+        Credentials::Password(password) => login(client, username, password).await,
+        Credentials::OAuth2 { user, access_token } => {
+            authenticate_xoauth2(client, user, access_token).await
+        }
+    }
+}
+
 /// Sends LOGIN. Works on any stream, so tests can use an in-memory one.
 async fn login<T>(
     client: Client<T>,
@@ -109,6 +152,67 @@ where
             .map_err(|(e, _client)| login_error(e))
     };
     with_timeout(COMMAND_TIMEOUT, "LOGIN", logging_in).await
+}
+
+/// The SASL XOAUTH2 exchange. The first challenge (empty) gets the token
+/// string; any later one is the server's error report (JSON), which must
+/// be answered with an empty line before the server sends its tagged NO.
+struct XOAuth2 {
+    initial: Option<String>,
+}
+
+impl XOAuth2 {
+    fn new(user: &str, access_token: &str) -> XOAuth2 {
+        XOAuth2 {
+            initial: Some(xoauth2_string(user, access_token)),
+        }
+    }
+}
+
+impl Authenticator for XOAuth2 {
+    type Response = String;
+
+    fn process(&mut self, _challenge: &[u8]) -> String {
+        self.initial.take().unwrap_or_default()
+    }
+}
+
+/// `user={user}^Aauth=Bearer {token}^A^A` (RFC 7628 style, used by Google
+/// and Microsoft). The library base64-encodes it.
+fn xoauth2_string(user: &str, access_token: &str) -> String {
+    format!("user={user}\x01auth=Bearer {access_token}\x01\x01")
+}
+
+/// Sends AUTHENTICATE XOAUTH2; errors are classified like LOGIN's.
+async fn authenticate_xoauth2<T>(
+    client: Client<T>,
+    user: &str,
+    access_token: &str,
+) -> Result<Session<T>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let authenticating = async {
+        // As for LOGIN, the error only holds the server's answer.
+        client
+            .authenticate("XOAUTH2", XOAuth2::new(user, access_token))
+            .await
+            .map_err(|(e, _client)| login_error(e))
+    };
+    with_timeout(COMMAND_TIMEOUT, "AUTHENTICATE", authenticating).await
+}
+
+/// Asks for CAPABILITY once, to know whether MOVE and UIDPLUS exist.
+async fn read_caps<T>(session: &mut Session<T>) -> Result<ServerCaps, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let asking = async { session.capabilities().await.map_err(command_error) };
+    let caps = with_timeout(COMMAND_TIMEOUT, "CAPABILITY", asking).await?;
+    Ok(ServerCaps {
+        move_command: caps.has_str("MOVE"),
+        uidplus: caps.has_str("UIDPLUS"),
+    })
 }
 
 /// Only a NO or BAD answer from the server means "wrong credentials";
@@ -150,27 +254,29 @@ fn attribute_text(attribute: &NameAttribute<'_>) -> String {
     }
 }
 
-/// Sends `UID FETCH` and reads every answer up to the one tagged for it.
+/// `1,5,9` for a UID STORE/COPY/MOVE/EXPUNGE.
+fn uid_set(uids: &[u32]) -> String {
+    uids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Sends a `UID FETCH` command and reads every answer up to the one tagged
+/// for it, passing the attributes of each FETCH answer to `on_fetch`.
 ///
 /// We do not use async-imap's `uid_fetch`: its stream simply ends when the
 /// server answers NO or BAD, so a refused fetch would look like an empty
 /// folder. Here a refusal is a `SyncError::Protocol`.
-async fn fetch_headers_from<T>(
+async fn run_uid_fetch<T>(
     session: &mut Session<T>,
-    from_uid: u32,
-    to_uid: Option<u32>,
-) -> Result<Vec<FetchedHeader>, SyncError>
+    command: &str,
+    mut on_fetch: impl FnMut(&[AttributeValue<'_>]),
+) -> Result<(), SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
-    let range = match to_uid {
-        Some(to) => format!("{from_uid}:{to}"),
-        None => format!("{from_uid}:*"),
-    };
-    let command = format!("UID FETCH {range} (UID FLAGS BODY.PEEK[HEADER])");
-    let tag = session.run_command(&command).await.map_err(command_error)?;
-
-    let mut headers = Vec::new();
+    let tag = session.run_command(command).await.map_err(command_error)?;
     loop {
         let response = match session.read_response().await {
             Ok(Some(response)) => response,
@@ -185,30 +291,87 @@ where
                 outcome,
             } if *done_tag == tag => {
                 if *status == Status::Ok {
-                    return Ok(headers);
+                    return Ok(());
                 }
                 let reason = outcome.information.as_deref().unwrap_or("");
                 return Err(SyncError::Protocol(format!(
                     "UID FETCH refused: {status:?} {reason}"
                 )));
             }
-            Response::Fetch(_, attributes) => {
-                if let Some(header) = header_from_fetch(attributes, from_uid) {
-                    headers.push(header);
-                }
-            }
+            Response::Fetch(_, attributes) => on_fetch(attributes),
             // Other answers (EXISTS, EXPUNGE, ...) are not needed here.
             _ => {}
         }
     }
 }
 
-/// Builds a `FetchedHeader` from the attributes of one FETCH answer.
-/// Returns `None` if the UID or the header block is missing.
-fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option<FetchedHeader> {
+/// Headers (with UID and flags) of the messages in `from_uid..=to_uid`.
+async fn fetch_headers_from<T>(
+    session: &mut Session<T>,
+    from_uid: u32,
+    to_uid: Option<u32>,
+) -> Result<Vec<FetchedHeader>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let range = match to_uid {
+        Some(to) => format!("{from_uid}:{to}"),
+        None => format!("{from_uid}:*"),
+    };
+    let command = format!("UID FETCH {range} (UID FLAGS BODY.PEEK[HEADER])");
+    let mut headers = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        headers.extend(header_from_fetch(attributes, from_uid));
+    })
+    .await?;
+    Ok(headers)
+}
+
+/// `(uid, seen)` of every message from `from_uid` up.
+async fn fetch_flags_from<T>(
+    session: &mut Session<T>,
+    from_uid: u32,
+) -> Result<Vec<(u32, bool)>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("UID FETCH {from_uid}:* (UID FLAGS)");
+    let mut flags = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        let (uid, seen, _) = read_fetch(attributes);
+        // `N:*` always returns the last message, even below N.
+        if let Some(uid) = uid.filter(|&uid| uid >= from_uid) {
+            flags.push((uid, seen));
+        }
+    })
+    .await?;
+    Ok(flags)
+}
+
+/// The full raw message, without setting `\Seen` (BODY.PEEK).
+/// `None` when the server has no message with this UID.
+async fn fetch_body_of<T>(session: &mut Session<T>, uid: u32) -> Result<Option<Vec<u8>>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("UID FETCH {uid} (UID BODY.PEEK[])");
+    let mut body = None;
+    run_uid_fetch(session, &command, |attributes| {
+        let (fetched_uid, _, data) = read_fetch(attributes);
+        if fetched_uid == Some(uid) && data.is_some() {
+            body = data;
+        }
+    })
+    .await?;
+    Ok(body)
+}
+
+/// UID, seen flag and body section (whole message or header) of one
+/// FETCH answer.
+fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, bool, Option<Vec<u8>>) {
     let mut uid = None;
     let mut seen = false;
-    let mut raw = None;
+    let mut data = None;
     for attribute in attributes {
         match attribute {
             AttributeValue::Uid(value) => uid = Some(*value),
@@ -216,16 +379,22 @@ fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option
                 seen = flags.iter().any(|flag| flag.eq_ignore_ascii_case(r"\Seen"));
             }
             AttributeValue::BodySection {
-                section: Some(SectionPath::Full(MessageSection::Header)),
-                data: Some(data),
+                section: None | Some(SectionPath::Full(MessageSection::Header)),
+                data: Some(bytes),
                 ..
             }
-            | AttributeValue::Rfc822Header(Some(data)) => raw = Some(data.to_vec()),
+            | AttributeValue::Rfc822(Some(bytes))
+            | AttributeValue::Rfc822Header(Some(bytes)) => data = Some(bytes.to_vec()),
             _ => {}
         }
     }
+    (uid, seen, data)
+}
 
-    let (Some(uid), Some(raw)) = (uid, raw) else {
+/// Builds a `FetchedHeader` from the attributes of one FETCH answer.
+/// Returns `None` if the UID or the header block is missing.
+fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option<FetchedHeader> {
+    let (Some(uid), seen, Some(raw)) = read_fetch(attributes) else {
         return None;
     };
     // `N:*` always returns the last message, even below N.
@@ -233,6 +402,99 @@ fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option
         return None;
     }
     Some(FetchedHeader { uid, seen, raw })
+}
+
+/// Runs a command that only needs a tagged OK (STORE, COPY, EXPUNGE...).
+async fn run_checked<T>(session: &mut Session<T>, command: &str) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let name = command.split(' ').take(2).collect::<Vec<_>>().join(" ");
+    let running = async {
+        session
+            .run_command_and_check_ok(command)
+            .await
+            .map_err(command_error)
+    };
+    with_timeout(COMMAND_TIMEOUT, &name, running).await
+}
+
+/// Adds or removes `\Seen` on the given messages of the selected folder.
+async fn store_seen<T>(session: &mut Session<T>, uids: &[u32], seen: bool) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let sign = if seen { '+' } else { '-' };
+    let command = format!("UID STORE {} {sign}FLAGS.SILENT (\\Seen)", uid_set(uids));
+    run_checked(session, &command).await
+}
+
+/// Moves messages of the selected folder to `dest`: UID MOVE when the
+/// server has it, else COPY, mark `\Deleted` and expunge (only those UIDs
+/// with UIDPLUS; a plain EXPUNGE also removes other messages already
+/// marked `\Deleted` in the folder).
+async fn move_uids<T>(
+    session: &mut Session<T>,
+    caps: ServerCaps,
+    uids: &[u32],
+    dest: &str,
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let set = uid_set(uids);
+    let dest = quote_mailbox(dest)?;
+    if caps.move_command {
+        return run_checked(session, &format!("UID MOVE {set} {dest}")).await;
+    }
+    run_checked(session, &format!("UID COPY {set} {dest}")).await?;
+    run_checked(
+        session,
+        &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
+    )
+    .await?;
+    if caps.uidplus {
+        run_checked(session, &format!("UID EXPUNGE {set}")).await
+    } else {
+        run_checked(session, "EXPUNGE").await
+    }
+}
+
+/// Adds a raw message to `folder`, flagged `\Seen` if asked.
+async fn append_to<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    raw: &[u8],
+    seen: bool,
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let flags = if seen { Some(r"(\Seen)") } else { None };
+    let appending = async {
+        session
+            .append(folder, flags, None, raw)
+            .await
+            .map_err(command_error)
+    };
+    with_timeout(TRANSFER_TIMEOUT, "APPEND", appending).await
+}
+
+/// A mailbox name as an IMAP quoted string. Line breaks cannot be quoted.
+fn quote_mailbox(name: &str) -> Result<String, SyncError> {
+    if name.contains(['\r', '\n']) {
+        return Err(SyncError::Protocol("invalid folder name".to_string()));
+    }
+    Ok(format!(
+        "\"{}\"",
+        name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 impl MailSource for ImapSource {
@@ -266,6 +528,7 @@ impl MailSource for ImapSource {
         Ok(FolderStatus {
             uid_validity,
             uid_next: mailbox.uid_next,
+            exists: mailbox.exists,
         })
     }
 
@@ -277,43 +540,115 @@ impl MailSource for ImapSource {
         let fetching = fetch_headers_from(&mut self.session, from_uid, to_uid);
         with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
+
+    async fn fetch_flags(&mut self, from_uid: u32) -> Result<Vec<(u32, bool)>, SyncError> {
+        let fetching = fetch_flags_from(&mut self.session, from_uid);
+        with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
+    }
+
+    async fn fetch_body(&mut self, uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
+        let fetching = fetch_body_of(&mut self.session, uid);
+        with_timeout(TRANSFER_TIMEOUT, "UID FETCH", fetching).await
+    }
+
+    async fn set_seen(&mut self, uids: &[u32], seen: bool) -> Result<(), SyncError> {
+        store_seen(&mut self.session, uids, seen).await
+    }
+
+    async fn move_to(&mut self, uids: &[u32], dest: &str) -> Result<(), SyncError> {
+        move_uids(&mut self.session, self.caps, uids, dest).await
+    }
+
+    async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError> {
+        append_to(&mut self.session, folder, raw, seen).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+    use tokio::task::JoinHandle;
 
-    /// A tiny scripted IMAP server. For each command line the client sends,
-    /// it writes the next reply (`{tag}` becomes the command's tag).
-    /// Then it keeps the connection open until the client goes away.
-    async fn fake_server(stream: DuplexStream, replies: Vec<String>) {
+    /// A tiny scripted IMAP server. For each line the client sends, it
+    /// writes the next reply (`{tag}` becomes the tag of the last command;
+    /// a line without a space, such as a SASL answer or an APPEND literal,
+    /// keeps the previous tag). Then it reads one more line and hangs up,
+    /// returning every line it received.
+    async fn fake_server(stream: DuplexStream, replies: Vec<String>) -> Vec<String> {
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
+        let mut received = Vec::new();
         write
             .write_all(b"* OK fake server ready\r\n")
             .await
             .unwrap();
+        let mut tag = String::new();
         for reply in replies {
             let Ok(Some(line)) = lines.next_line().await else {
-                return;
+                return received;
             };
-            let tag = line.split(' ').next().unwrap_or("");
+            if let Some((first, _)) = line.split_once(' ') {
+                tag = first.to_string();
+            }
+            received.push(line);
             write
-                .write_all(reply.replace("{tag}", tag).as_bytes())
+                .write_all(reply.replace("{tag}", &tag).as_bytes())
                 .await
                 .unwrap();
         }
-        let _ = lines.next_line().await;
+        // One more line (or the end of the connection), then hang up.
+        if let Ok(Some(line)) = lines.next_line().await {
+            received.push(line);
+        }
+        received
+    }
+
+    /// A client connected to a fake server, greeting already read; the
+    /// handle gives the lines the server received once the client is gone.
+    async fn client_recording(
+        replies: Vec<String>,
+    ) -> (Client<DuplexStream>, JoinHandle<Vec<String>>) {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(fake_server(server_side, replies));
+        let mut client = Client::new(client_side);
+        client.read_response().await.unwrap().unwrap();
+        (client, server)
     }
 
     /// A client connected to a fake server, greeting already read.
     async fn client_for(replies: Vec<String>) -> Client<DuplexStream> {
-        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(fake_server(server_side, replies));
-        let mut client = Client::new(client_side);
-        client.read_response().await.unwrap().unwrap();
-        client
+        client_recording(replies).await.0
+    }
+
+    /// A logged-in session on a fake server whose next replies are
+    /// `replies`, and the handle to the lines it received.
+    async fn session_recording(
+        replies: Vec<&str>,
+    ) -> (Session<DuplexStream>, JoinHandle<Vec<String>>) {
+        let mut script = vec![LOGIN_OK.to_string()];
+        script.extend(replies.into_iter().map(String::from));
+        let (client, server) = client_recording(script).await;
+        let session = login(client, "user", "pw").await.unwrap();
+        (session, server)
+    }
+
+    /// Commands the server received after LOGIN, without their tags.
+    async fn commands(
+        session: Session<DuplexStream>,
+        server: JoinHandle<Vec<String>>,
+    ) -> Vec<String> {
+        drop(session);
+        server
+            .await
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .map(|line| match line.split_once(' ') {
+                Some((_tag, rest)) => rest.to_string(),
+                _ => line,
+            })
+            .collect()
     }
 
     /// One FETCH answer carrying `header` as a literal.
@@ -325,6 +660,7 @@ mod tests {
     }
 
     const LOGIN_OK: &str = "{tag} OK logged in\r\n";
+    const OK: &str = "{tag} OK done\r\n";
 
     #[tokio::test]
     async fn login_refused_is_auth_error() {
@@ -410,5 +746,228 @@ mod tests {
             command_error(ImapError::ConnectionLost),
             SyncError::Connect(_)
         ));
+    }
+
+    #[test]
+    fn xoauth2_string_has_sasl_layout() {
+        assert_eq!(
+            xoauth2_string("a@x.com", "tok"),
+            "user=a@x.com\x01auth=Bearer tok\x01\x01"
+        );
+        let mut auth = XOAuth2::new("a@x.com", "tok");
+        assert_eq!(auth.process(b""), "user=a@x.com\x01auth=Bearer tok\x01\x01");
+        // The error report that follows a refusal gets an empty answer.
+        assert_eq!(auth.process(b"{\"status\":\"401\"}"), "");
+    }
+
+    #[tokio::test]
+    async fn xoauth2_sends_the_token_and_logs_in() {
+        let (client, server) =
+            client_recording(vec!["+ \r\n".into(), "{tag} OK welcome\r\n".into()]).await;
+        let creds = Credentials::OAuth2 {
+            user: "a@x.com".into(),
+            access_token: "tok".into(),
+        };
+
+        let session = authenticate(client, "ignored", &creds).await.unwrap();
+
+        drop(session);
+        let lines = server.await.unwrap();
+        assert!(lines[0].ends_with("AUTHENTICATE XOAUTH2"), "{lines:?}");
+        // base64("user=a@x.com\x01auth=Bearer tok\x01\x01")
+        assert_eq!(lines[1], "dXNlcj1hQHguY29tAWF1dGg9QmVhcmVyIHRvawEB");
+    }
+
+    #[tokio::test]
+    async fn xoauth2_refused_is_auth_error() {
+        let (client, _server) = client_recording(vec![
+            "+ \r\n".into(),
+            "+ eyJzdGF0dXMiOiI0MDEifQ==\r\n".into(),
+            "{tag} NO [AUTHENTICATIONFAILED] Invalid credentials\r\n".into(),
+        ])
+        .await;
+        let creds = Credentials::OAuth2 {
+            user: "a@x.com".into(),
+            access_token: "expired".into(),
+        };
+        let result = authenticate(client, "a@x.com", &creds).await;
+        match result {
+            Err(SyncError::Auth(text)) => assert!(!text.contains("expired"), "{text}"),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("authentication should fail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn password_credentials_use_login() {
+        let (client, server) = client_recording(vec![LOGIN_OK.into()]).await;
+        let creds = Credentials::Password("pw".into());
+        let session = authenticate(client, "user", &creds).await.unwrap();
+        drop(session);
+        let lines = server.await.unwrap();
+        assert!(lines[0].contains("LOGIN \"user\" \"pw\""), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn starttls_imap_is_refused_before_connecting() {
+        let cfg = ServerConfig {
+            host: "imap.example.com".into(),
+            port: 143,
+            username: "u".into(),
+            security: Security::StartTls,
+        };
+        let result = ImapSource::connect(&cfg, &Credentials::Password("pw".into())).await;
+        assert!(matches!(result, Err(SyncError::Connect(_))));
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_read_once() {
+        let (mut session, _server) = session_recording(vec![
+            "* CAPABILITY IMAP4rev1 UIDPLUS MOVE IDLE\r\n{tag} OK\r\n",
+        ])
+        .await;
+        let caps = read_caps(&mut session).await.unwrap();
+        assert_eq!(
+            caps,
+            ServerCaps {
+                move_command: true,
+                uidplus: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_flags_reads_seen_and_skips_lower_uids() {
+        let reply = "* 1 FETCH (UID 3 FLAGS (\\Seen))\r\n\
+                     * 2 FETCH (UID 7 FLAGS (\\Answered \\Seen))\r\n\
+                     * 3 FETCH (UID 9 FLAGS ())\r\n\
+                     {tag} OK done\r\n";
+        let (mut session, server) = session_recording(vec![reply]).await;
+
+        let flags = fetch_flags_from(&mut session, 5).await.unwrap();
+
+        assert_eq!(flags, vec![(7, true), (9, false)]);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID FETCH 5:* (UID FLAGS)"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_flags_refused_is_protocol_error() {
+        let (mut session, _server) = session_recording(vec!["{tag} BAD invalid set\r\n"]).await;
+        let result = fetch_flags_from(&mut session, 1).await;
+        assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_body_peeks_whole_message() {
+        let raw = "Subject: a\r\n\r\nbody\r\n";
+        let reply = format!(
+            "* 1 FETCH (UID 9 BODY[] {{{}}}\r\n{raw})\r\n{{tag}} OK done\r\n",
+            raw.len()
+        );
+        let (mut session, server) = session_recording(vec![&reply, OK]).await;
+
+        let body = fetch_body_of(&mut session, 9).await.unwrap();
+        assert_eq!(body.as_deref(), Some(raw.as_bytes()));
+        // No FETCH answer: the message is gone.
+        assert_eq!(fetch_body_of(&mut session, 10).await.unwrap(), None);
+
+        let sent = commands(session, server).await;
+        assert_eq!(sent[0], "UID FETCH 9 (UID BODY.PEEK[])");
+    }
+
+    #[tokio::test]
+    async fn set_seen_stores_silently() {
+        let (mut session, server) = session_recording(vec![OK, OK]).await;
+        store_seen(&mut session, &[1, 4], true).await.unwrap();
+        store_seen(&mut session, &[2], false).await.unwrap();
+        // Nothing to do: no command sent.
+        store_seen(&mut session, &[], true).await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec![
+                "UID STORE 1,4 +FLAGS.SILENT (\\Seen)",
+                "UID STORE 2 -FLAGS.SILENT (\\Seen)"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_store_is_protocol_error() {
+        let (mut session, _server) = session_recording(vec!["{tag} NO read-only\r\n"]).await;
+        let result = store_seen(&mut session, &[1], true).await;
+        assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn move_uses_move_when_announced() {
+        let (mut session, server) = session_recording(vec![OK]).await;
+        let caps = ServerCaps {
+            move_command: true,
+            uidplus: true,
+        };
+        move_uids(&mut session, caps, &[3, 5], "[Gmail]/Corbeille")
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID MOVE 3,5 \"[Gmail]/Corbeille\""]);
+    }
+
+    #[tokio::test]
+    async fn move_without_move_copies_deletes_and_expunges() {
+        let (mut session, server) = session_recording(vec![OK, OK, OK]).await;
+        let caps = ServerCaps {
+            move_command: false,
+            uidplus: true,
+        };
+        move_uids(&mut session, caps, &[3], "Trash").await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec![
+                "UID COPY 3 \"Trash\"",
+                "UID STORE 3 +FLAGS.SILENT (\\Deleted)",
+                "UID EXPUNGE 3"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn move_without_uidplus_uses_plain_expunge() {
+        let (mut session, server) = session_recording(vec![OK, OK, OK]).await;
+        move_uids(&mut session, ServerCaps::default(), &[3], "Trash")
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent[2], "EXPUNGE");
+    }
+
+    #[tokio::test]
+    async fn failed_copy_stops_the_move() {
+        let (mut session, server) =
+            session_recording(vec!["{tag} NO [TRYCREATE] no such folder\r\n"]).await;
+        let result = move_uids(&mut session, ServerCaps::default(), &[3], "Nope").await;
+        assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+        let sent = commands(session, server).await;
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_sends_the_message_as_a_literal() {
+        let (mut session, server) = session_recording(vec!["+ go ahead\r\n", OK]).await;
+        append_to(&mut session, "Sent", b"hello", true)
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent[0], "APPEND \"Sent\" (\\Seen) {5}");
+        assert_eq!(sent[1], "hello");
+    }
+
+    #[test]
+    fn mailbox_names_are_quoted() {
+        assert_eq!(quote_mailbox("a \"b\"").unwrap(), "\"a \\\"b\\\"\"");
+        assert!(quote_mailbox("a\r\nb").is_err());
+        assert_eq!(uid_set(&[1, 2, 30]), "1,2,30");
     }
 }

@@ -171,7 +171,11 @@ impl App {
             }
         };
         self.syncing.insert(account.id);
-        let sync = spawn_sync(self.db_path.clone(), account, password);
+        let sync = spawn_sync(
+            self.db_path.clone(),
+            account,
+            avero_core::Credentials::Password(password),
+        );
         Some(Task::perform(sync, |(id, result)| {
             Message::SyncFinished(id, result)
         }))

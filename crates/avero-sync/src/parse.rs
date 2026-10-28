@@ -1,10 +1,15 @@
 //! Parsing of raw IMAP headers and detection of folder roles.
 
 use avero_core::model::{FolderRole, NewMessage};
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders};
 
 /// Builds a `NewMessage` from raw header bytes. Never panics: anything
 /// missing or unreadable falls back to a default value.
+///
+/// `has_attachments` is a guess from the header block alone: a top-level
+/// `Content-Type: multipart/mixed` almost always means attachments. It can
+/// be wrong (a mixed message with only text parts, or an attachment inside
+/// another multipart type); the flag is corrected once the body is read.
 pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
     let mut msg = NewMessage {
         uid,
@@ -36,6 +41,13 @@ pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
     if let Some(date) = parsed.date() {
         msg.date = date.to_timestamp();
     }
+
+    msg.has_attachments = parsed.content_type().is_some_and(|ct| {
+        ct.ctype().eq_ignore_ascii_case("multipart")
+            && ct
+                .subtype()
+                .is_some_and(|sub| sub.eq_ignore_ascii_case("mixed"))
+    });
 
     msg
 }
@@ -112,6 +124,29 @@ mod tests {
         let m = parse_headers(1, false, &[0xff, 0xfe, 0x00, 0x80]);
         assert_eq!(m.uid, 1);
         assert_eq!(m.subject, "(sans objet)");
+    }
+
+    #[test]
+    fn multipart_mixed_header_means_attachments() {
+        let mixed = b"Subject: a
+Content-Type: multipart/Mixed; boundary=x
+
+";
+        assert!(parse_headers(1, false, mixed).has_attachments);
+        let alternative = b"Content-Type: multipart/alternative; boundary=x
+
+";
+        assert!(!parse_headers(1, false, alternative).has_attachments);
+        assert!(
+            !parse_headers(
+                1,
+                false,
+                b"Subject: a
+
+"
+            )
+            .has_attachments
+        );
     }
 
     #[test]

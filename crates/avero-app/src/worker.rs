@@ -1,7 +1,7 @@
 //! Runs one account's synchronisation on its own thread.
 
 use avero_core::store::Store;
-use avero_core::{Account, AccountId, ServerConfig};
+use avero_core::{Account, AccountId, Credentials, ServerConfig};
 use avero_sync::imap::ImapSource;
 use avero_sync::source::SyncError;
 use avero_sync::sync::{SyncReport, sync_account};
@@ -17,13 +17,13 @@ use std::path::{Path, PathBuf};
 pub fn spawn_sync(
     db_path: PathBuf,
     account: Account,
-    password: String,
+    creds: Credentials,
 ) -> impl Future<Output = (AccountId, Result<SyncReport, String>)> + Send + 'static {
     let id = account.id;
     let (sender, receiver) = tokio::sync::oneshot::channel();
 
     std::thread::spawn(move || {
-        let result = run_sync(&db_path, &account, &password);
+        let result = run_sync(&db_path, &account, &creds);
         // The receiver may be gone if the UI gave up; nothing to do then.
         let _ = sender.send(result);
     });
@@ -39,7 +39,7 @@ pub fn spawn_sync(
 }
 
 /// Runs on the sync thread: builds a runtime and does the actual work.
-fn run_sync(db_path: &Path, account: &Account, password: &str) -> Result<SyncReport, String> {
+fn run_sync(db_path: &Path, account: &Account, creds: &Credentials) -> Result<SyncReport, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -48,8 +48,8 @@ fn run_sync(db_path: &Path, account: &Account, password: &str) -> Result<SyncRep
     runtime.block_on(async {
         let result = async {
             let store = Store::open(db_path)?;
-            let mut source = ImapSource::connect(&account.imap, password).await?;
-            sync_account(&store, &mut source, account.id).await
+            let mut source = ImapSource::connect(&account.imap, creds).await?;
+            sync_account(&store, &mut source, account.id, |_| {}).await
         }
         .await;
         result.map_err(|e: SyncError| user_message(&e, &account.imap))
@@ -103,7 +103,12 @@ mod tests {
     #[tokio::test]
     async fn unreachable_server_reports_error_without_panicking() {
         let account = account_at("127.0.0.1", 1);
-        let (id, result) = spawn_sync(temp_db("one"), account.clone(), "pw".into()).await;
+        let (id, result) = spawn_sync(
+            temp_db("one"),
+            account.clone(),
+            Credentials::Password("pw".into()),
+        )
+        .await;
         assert_eq!(id, account.id);
         let msg = result.unwrap_err();
         assert!(msg.contains("Connexion impossible"), "{msg}");
@@ -114,9 +119,13 @@ mod tests {
         let a = spawn_sync(
             temp_db("a"),
             account_at("invalid.invalid", 993),
-            "pw".into(),
+            Credentials::Password("pw".into()),
         );
-        let b = spawn_sync(temp_db("b"), account_at("127.0.0.1", 1), "pw".into());
+        let b = spawn_sync(
+            temp_db("b"),
+            account_at("127.0.0.1", 1),
+            Credentials::Password("pw".into()),
+        );
         let ((_, ra), (_, rb)) = futures::join!(a, b);
         assert!(ra.is_err());
         assert!(rb.is_err());
