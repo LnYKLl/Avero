@@ -1088,7 +1088,7 @@ impl Store {
     /// Unknown rows are left out.
     pub fn message_refs(&self, row_ids: &[i64]) -> Result<Vec<MessageRef>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, f.account_id, f.id, f.path, m.uid
+            "SELECT m.id, f.account_id, f.id, f.path, m.uid, f.uid_validity
              FROM messages m JOIN folders f ON f.id = m.folder_id
              WHERE m.id = ?1",
         )?;
@@ -1102,6 +1102,7 @@ impl Store {
                         folder_id: FolderId(row.get(2)?),
                         folder_path: row.get(3)?,
                         uid: row.get(4)?,
+                        uid_validity: row.get(5)?,
                     })
                 })
                 .optional()?;
@@ -2155,6 +2156,7 @@ mod tests {
             account_id: a,
             folder_id: f.id,
             folder_path: "INBOX".into(),
+            uid_validity: None,
             uid,
         };
         assert_eq!(refs, vec![expected(rows[1], 5), expected(rows[0], 8)]);

@@ -55,6 +55,10 @@ pub enum SyncError {
     Auth(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The folder got a new UIDVALIDITY since its messages were read: the
+    /// UIDs known here name other messages now (or none).
+    #[error("the folder {0} changed on the server")]
+    FolderChanged(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }

@@ -459,6 +459,10 @@ pub struct MessageRef {
     pub folder_id: FolderId,
     pub folder_path: String,
     pub uid: u32,
+    /// The folder's UIDVALIDITY when `uid` was read (`None`: never
+    /// synced). If the server's is another one, `uid` names another
+    /// message now: nothing must be done with it.
+    pub uid_validity: Option<u32>,
 }
 
 #[cfg(test)]

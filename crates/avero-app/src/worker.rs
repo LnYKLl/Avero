@@ -1432,10 +1432,11 @@ impl<C: Connector> Worker<C> {
         }
         let raw = self
             .with_session(async |session, _store| {
-                session.select(&target.folder_path).await?;
+                select_unchanged(session, &target.folder_path, target.uid_validity).await?;
                 session.fetch_body(target.uid).await
             })
-            .await?;
+            .await;
+        let raw = self.resync_if_changed(raw)?;
         let Some(raw) = raw else {
             return Err(AccountError::new(
                 ErrorKind::Other,
@@ -1460,14 +1461,15 @@ impl<C: Connector> Worker<C> {
     /// again (on failure too: the next sync brings the truth back).
     async fn set_seen(&mut self, targets: &[MessageRef], seen: bool) -> Result<(), AccountError> {
         let mut result = Ok(());
-        for (folder, (uids, _rows)) in by_folder(targets) {
+        for (folder, group) in by_folder(targets) {
             self.changing(&folder);
             result = self
                 .with_session(async |session, _store| {
-                    session.select(&folder).await?;
-                    session.set_seen(&uids, seen).await
+                    select_unchanged(session, &folder, group.uid_validity).await?;
+                    session.set_seen(&group.uids, seen).await
                 })
                 .await;
+            result = self.resync_if_changed(result);
             if result.is_err() {
                 break;
             }
@@ -1485,14 +1487,15 @@ impl<C: Connector> Worker<C> {
         flagged: bool,
     ) -> Result<(), AccountError> {
         let mut result = Ok(());
-        for (folder, (uids, _rows)) in by_folder(targets) {
+        for (folder, group) in by_folder(targets) {
             self.changing(&folder);
             result = self
                 .with_session(async |session, _store| {
-                    session.select(&folder).await?;
-                    session.set_flagged(&uids, flagged).await
+                    select_unchanged(session, &folder, group.uid_validity).await?;
+                    session.set_flagged(&group.uids, flagged).await
                 })
                 .await;
+            result = self.resync_if_changed(result);
             if result.is_err() {
                 break;
             }
@@ -1517,27 +1520,40 @@ impl<C: Connector> Worker<C> {
         op: impl AsyncFn(&mut C::Source, &[u32]) -> Result<(), SyncError>,
     ) -> Result<(), AccountError> {
         let mut result = Ok(());
-        for (folder, (uids, rows)) in by_folder(targets) {
+        for (folder, group) in by_folder(targets) {
             if result.is_err() || skip == Some(folder.as_str()) {
-                self.show(&rows);
+                self.show(&group.rows);
                 continue;
             }
             self.changing(&folder);
             let done = self
                 .with_session(async |session, _store| {
-                    session.select(&folder).await?;
-                    op(session, &uids).await
+                    select_unchanged(session, &folder, group.uid_validity).await?;
+                    op(session, &group.uids).await
                 })
                 .await;
-            match done {
+            match self.resync_if_changed(done) {
                 Ok(()) => {
-                    let _ = self.store.delete_messages(&rows);
+                    let _ = self.store.delete_messages(&group.rows);
                 }
                 Err(error) => {
-                    self.show(&rows);
+                    self.show(&group.rows);
                     result = Err(error);
                 }
             }
+        }
+        result
+    }
+
+    /// After an action refused because its folder changed on the server
+    /// (see `select_unchanged`), a sync brings the folder's messages again
+    /// under their new UIDs.
+    fn resync_if_changed<T>(&mut self, result: Result<T, AccountError>) -> Result<T, AccountError> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.message == FOLDER_CHANGED)
+        {
+            self.sync_after_change(SyncScope::Account);
         }
         result
     }
@@ -1730,13 +1746,43 @@ pub const NO_DRAFTS_FOLDER: &str =
 pub const SMTP_MISSING: &str =
     "Le serveur d'envoi de ce compte n'est pas configuré (Réglages › Serveurs).";
 
+/// Shown when an action was refused because its folder changed on the
+/// server (a new UIDVALIDITY): the UIDs known here name other messages.
+pub const FOLDER_CHANGED: &str = "Ce dossier a changé sur le serveur : action annulée, \
+     la liste va être mise à jour";
+
+/// Selects `folder`, and refuses to go on (`SyncError::FolderChanged`)
+/// when its UIDVALIDITY is not `expected` any more: the UIDs read before
+/// would name other messages. `None` (never synced) checks nothing.
+async fn select_unchanged<S: MailSource>(
+    session: &mut S,
+    folder: &str,
+    expected: Option<u32>,
+) -> Result<(), SyncError> {
+    let status = session.select(folder).await?;
+    if expected.is_some_and(|known| known != status.uid_validity) {
+        return Err(SyncError::FolderChanged(folder.to_string()));
+    }
+    Ok(())
+}
+
+/// The messages of one folder an action is about.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FolderGroup {
+    uids: Vec<u32>,
+    rows: Vec<i64>,
+    /// The folder's UIDVALIDITY when they were read (see `MessageRef`).
+    uid_validity: Option<u32>,
+}
+
 /// Groups messages by folder: their UIDs and row ids, in order.
-fn by_folder(targets: &[MessageRef]) -> BTreeMap<String, (Vec<u32>, Vec<i64>)> {
-    let mut groups: BTreeMap<String, (Vec<u32>, Vec<i64>)> = BTreeMap::new();
+fn by_folder(targets: &[MessageRef]) -> BTreeMap<String, FolderGroup> {
+    let mut groups: BTreeMap<String, FolderGroup> = BTreeMap::new();
     for target in targets {
-        let (uids, rows) = groups.entry(target.folder_path.clone()).or_default();
-        uids.push(target.uid);
-        rows.push(target.row_id);
+        let group = groups.entry(target.folder_path.clone()).or_default();
+        group.uids.push(target.uid);
+        group.rows.push(target.row_id);
+        group.uid_validity = group.uid_validity.or(target.uid_validity);
     }
     groups
 }
@@ -1766,6 +1812,7 @@ pub fn user_error(error: &SyncError, account: &Account) -> AccountError {
             ErrorKind::Other,
             format!("Erreur de la base locale : {detail}"),
         ),
+        SyncError::FolderChanged(_) => AccountError::new(ErrorKind::Other, FOLDER_CHANGED),
     }
 }
 
@@ -2043,10 +2090,16 @@ mod tests {
             folder_id: FolderId(1),
             folder_path: folder.into(),
             uid,
+            uid_validity: Some(7),
         };
         let groups = by_folder(&[target("INBOX", 3), target("Spam", 9), target("INBOX", 1)]);
-        assert_eq!(groups["INBOX"], (vec![3, 1], vec![3, 1]));
-        assert_eq!(groups["Spam"], (vec![9], vec![9]));
+        let group = |uids: Vec<u32>, rows: Vec<i64>| FolderGroup {
+            uids,
+            rows,
+            uid_validity: Some(7),
+        };
+        assert_eq!(groups["INBOX"], group(vec![3, 1], vec![3, 1]));
+        assert_eq!(groups["Spam"], group(vec![9], vec![9]));
     }
 
     #[tokio::test]
@@ -2818,6 +2871,52 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         flush(&fake.worker).await;
         assert_eq!(fake.server.selects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_action_on_a_folder_that_changed_is_refused_then_synced() {
+        let fake = fake_worker("uidvalidity");
+        fake.open.send(true).unwrap();
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        // Read when the inbox's UIDVALIDITY was 5; the server says 1 now:
+        // UID 1 is another message.
+        let mut target = fake.target.clone();
+        target.uid_validity = Some(5);
+        fake.store.set_hidden(&[target.row_id], true).unwrap();
+        let done: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::DeleteForever {
+                targets: vec![target.clone()],
+                reply,
+            })
+            .collect()
+            .await;
+        match done.last() {
+            Some(Event::Done(Err(error))) => assert_eq!(error.message, FOLDER_CHANGED),
+            other => panic!("{other:?}"),
+        }
+        // The row is shown again, and a sync follows.
+        let shown = fake
+            .store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap();
+        assert_eq!(shown.len(), 1);
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+        // The same UIDVALIDITY as the server's: done.
+        target.uid_validity = Some(1);
+        let done: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetSeen {
+                targets: vec![target],
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(matches!(done.last(), Some(Event::Done(Ok(())))), "{done:?}");
     }
 
     #[tokio::test]
