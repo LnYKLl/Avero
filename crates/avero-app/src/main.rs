@@ -129,7 +129,7 @@ fn window_icon() -> Option<window::Icon> {
 }
 
 fn unpremultiply(mut data: Vec<u8>) -> Vec<u8> {
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha > 0 && alpha < 255 {
             for channel in &mut pixel[..3] {
