@@ -10,6 +10,8 @@ Supported platforms: Windows, macOS and Linux. The interface is in French.
 
 ![Dark mode](docs/screenshots/inbox-dark.png)
 
+!["Océan" colours (Réglages › Apparence: Avero, Orange or Océan)](docs/screenshots/inbox-ocean.png)
+
 ## Features
 
 - **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Gmail and Microsoft accounts can sign in with "Continuer avec Google / Microsoft" in the browser (OAuth2, PKCE). Other providers use a password or an app password. The IMAP and SMTP logins are tested before the account is saved.
