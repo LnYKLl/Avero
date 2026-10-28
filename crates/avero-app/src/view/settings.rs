@@ -476,8 +476,10 @@ fn rule_summary(app: &App, rule: &Rule) -> String {
                 RuleField::From => "l'expéditeur",
                 RuleField::To => "le destinataire",
                 RuleField::Subject => "l'objet",
+                RuleField::FromAddress => "l'adresse de l'expéditeur",
             };
-            format!("{field} contient « {} »", c.value)
+            let verb = crate::app::field_verb(c.field);
+            format!("{field} {verb} « {} »", c.value)
         })
         .collect();
     let joiner = if rule.def.match_all { " et " } else { " ou " };

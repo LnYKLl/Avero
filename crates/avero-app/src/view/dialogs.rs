@@ -9,7 +9,7 @@ use super::{field_label, icon_button};
 use crate::app::{
     AccountMsg, App, CleanupMsg, LaterMsg, LaterPicker, LaterPurpose, Message, Overlay,
     PasswordDialog, RuleForm, RuleMsg, SPACE_ICONS, ServerField, ServersForm, SpaceForm, SpaceMsg,
-    UnsubscribeOffer, field_name, move_name,
+    UnsubscribeOffer, field_name, field_verb, move_name,
 };
 use crate::icons::{self, Icon, Tone};
 use crate::later;
@@ -584,7 +584,9 @@ fn rule_editor<'a>(app: &'a App, form: &'a RuleForm) -> Element<'a, Message> {
         }
         let mut line = row![
             fields,
-            text("contient").size(12).style(theme::muted),
+            text(field_verb(condition.field))
+                .size(12)
+                .style(theme::muted),
             text_input("texte", &condition.value)
                 .on_input(move |v| Message::Rule(RuleMsg::Value(index, v)))
                 .padding([6, 8])

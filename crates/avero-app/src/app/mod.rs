@@ -29,7 +29,7 @@ mod unsubscribe;
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
 pub use cleanup::{Cleanup, CleanupMsg};
 pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
-pub use filters::{RuleForm, RuleMsg, field_name, move_name};
+pub use filters::{RuleForm, RuleMsg, field_name, field_verb, move_name};
 pub use keys::SHORTCUTS;
 pub use later::{LaterMsg, LaterPicker, LaterPurpose, scheduled_status};
 pub use places::{SenderView, tab_name};

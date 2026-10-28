@@ -1,13 +1,15 @@
 //! The user's rules: "if the sender contains X, archive it".
 //!
 //! A rule has conditions (sender, recipient or subject contains a text,
-//! case ignored), checked all together or at least one of them, and
+//! or the sender's address is exactly one, case ignored), checked all
+//! together or at least one of them, and
 //! actions: mark as read, and at most one move (archive, trash, spam).
 //! It applies to one account or to all of them. Rules stay on this
 //! computer: they act on the new messages of the inbox after each sync
 //! (so only while Avero runs), and on the inbox on demand.
 
 use crate::AccountId;
+use crate::category::sender_key;
 
 /// What a condition looks at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,10 +19,19 @@ pub enum RuleField {
     /// The recipients (To) and the mailbox that received the message.
     To,
     Subject,
+    /// The sender's address, compared whole (not "contains"): what
+    /// "Bloquer" uses, so that blocking `jo@gmail.com` spares
+    /// `marjo@gmail.com`.
+    FromAddress,
 }
 
 impl RuleField {
-    pub const ALL: [RuleField; 3] = [RuleField::From, RuleField::To, RuleField::Subject];
+    pub const ALL: [RuleField; 4] = [
+        RuleField::From,
+        RuleField::To,
+        RuleField::Subject,
+        RuleField::FromAddress,
+    ];
 
     /// Stable text form, used for storage.
     pub fn as_str(&self) -> &'static str {
@@ -28,6 +39,7 @@ impl RuleField {
             RuleField::From => "from",
             RuleField::To => "to",
             RuleField::Subject => "subject",
+            RuleField::FromAddress => "from_address",
         }
     }
 
@@ -36,12 +48,14 @@ impl RuleField {
         match s {
             "from" => RuleField::From,
             "to" => RuleField::To,
+            "from_address" => RuleField::FromAddress,
             _ => RuleField::Subject,
         }
     }
 }
 
-/// "`field` contains `value`" (case ignored).
+/// "`field` contains `value`" (case ignored), or for `FromAddress`,
+/// "the sender's address is `value`".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Condition {
     pub field: RuleField,
@@ -149,6 +163,7 @@ impl Condition {
             RuleField::From => has(&facts.from_addr) || facts.from_name.as_deref().is_some_and(has),
             RuleField::To => facts.to.iter().any(|addr| has(addr)),
             RuleField::Subject => has(&facts.subject),
+            RuleField::FromAddress => sender_key(&facts.from_addr) == wanted,
         }
     }
 }
@@ -200,7 +215,8 @@ pub fn outcome(rules: &[Rule], facts: &RuleFacts) -> RuleOutcome {
 }
 
 /// The rule "Bloquer" makes for a sender: their future mail goes to the
-/// trash, on every account.
+/// trash, on every account. Only this exact address is caught (not the
+/// addresses or names that contain it).
 pub fn block_rule(addr: &str, name: &str) -> RuleDef {
     let shown = if name.trim().is_empty() {
         addr.trim()
@@ -210,8 +226,8 @@ pub fn block_rule(addr: &str, name: &str) -> RuleDef {
     RuleDef {
         name: format!("Bloquer {shown}"),
         conditions: vec![Condition {
-            field: RuleField::From,
-            value: addr.trim().to_lowercase(),
+            field: RuleField::FromAddress,
+            value: sender_key(addr),
         }],
         match_all: true,
         mark_read: false,
@@ -225,7 +241,7 @@ pub fn blocks(rule: &RuleDef, addr: &str) -> bool {
     rule.move_to == Some(RuleMove::Trash)
         && rule.account.is_none()
         && matches!(rule.conditions.as_slice(),
-            [c] if c.field == RuleField::From && folded(&c.value) == folded(addr))
+            [c] if c.field == RuleField::FromAddress && folded(&c.value) == folded(addr))
 }
 
 #[cfg(test)]
@@ -357,6 +373,21 @@ mod tests {
         assert!(!def.matches(&facts("info@ailleurs.fr", "x")));
         assert!(blocks(&def, "PROMO@boutique.fr"));
         assert!(!blocks(&def, "info@ailleurs.fr"));
+    }
+
+    #[test]
+    fn blocking_a_sender_spares_the_addresses_that_contain_it() {
+        let def = block_rule("jo@gmail.com", "");
+        assert!(def.matches(&facts(" JO@gmail.com ", "x")));
+        assert!(!def.matches(&facts("marjo@gmail.com", "x")));
+        assert!(!def.matches(&facts("jo@gmail.com.evil.fr", "x")));
+        let mut named = facts("autre@site.fr", "x");
+        named.from_name = Some("jo@gmail.com".to_string());
+        assert!(!def.matches(&named));
+
+        // A rule written by hand still means "contains".
+        let by_hand = rule(1, vec![cond(RuleField::From, "jo@gmail.com")], true, None);
+        assert!(by_hand.def.matches(&facts("marjo@gmail.com", "x")));
     }
 
     #[test]

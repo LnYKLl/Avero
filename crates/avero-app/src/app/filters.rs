@@ -138,6 +138,16 @@ pub fn field_name(field: RuleField) -> &'static str {
         RuleField::From => "Expéditeur",
         RuleField::To => "Destinataire",
         RuleField::Subject => "Objet",
+        RuleField::FromAddress => "Adresse exacte",
+    }
+}
+
+/// How a condition compares, as the editor says it: the exact address
+/// "est", the others "contient".
+pub fn field_verb(field: RuleField) -> &'static str {
+    match field {
+        RuleField::FromAddress => "est",
+        RuleField::From | RuleField::To | RuleField::Subject => "contient",
     }
 }
 

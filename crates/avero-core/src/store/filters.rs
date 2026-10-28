@@ -507,6 +507,48 @@ mod tests {
     }
 
     #[test]
+    fn old_block_rules_compare_the_whole_address() {
+        let path = std::env::temp_dir().join(format!("avero-block-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            let block = s.add_rule(&block_rule("jo@gmail.com", "Jo")).unwrap();
+            // Rules written by hand, which look like it but are not one.
+            let mut by_hand = block_rule("info@shop.fr", "");
+            by_hand.name = "Corbeille Shop".into();
+            let by_hand = s.add_rule(&by_hand).unwrap();
+            let mut two = block_rule("a@b.fr", "");
+            two.conditions.push(Condition {
+                field: RuleField::Subject,
+                value: "promo".into(),
+            });
+            let two = s.add_rule(&two).unwrap();
+            // What a version 10 "Bloquer" saved: "the sender contains".
+            s.conn
+                .execute_batch(
+                    "UPDATE rule_conditions SET field = 'from';
+                     PRAGMA user_version = 10;",
+                )
+                .unwrap();
+            assert_eq!((block.id, by_hand.id, two.id), (1, 2, 3));
+        }
+        let s = Store::open(&path).unwrap();
+        let fields: Vec<RuleField> = s
+            .rules()
+            .unwrap()
+            .iter()
+            .map(|r| r.def.conditions[0].field)
+            .collect();
+        assert_eq!(
+            fields,
+            vec![RuleField::FromAddress, RuleField::From, RuleField::From]
+        );
+        assert!(rules::blocks(&s.rules().unwrap()[0].def, "jo@gmail.com"));
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn rules_are_saved_in_order_and_edited() {
         let s = Store::open_in_memory().unwrap();
         let a = acct(&s, "moi@x.fr");
@@ -605,7 +647,14 @@ mod tests {
         let rule = Rule {
             id: 1,
             enabled: true,
-            def: block_rule("shop.fr", ""),
+            def: RuleDef {
+                conditions: vec![Condition {
+                    field: RuleField::From,
+                    value: "shop.fr".into(),
+                }],
+                move_to: Some(RuleMove::Trash),
+                ..RuleDef::default()
+            },
         };
         let caught: Vec<i64> = all
             .iter()
