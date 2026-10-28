@@ -3,7 +3,7 @@
 //! servers used by OAuth providers.
 
 use avero_core::{AuthKind, Security, ServerConfig};
-use avero_oauth::Provider;
+use avero_oauth::{OAuthError, Provider};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -78,6 +78,35 @@ impl fmt::Debug for OAuthGrant {
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
             .field("access", &self.access)
             .finish()
+    }
+}
+
+/// OAuth error codes meaning the grant is gone or needs the user again:
+/// signing in again fixes them, retrying does not.
+const RECONNECT_CODES: [&str; 5] = [
+    "invalid_grant",
+    "interaction_required",
+    "consent_required",
+    "login_required",
+    "unauthorized_client",
+];
+
+/// Whether a token refresh failure needs a new sign-in ("Reconnexion
+/// nécessaire") rather than a later retry.
+pub fn needs_reconnect(error: &OAuthError) -> bool {
+    matches!(error, OAuthError::Server(code) if RECONNECT_CODES.contains(&code.as_str()))
+}
+
+/// Checks that a reconnection signed in to the same mailbox: the
+/// provider may let the user pick another account in the browser.
+pub fn check_grant_email(account_email: &str, grant_email: Option<&str>) -> Result<(), String> {
+    match grant_email {
+        Some(email) if !email.trim().eq_ignore_ascii_case(account_email.trim()) => Err(format!(
+            "Vous vous êtes connecté avec {} au lieu de {account_email}. \
+             Reconnectez-vous avec le bon compte.",
+            email.trim()
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -269,6 +298,32 @@ mod tests {
             "outlook.office365.com"
         ));
         assert!(!server_saves_sent_mail("smtp.orange.fr", "imap.orange.fr"));
+    }
+
+    #[test]
+    fn grant_errors_that_need_a_new_sign_in() {
+        for code in [
+            "invalid_grant",
+            "interaction_required",
+            "consent_required",
+            "unauthorized_client",
+        ] {
+            assert!(needs_reconnect(&OAuthError::Server(code.into())), "{code}");
+        }
+        assert!(!needs_reconnect(&OAuthError::Server(
+            "temporarily_unavailable".into()
+        )));
+        assert!(!needs_reconnect(&OAuthError::Network("dns".into())));
+        assert!(!needs_reconnect(&OAuthError::Timeout));
+    }
+
+    #[test]
+    fn reconnection_must_use_the_same_mailbox() {
+        assert!(check_grant_email("Jean@Gmail.com", Some("jean@gmail.com")).is_ok());
+        assert!(check_grant_email("jean@gmail.com", None).is_ok());
+        let error = check_grant_email("jean@gmail.com", Some("autre@gmail.com")).unwrap_err();
+        assert!(error.contains("autre@gmail.com"), "{error}");
+        assert!(error.contains("jean@gmail.com"), "{error}");
     }
 
     #[test]

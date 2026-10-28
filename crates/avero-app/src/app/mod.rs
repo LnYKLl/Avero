@@ -13,7 +13,7 @@ pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
 
 use crate::account_form::{AccountForm, Field};
 use crate::auth::OAuthGrant;
-use crate::background::LoginError;
+use crate::background::{LoginError, OpenedBody};
 use crate::compose::Mode;
 use crate::settings::{Settings, ThemeChoice};
 use crate::theme;
@@ -22,15 +22,17 @@ use crate::worker::{self, AccountError, Destination, Event, Job, Reply, WorkerHa
 use avero_autoconfig::ProviderConfig;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
-use avero_core::{Account, AccountFilter, AccountId, FolderRole, Security, UnifiedItem};
+use avero_core::{
+    Account, AccountFilter, AccountId, FolderRole, Security, ServerConfig, UnifiedItem,
+};
 use avero_oauth::Provider;
-use avero_sync::parse::ParsedBody;
 use iced::widget::text_editor;
 use iced::{Element, Subscription, Task, Theme, keyboard};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// How many messages one page of the list holds.
@@ -39,6 +41,9 @@ pub const PAGE: usize = 200;
 pub const AUTO_SYNC: Duration = Duration::from_secs(5 * 60);
 /// Id of the search field (Ctrl+F focuses it).
 pub const SEARCH_ID: &str = "search";
+/// The list is read again at most this often while a sync reports
+/// progress (plus once at the end).
+pub const RELOAD_EVERY: Duration = Duration::from_millis(700);
 
 /// Where account work happens.
 pub enum Backend {
@@ -72,16 +77,110 @@ pub enum Overlay {
     ConfirmDelete(AccountId),
     /// Waiting for the browser to reconnect an OAuth account.
     Reconnect(AccountId),
+    /// The IMAP and SMTP servers of an account.
+    Servers(ServersForm),
+    /// Deleting messages that are already in the trash, for good.
+    ConfirmDeleteForever(Vec<i64>),
 }
 
 /// "Changer le mot de passe".
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PasswordDialog {
     pub account: AccountId,
     pub password: String,
     pub error: Option<String>,
     pub checking: bool,
     pub generation: u64,
+}
+
+impl fmt::Debug for PasswordDialog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordDialog")
+            .field("account", &self.account)
+            .field("password", &"***")
+            .field("error", &self.error)
+            .field("checking", &self.checking)
+            .finish()
+    }
+}
+
+/// Editable fields of the "Serveurs" dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerField {
+    ImapHost,
+    ImapPort,
+    SmtpHost,
+    SmtpPort,
+}
+
+/// "Serveurs": where an account receives (IMAP) and sends (SMTP).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServersForm {
+    pub account: AccountId,
+    pub imap_host: String,
+    pub imap_port: String,
+    pub smtp_host: String,
+    pub smtp_port: String,
+    pub smtp_security: Security,
+    pub error: Option<String>,
+}
+
+impl ServersForm {
+    pub fn of(account: &Account) -> ServersForm {
+        ServersForm {
+            account: account.id,
+            imap_host: account.imap.host.clone(),
+            imap_port: account.imap.port.to_string(),
+            smtp_host: account.smtp.host.clone(),
+            smtp_port: account.smtp.port.to_string(),
+            smtp_security: account.smtp.security,
+            error: None,
+        }
+    }
+
+    pub fn set(&mut self, field: ServerField, value: String) {
+        self.error = None;
+        match field {
+            ServerField::ImapHost => self.imap_host = value,
+            ServerField::ImapPort => self.imap_port = value,
+            ServerField::SmtpHost => self.smtp_host = value,
+            ServerField::SmtpPort => {
+                if let Some(security) = crate::account_form::security_for_port(&value) {
+                    self.smtp_security = security;
+                }
+                self.smtp_port = value;
+            }
+        }
+    }
+
+    /// The new IMAP and SMTP settings (usernames kept), or what is wrong.
+    pub fn apply(&self, account: &Account) -> Result<(ServerConfig, ServerConfig), String> {
+        let imap_host = self.imap_host.trim();
+        let smtp_host = self.smtp_host.trim();
+        if imap_host.is_empty() || smtp_host.is_empty() {
+            return Err("Indiquez les serveurs de réception et d'envoi".to_string());
+        }
+        let port = |text: &str| text.trim().parse::<u16>().ok().filter(|&p| p >= 1);
+        let imap_port = port(&self.imap_port).ok_or("Port IMAP invalide (1 à 65535)")?;
+        let smtp_port = port(&self.smtp_port).ok_or("Port SMTP invalide (1 à 65535)")?;
+        let smtp_user = match account.smtp.username.trim() {
+            "" => account.imap.username.clone(),
+            user => user.to_string(),
+        };
+        Ok((
+            ServerConfig {
+                host: imap_host.to_string(),
+                port: imap_port,
+                ..account.imap.clone()
+            },
+            ServerConfig {
+                host: smtp_host.to_string(),
+                port: smtp_port,
+                username: smtp_user,
+                security: self.smtp_security,
+            },
+        ))
+    }
 }
 
 /// Sync state and last problem of one account.
@@ -105,8 +204,8 @@ pub struct Reading {
 pub enum Body {
     Loading,
     Ready {
-        parsed: Box<ParsedBody>,
-        raw: Arc<Vec<u8>>,
+        /// Parsed once, attachments decoded (forward and save reuse them).
+        opened: Arc<OpenedBody>,
         /// Read-only editor: lets the user select and copy the text.
         content: text_editor::Content,
     },
@@ -146,6 +245,13 @@ pub enum Message {
     LoadMore,
     Refresh,
     Worker(AccountId, Event),
+    /// A throttled list reload is due.
+    ReloadDue,
+    /// A body was parsed off the UI thread.
+    BodyParsed(i64, Result<Arc<OpenedBody>, String>),
+    /// What a worker answered to an archive or delete of these rows.
+    Moved(Vec<i64>, Event),
+    ConfirmDeleteForever,
 
     ReaderAction(text_editor::Action),
     Answer(Mode),
@@ -160,8 +266,8 @@ pub enum Message {
     Account(AccountMsg),
 }
 
-/// Messages of the add-account card.
-#[derive(Debug, Clone)]
+/// Messages of the add-account card. `Debug` hides a typed password.
+#[derive(Clone)]
 pub enum AddMsg {
     /// Opens the card; with a provider, starts that sign-in directly.
     Open(Option<Provider>),
@@ -180,8 +286,35 @@ pub enum AddMsg {
     Close,
 }
 
-/// Messages of account management (settings and banners).
-#[derive(Debug, Clone)]
+impl fmt::Debug for AddMsg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddMsg::Field(Field::Password, _) => f.write_str("Field(Password, \"***\")"),
+            AddMsg::Field(field, value) => write!(f, "Field({field:?}, {value:?})"),
+            AddMsg::Open(provider) => write!(f, "Open({provider:?})"),
+            AddMsg::SubmitEmail => f.write_str("SubmitEmail"),
+            AddMsg::Detected(generation, config) => {
+                write!(f, "Detected({generation}, {})", config.is_some())
+            }
+            AddMsg::Back => f.write_str("Back"),
+            AddMsg::ToggleAdvanced => f.write_str("ToggleAdvanced"),
+            AddMsg::UsePassword => f.write_str("UsePassword"),
+            AddMsg::SmtpSecurity(security) => write!(f, "SmtpSecurity({security:?})"),
+            AddMsg::SubmitPassword => f.write_str("SubmitPassword"),
+            AddMsg::Checked(generation, result) => write!(f, "Checked({generation}, {result:?})"),
+            AddMsg::SignIn(provider) => write!(f, "SignIn({provider:?})"),
+            AddMsg::SignedIn(generation, result) => {
+                write!(f, "SignedIn({generation}, {result:?})")
+            }
+            AddMsg::CancelWait => f.write_str("CancelWait"),
+            AddMsg::Close => f.write_str("Close"),
+        }
+    }
+}
+
+/// Messages of account management (settings and banners). `Debug` hides
+/// a typed password.
+#[derive(Clone)]
 pub enum AccountMsg {
     StartRename(AccountId),
     RenameText(String),
@@ -194,7 +327,39 @@ pub enum AccountMsg {
     ConfirmDelete,
     Reconnect(AccountId),
     Reconnected(AccountId, Result<OAuthGrant, String>),
+    OpenServers(AccountId),
+    ServerText(ServerField, String),
+    ServerSecurity(Security),
+    SaveServers,
+    /// The SMTP server found for an account that had none.
+    SmtpFound(AccountId, Option<ServerConfig>),
     CloseDialog,
+}
+
+impl fmt::Debug for AccountMsg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccountMsg::PasswordText(_) => f.write_str("PasswordText(\"***\")"),
+            AccountMsg::StartRename(id) => write!(f, "StartRename({id:?})"),
+            AccountMsg::RenameText(text) => write!(f, "RenameText({text:?})"),
+            AccountMsg::SaveRename => f.write_str("SaveRename"),
+            AccountMsg::OpenPassword(id) => write!(f, "OpenPassword({id:?})"),
+            AccountMsg::SubmitPassword => f.write_str("SubmitPassword"),
+            AccountMsg::PasswordChecked(generation, result) => {
+                write!(f, "PasswordChecked({generation}, {result:?})")
+            }
+            AccountMsg::AskDelete(id) => write!(f, "AskDelete({id:?})"),
+            AccountMsg::ConfirmDelete => f.write_str("ConfirmDelete"),
+            AccountMsg::Reconnect(id) => write!(f, "Reconnect({id:?})"),
+            AccountMsg::Reconnected(id, result) => write!(f, "Reconnected({id:?}, {result:?})"),
+            AccountMsg::OpenServers(id) => write!(f, "OpenServers({id:?})"),
+            AccountMsg::ServerText(field, text) => write!(f, "ServerText({field:?}, {text:?})"),
+            AccountMsg::ServerSecurity(security) => write!(f, "ServerSecurity({security:?})"),
+            AccountMsg::SaveServers => f.write_str("SaveServers"),
+            AccountMsg::SmtpFound(id, found) => write!(f, "SmtpFound({id:?}, {found:?})"),
+            AccountMsg::CloseDialog => f.write_str("CloseDialog"),
+        }
+    }
 }
 
 /// The window.
@@ -217,6 +382,15 @@ pub struct App {
     pub(crate) search_query: Option<String>,
     search_generation: u64,
     pub(crate) items: Vec<UnifiedItem>,
+    /// Accounts that have a trash folder (Supprimer needs one).
+    pub(crate) trash_accounts: HashSet<AccountId>,
+    /// Whether some account has a real archive folder to show (Gmail's
+    /// archive is "All Mail", which is not synced).
+    pub(crate) archive_view: bool,
+    /// When the list was last read during a sync, and whether a reload is
+    /// waiting for its turn.
+    last_reload: Option<Instant>,
+    reload_scheduled: bool,
     /// Row ids of the selected item (stable across reloads).
     pub(crate) selected: Option<Vec<i64>>,
     pub(crate) reading: Option<Reading>,
@@ -244,6 +418,11 @@ impl App {
             eprintln!("Impossible de lire les comptes : {e}");
             Vec::new()
         });
+        // The jobs of the previous run are gone: hidden rows come back,
+        // server flags apply again.
+        if let Err(e) = store.clear_pending() {
+            eprintln!("Impossible de remettre la base en ordre : {e}");
+        }
         let mut app = App {
             store,
             backend,
@@ -261,6 +440,10 @@ impl App {
             search_query: None,
             search_generation: 0,
             items: Vec::new(),
+            trash_accounts: HashSet::new(),
+            archive_view: false,
+            last_reload: None,
+            reload_scheduled: false,
             selected: None,
             reading: None,
             composer: None,
@@ -275,7 +458,11 @@ impl App {
         }
         app.load_first_page();
         let system = iced::system::theme().map(Message::SystemTheme);
-        (app, Task::batch([system, Task::done(Message::AutoSync)]))
+        let complete = app.complete_smtp_settings();
+        (
+            app,
+            Task::batch([system, Task::done(Message::AutoSync), complete]),
+        )
     }
 
     pub fn theme(&self) -> Theme {
@@ -357,6 +544,17 @@ impl App {
             | Message::SaveAttachment(_)
             | Message::AttachmentSaved(_) => self.update_mail(message),
             Message::Worker(account, event) => self.on_worker_event(account, event),
+            Message::ReloadDue => {
+                self.reload_scheduled = false;
+                self.reload_now();
+                Task::none()
+            }
+            Message::BodyParsed(row, result) => {
+                self.body_parsed(row, result);
+                Task::none()
+            }
+            Message::Moved(rows, event) => self.moved(rows, event),
+            Message::ConfirmDeleteForever => self.delete_forever(),
             Message::Compose(message) => self.update_composer(message),
             Message::Add(message) => self.update_add(message),
             Message::Account(message) => self.update_account(message),
@@ -559,7 +757,8 @@ fn demo_answer(job: Job) {
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
-        | Job::Move { reply, .. } => {
+        | Job::Move { reply, .. }
+        | Job::DeleteForever { reply, .. } => {
             let _ = reply.send(Event::Done(Ok(())));
         }
         Job::UpdateAccount(_) | Job::Shutdown { .. } => {}

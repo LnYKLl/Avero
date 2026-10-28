@@ -102,6 +102,13 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
     ]
     .spacing(3)
     .width(Fill);
+    if account.smtp.host.trim().is_empty() {
+        details = details.push(
+            text("Serveur d'envoi à configurer (bouton Serveurs)")
+                .size(12)
+                .style(theme::danger_text),
+        );
+    }
     if let Some(error) = app.status.get(&id).and_then(|s| s.error.as_ref()) {
         details = details.push(
             text(error.message.clone())
@@ -126,6 +133,12 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
             Icon::Pencil,
             "Renommer",
             AccountMsg::StartRename(id),
+            Tone::Text
+        ),
+        action(
+            Icon::Globe,
+            "Serveurs (réception et envoi)",
+            AccountMsg::OpenServers(id),
             Tone::Text
         ),
         action(secret_icon, secret_label, secret_action, Tone::Text),

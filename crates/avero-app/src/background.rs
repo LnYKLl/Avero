@@ -10,8 +10,11 @@ use crate::auth::{AccessToken, OAuthGrant};
 use avero_core::{Credentials, ServerConfig};
 use avero_oauth::{ClientConfig, OAuthError, Provider};
 use avero_sync::imap::ImapSource;
+use avero_sync::parse::ParsedBody;
+use avero_sync::smtp::SendError;
 use avero_sync::source::SyncError;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// Message used when a background thread dies without answering.
@@ -44,22 +47,107 @@ pub enum LoginError {
     Refused,
     /// The server could not be reached (or TLS failed).
     Unreachable(String),
+    /// The sending (SMTP) server refused the credentials.
+    SmtpRefused,
+    /// The sending (SMTP) server could not be reached.
+    SmtpUnreachable(String),
     /// Anything else.
     Other(String),
 }
 
 /// Logs in to the IMAP server once to check the settings, then hangs up.
 pub async fn check_login(imap: ServerConfig, creds: Credentials) -> Result<(), LoginError> {
+    let result = run(move || async move { imap_login(&imap, &creds).await }).await;
+    result.unwrap_or_else(|| Err(LoginError::Other(CRASHED.to_string())))
+}
+
+/// Checks a new account: IMAP login first, then SMTP login (nothing is
+/// sent), so an account is never saved with a sending server that
+/// refuses it.
+pub async fn check_account(
+    imap: ServerConfig,
+    smtp: ServerConfig,
+    creds: Credentials,
+) -> Result<(), LoginError> {
     let result = run(move || async move {
-        match ImapSource::connect(&imap, &creds).await {
-            Ok(_) => Ok(()),
-            Err(SyncError::Auth(_)) => Err(LoginError::Refused),
-            Err(SyncError::Connect(detail)) => Err(LoginError::Unreachable(detail)),
+        imap_login(&imap, &creds).await?;
+        match avero_sync::smtp::check(&smtp, &creds).await {
+            Ok(()) => Ok(()),
+            Err(SendError::Auth(_)) => Err(LoginError::SmtpRefused),
+            Err(SendError::Connect(detail)) => Err(LoginError::SmtpUnreachable(detail)),
             Err(other) => Err(LoginError::Other(other.to_string())),
         }
     })
     .await;
     result.unwrap_or_else(|| Err(LoginError::Other(CRASHED.to_string())))
+}
+
+async fn imap_login(imap: &ServerConfig, creds: &Credentials) -> Result<(), LoginError> {
+    match ImapSource::connect(imap, creds).await {
+        Ok(_) => Ok(()),
+        Err(SyncError::Auth(_)) => Err(LoginError::Refused),
+        Err(SyncError::Connect(detail) | SyncError::Timeout(detail)) => {
+            Err(LoginError::Unreachable(detail))
+        }
+        Err(other) => Err(LoginError::Other(other.to_string())),
+    }
+}
+
+/// The SMTP server of an address: the built-in table, else the network
+/// discovery. Used to complete accounts made before SMTP existed.
+pub async fn discover_smtp(email: String) -> Option<ServerConfig> {
+    let config = match avero_autoconfig::known(&email) {
+        Some(config) => config,
+        None => discover(email.clone()).await?,
+    };
+    Some(ServerConfig {
+        host: config.smtp.host.clone(),
+        port: config.smtp.port,
+        username: config.smtp.username_for(&email),
+        security: match config.smtp.security {
+            avero_autoconfig::Security::Tls => avero_core::Security::Tls,
+            avero_autoconfig::Security::StartTls => avero_core::Security::StartTls,
+        },
+    })
+}
+
+/// Parses a message on its own thread (MIME decoding and HTML to text
+/// can take a while on a big message): the UI never waits for it. A
+/// panic of the parser comes back as an error.
+pub async fn parse_message(raw: Vec<u8>) -> Result<OpenedBody, String> {
+    let (sender, receiver) = oneshot::channel();
+    std::thread::spawn(move || {
+        let parsed = avero_sync::parse::guarded(|| OpenedBody::parse(&raw));
+        let _ = sender.send(parsed);
+    });
+    receiver.await.unwrap_or_else(|_| Err(CRASHED.to_string()))
+}
+
+/// A parsed message ready for the reader, with its attachments decoded
+/// once (forward and save use them without parsing again).
+#[derive(Clone)]
+pub struct OpenedBody {
+    pub parsed: ParsedBody,
+    pub attachments: Vec<Arc<Vec<u8>>>,
+}
+
+impl OpenedBody {
+    pub fn parse(raw: &[u8]) -> OpenedBody {
+        let (parsed, data) = avero_sync::parse::parse_with_attachments(raw);
+        OpenedBody {
+            parsed,
+            attachments: data.into_iter().map(Arc::new).collect(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenedBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedBody")
+            .field("subject", &self.parsed.subject)
+            .field("attachments", &self.attachments.len())
+            .finish()
+    }
 }
 
 /// Finds the servers of an address (table, ISPDB, autoconfig, guess).
@@ -158,6 +246,47 @@ mod tests {
             security: Security::Tls,
         };
         let result = check_login(imap, Credentials::Password("pw".into())).await;
+        assert!(
+            matches!(result, Err(LoginError::Unreachable(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parsing_happens_off_thread_and_decodes_attachments_once() {
+        let raw = [
+            "Subject: Facture",
+            "Content-Type: multipart/mixed; boundary=b",
+            "",
+            "--b",
+            "Content-Type: text/plain",
+            "",
+            "Bonjour",
+            "--b",
+            "Content-Type: application/pdf; name=f.pdf",
+            "Content-Disposition: attachment; filename=f.pdf",
+            "",
+            "%PDF",
+            "--b--",
+            "",
+        ]
+        .join("\r\n")
+        .into_bytes();
+        let opened = parse_message(raw).await.unwrap();
+        assert_eq!(opened.parsed.subject, "Facture");
+        assert_eq!(opened.attachments.len(), opened.parsed.attachments.len());
+        assert_eq!(opened.attachments[0].as_slice(), b"%PDF");
+    }
+
+    #[tokio::test]
+    async fn smtp_problems_are_reported_after_imap() {
+        let imap = ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: "a@x".into(),
+            security: Security::Tls,
+        };
+        let result = check_account(imap.clone(), imap, Credentials::Password("pw".into())).await;
         assert!(
             matches!(result, Err(LoginError::Unreachable(_))),
             "{result:?}"

@@ -190,6 +190,10 @@ fn chip<'a>(
 fn folders(app: &App) -> Element<'_, Message> {
     let mut tabs = Row::new().spacing(2).align_y(Alignment::Center);
     for (role, name, icon) in FOLDERS {
+        // Gmail's archive is "All Mail", which is not synced: no view.
+        if role == FolderRole::Archive && !app.archive_view && app.folder != role {
+            continue;
+        }
         let selected = app.search_query.is_none() && app.folder == role;
         let tone = if selected { Tone::Accent } else { Tone::Muted };
         let mut content = Row::new()

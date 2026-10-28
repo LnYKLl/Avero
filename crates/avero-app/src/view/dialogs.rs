@@ -2,9 +2,10 @@
 
 use super::add_account::{error_line, spinner_line};
 use super::{field_label, icon_button};
-use crate::app::{AccountMsg, App, Message, Overlay, PasswordDialog};
+use crate::app::{AccountMsg, App, Message, Overlay, PasswordDialog, ServerField, ServersForm};
 use crate::icons::Icon;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
+use avero_core::Security;
 use iced::widget::{Column, button, column, container, row, space, text, text_input};
 use iced::{Alignment, Element, Fill};
 
@@ -18,6 +19,8 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::Rename { account, name } => rename(app, *account, name),
         Overlay::ConfirmDelete(account) => confirm_delete(app, *account),
         Overlay::Reconnect(account) => reconnect(app, *account),
+        Overlay::Servers(form) => servers(app, form),
+        Overlay::ConfirmDeleteForever(rows) => confirm_delete_forever(rows.len()),
     }
 }
 
@@ -144,6 +147,98 @@ fn confirm_delete(app: &App, account: avero_core::AccountId) -> Element<'_, Mess
     ]
     .spacing(14);
     card("Supprimer le compte", body.into())
+}
+
+fn servers<'a>(app: &'a App, form: &'a ServersForm) -> Element<'a, Message> {
+    let email = app
+        .account(form.account)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let field = |label: &'static str, field: ServerField, value: &str, width: f32| {
+        column![
+            field_label(label),
+            text_input("", value)
+                .on_input(move |v| Message::Account(AccountMsg::ServerText(field, v)))
+                .on_submit(Message::Account(AccountMsg::SaveServers))
+                .padding([8, 10])
+                .size(13)
+                .style(theme::input),
+        ]
+        .spacing(4)
+        .width(if width > 0.0 {
+            iced::Length::Fixed(width)
+        } else {
+            Fill
+        })
+    };
+    let security = |label: &'static str, value: Security| {
+        button(text(label).size(12).font(MEDIUM))
+            .padding([6, 10])
+            .on_press(Message::Account(AccountMsg::ServerSecurity(value)))
+            .style(theme::chip(form.smtp_security == value))
+    };
+    let mut body = Column::new()
+        .spacing(12)
+        .push(
+            text(format!("Serveurs utilisés par {email}."))
+                .size(13)
+                .style(theme::muted),
+        )
+        .push(text("Réception (IMAP, TLS)").size(13).font(SEMIBOLD))
+        .push(
+            row![
+                field("Serveur", ServerField::ImapHost, &form.imap_host, 0.0),
+                field("Port", ServerField::ImapPort, &form.imap_port, 80.0),
+            ]
+            .spacing(10),
+        )
+        .push(text("Envoi (SMTP)").size(13).font(SEMIBOLD))
+        .push(
+            row![
+                field("Serveur", ServerField::SmtpHost, &form.smtp_host, 0.0),
+                field("Port", ServerField::SmtpPort, &form.smtp_port, 80.0),
+            ]
+            .spacing(10),
+        )
+        .push(
+            row![
+                text("Chiffrement").size(12).style(theme::muted).width(Fill),
+                security("TLS (465)", Security::Tls),
+                security("STARTTLS (587)", Security::StartTls),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    if let Some(error) = &form.error {
+        body = body.push(error_line(error));
+    }
+    body = body.push(buttons(
+        "Enregistrer",
+        Some(Message::Account(AccountMsg::SaveServers)),
+        theme::primary,
+    ));
+    card("Serveurs", body.into())
+}
+
+fn confirm_delete_forever<'a>(count: usize) -> Element<'a, Message> {
+    let what = if count > 1 {
+        "Ces messages sont déjà dans la corbeille."
+    } else {
+        "Ce message est déjà dans la corbeille."
+    };
+    let body = column![
+        text(what).size(14).font(MEDIUM),
+        text("Il sera supprimé définitivement du serveur. Cette action est irréversible.")
+            .size(13)
+            .style(theme::muted),
+        buttons(
+            "Supprimer définitivement",
+            Some(Message::ConfirmDeleteForever),
+            theme::danger,
+        ),
+    ]
+    .spacing(14);
+    card("Supprimer définitivement", body.into())
 }
 
 fn reconnect(app: &App, account: avero_core::AccountId) -> Element<'_, Message> {

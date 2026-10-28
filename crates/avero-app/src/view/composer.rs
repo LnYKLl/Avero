@@ -141,7 +141,7 @@ pub fn view<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
             .height(Fill)
             .center_x(Fill),
         hr(),
-        bottom(composer),
+        bottom(app, composer),
     ])
     .width(Fill)
     .height(Fill)
@@ -173,7 +173,7 @@ fn input<'a>(
         .into()
 }
 
-fn bottom(composer: &Composer) -> Element<'_, Message> {
+fn bottom<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
     let mut files = Row::new().spacing(8).align_y(Alignment::Center);
     for (index, attachment) in composer.attachments.iter().enumerate() {
         files = files.push(
@@ -214,6 +214,21 @@ fn bottom(composer: &Composer) -> Element<'_, Message> {
             ))
             .size(11)
             .style(theme::muted),
+        );
+    }
+    let smtp_missing = app
+        .account(composer.from)
+        .is_some_and(|a| a.smtp.host.trim().is_empty());
+    if smtp_missing && composer.error.is_none() {
+        info = info.push(
+            row![
+                icons::icon(Icon::Alert, 14.0, Tone::Danger),
+                text(crate::worker::SMTP_MISSING)
+                    .size(12)
+                    .style(theme::danger_text),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
         );
     }
     if let Some(error) = &composer.error {

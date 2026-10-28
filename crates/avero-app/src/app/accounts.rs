@@ -1,11 +1,13 @@
 //! Adding, fixing and removing accounts, and what workers report.
 
-use super::{AccountMsg, AccountStatus, AddMsg, App, Backend, Message, Overlay, PasswordDialog};
+use super::{
+    AccountMsg, AccountStatus, AddMsg, App, Backend, Message, Overlay, PasswordDialog, ServersForm,
+};
 use crate::account_form::{self, AccountForm, Stage};
 use crate::auth::{self, OAuthGrant};
 use crate::background::{self, LoginError};
 use crate::worker::{AccountError, ErrorKind, Event, Job};
-use avero_core::{AccountFilter, AccountId, Credentials, NewAccount};
+use avero_core::{AccountFilter, AccountId, Credentials, NewAccount, ServerConfig};
 use avero_oauth::Provider;
 use iced::Task;
 use std::path::PathBuf;
@@ -26,10 +28,7 @@ impl App {
 
     pub(super) fn on_worker_event(&mut self, account: AccountId, event: Event) -> Task<Message> {
         match event {
-            Event::Progress => {
-                self.reload();
-                Task::none()
-            }
+            Event::Progress => self.reload_soon(),
             Event::Synced(result) => {
                 let status = self.status.entry(account).or_default();
                 status.syncing = false;
@@ -40,13 +39,12 @@ impl App {
                     }
                     Err(error) => status.error = Some(error),
                 }
-                self.reload();
+                self.reload_now();
                 Task::none()
             }
             Event::Body { row_id, result } => {
-                self.body_arrived(row_id, result);
-                self.reload();
-                Task::none()
+                let parse = self.body_arrived(row_id, result);
+                Task::batch([parse, self.reload_soon()])
             }
             Event::Done(Ok(())) => Task::none(),
             Event::Done(Err(error)) => {
@@ -65,6 +63,8 @@ impl App {
                 if let Some(composer) = &mut self.composer {
                     composer.sending = false;
                 }
+                self.body_lost();
+                self.reload_now();
                 Task::none()
             }
         }
@@ -243,7 +243,8 @@ impl App {
         if demo {
             return Task::done(Message::Add(AddMsg::Checked(generation, Ok(()))));
         }
-        let check = background::check_login(account.imap, Credentials::Password(password));
+        let check =
+            background::check_account(account.imap, account.smtp, Credentials::Password(password));
         Task::perform(check, move |result| {
             Message::Add(AddMsg::Checked(generation, result))
         })
@@ -346,23 +347,47 @@ impl App {
                 return Task::none();
             }
         };
+        // The secret goes to the keyring before the worker starts, so its
+        // first sync finds it. Never to the database.
+        let (keyring_value, access) = match secret {
+            NewSecret::Password(password) => (Some(password), None),
+            NewSecret::OAuth(grant) => (
+                grant.refresh_token.map(|token| {
+                    auth::OAuthSecret {
+                        refresh_token: token,
+                    }
+                    .to_json()
+                }),
+                Some(grant.access),
+            ),
+        };
+        if let (Backend::Live { secrets, .. }, Some(value)) = (&self.backend, keyring_value)
+            && let Err(e) = secrets.set(account.id, &value)
+        {
+            let _ = self.store.delete_account(account.id);
+            if let Some(form) = self.form() {
+                form.error = Some(format!("Coffre-fort inaccessible : {e}"));
+            }
+            return Task::none();
+        }
         self.overlay = None;
         self.accounts.push(account.clone());
         self.start_worker(&account);
         self.screen = super::Screen::Mail;
         self.reload();
         let id = account.id;
-        let store_secret = self.request(id, |reply| match secret {
-            NewSecret::Password(password) => Job::SetPassword { password, reply },
-            NewSecret::OAuth(grant) => Job::SetOAuth {
-                refresh_token: grant.refresh_token,
-                access: grant.access,
-                reply,
-            },
-        });
         let sync = self.sync_account(id);
         let toast = self.toast(format!("Compte ajouté : {}", account.email), false);
-        Task::batch([store_secret.chain(sync), toast])
+        let Some(access) = access else {
+            return Task::batch([sync, toast]);
+        };
+        // The access token only lives in the worker's memory.
+        let hand_token = self.request(id, |reply| Job::SetOAuth {
+            refresh_token: None,
+            access,
+            reply,
+        });
+        Task::batch([hand_token.chain(sync), toast])
     }
 
     // ---------------------------------------------------- manage accounts
@@ -413,6 +438,30 @@ impl App {
             AccountMsg::ConfirmDelete => self.delete_account(),
             AccountMsg::Reconnect(id) => self.reconnect(id),
             AccountMsg::Reconnected(id, result) => self.reconnected(id, result),
+            AccountMsg::OpenServers(id) => {
+                if let Some(account) = self.account(id) {
+                    self.overlay = Some(Overlay::Servers(ServersForm::of(account)));
+                }
+                Task::none()
+            }
+            AccountMsg::ServerText(field, text) => {
+                if let Some(Overlay::Servers(form)) = &mut self.overlay {
+                    form.set(field, text);
+                }
+                Task::none()
+            }
+            AccountMsg::ServerSecurity(security) => {
+                if let Some(Overlay::Servers(form)) = &mut self.overlay {
+                    form.smtp_security = security;
+                    form.smtp_port = match security {
+                        avero_core::Security::Tls => "465".into(),
+                        avero_core::Security::StartTls => "587".into(),
+                    };
+                }
+                Task::none()
+            }
+            AccountMsg::SaveServers => self.save_servers(),
+            AccountMsg::SmtpFound(id, found) => self.smtp_found(id, found),
             AccountMsg::CloseDialog => {
                 self.oauth_cancel = None;
                 self.overlay = None;
@@ -444,6 +493,96 @@ impl App {
             *slot = account;
         }
         self.overlay = None;
+        Task::none()
+    }
+
+    /// Saves the "Serveurs" dialog and resyncs with the new settings.
+    fn save_servers(&mut self) -> Task<Message> {
+        let Some(Overlay::Servers(form)) = &self.overlay else {
+            return Task::none();
+        };
+        let Some(account) = self.account(form.account).cloned() else {
+            return Task::none();
+        };
+        match form.apply(&account) {
+            Ok((imap, smtp)) => {
+                let saved = self.save_account_servers(account.id, imap, smtp);
+                self.overlay = None;
+                self.status.entry(account.id).or_default().error = None;
+                match saved {
+                    Ok(()) => {
+                        let sync = self.sync_account(account.id);
+                        let toast = self.toast("Serveurs enregistrés", false);
+                        Task::batch([sync, toast])
+                    }
+                    Err(e) => self.toast(e, true),
+                }
+            }
+            Err(error) => {
+                if let Some(Overlay::Servers(form)) = &mut self.overlay {
+                    form.error = Some(error);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// Writes new servers to the database, the account list and its worker.
+    fn save_account_servers(
+        &mut self,
+        id: AccountId,
+        imap: ServerConfig,
+        smtp: ServerConfig,
+    ) -> Result<(), String> {
+        let Some(mut account) = self.account(id).cloned() else {
+            return Ok(());
+        };
+        self.store
+            .update_account(id, &account.name, &imap, &smtp, account.auth)
+            .map_err(|e| format!("Erreur de la base locale : {e}"))?;
+        account.imap = imap;
+        account.smtp = smtp;
+        self.send_job(id, Job::UpdateAccount(account.clone()));
+        if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
+            *slot = account;
+        }
+        Ok(())
+    }
+
+    /// Accounts made before V1 have no SMTP server: look it up in the
+    /// background (built-in table, then the network) and save it.
+    pub(super) fn complete_smtp_settings(&self) -> Task<Message> {
+        if self.is_demo() {
+            return Task::none();
+        }
+        Task::batch(
+            self.accounts
+                .iter()
+                .filter(|a| a.smtp.host.trim().is_empty())
+                .map(|a| {
+                    let id = a.id;
+                    Task::perform(background::discover_smtp(a.email.clone()), move |found| {
+                        Message::Account(AccountMsg::SmtpFound(id, found))
+                    })
+                }),
+        )
+    }
+
+    fn smtp_found(&mut self, id: AccountId, found: Option<ServerConfig>) -> Task<Message> {
+        let Some(account) = self.account(id).cloned() else {
+            return Task::none();
+        };
+        let Some(mut smtp) = found else {
+            return Task::none();
+        };
+        if !account.smtp.host.trim().is_empty() {
+            return Task::none();
+        }
+        // The login is the one that already works for IMAP.
+        smtp.username = account.imap.username.clone();
+        if let Err(e) = self.save_account_servers(id, account.imap.clone(), smtp) {
+            return self.toast(e, true);
+        }
         Task::none()
     }
 
@@ -581,6 +720,13 @@ impl App {
             Err(error) if error.is_empty() => return Task::none(),
             Err(error) => return self.toast(error, true),
         };
+        let email = self
+            .account(id)
+            .map(|a| a.email.clone())
+            .unwrap_or_default();
+        if let Err(error) = auth::check_grant_email(&email, grant.email.as_deref()) {
+            return self.toast(error, true);
+        }
         self.status.insert(id, AccountStatus::default());
         let store = self.request(id, |reply| Job::SetOAuth {
             refresh_token: grant.refresh_token,
@@ -617,6 +763,20 @@ pub fn login_message(error: &LoginError, app_password: bool) -> String {
                 "Serveur injoignable : {detail}. Vérifiez l'adresse du serveur et votre connexion."
             )
         }
+        LoginError::SmtpRefused if app_password => {
+            "Le serveur d'envoi (SMTP) a refusé l'adresse ou le mot de passe. Ce service demande \
+             un mot de passe d'application (pas votre mot de passe habituel)."
+                .to_string()
+        }
+        LoginError::SmtpRefused => {
+            "La réception fonctionne, mais le serveur d'envoi (SMTP) a refusé l'adresse \
+             ou le mot de passe. Vérifiez les paramètres avancés."
+                .to_string()
+        }
+        LoginError::SmtpUnreachable(detail) => format!(
+            "Serveur d'envoi (SMTP) injoignable : {detail}. Vérifiez son adresse, son port \
+             et le chiffrement dans les paramètres avancés."
+        ),
         LoginError::Other(detail) => format!("Connexion impossible : {detail}"),
     }
 }

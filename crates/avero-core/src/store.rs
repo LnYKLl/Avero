@@ -60,17 +60,37 @@ impl Store {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let steps: [(i64, &str); 2] = [
+        let steps: [(i64, &str); 3] = [
             (1, include_str!("schema.sql")),
             (2, include_str!("schema_v2.sql")),
+            (3, include_str!("schema_v3.sql")),
         ];
         for (target, sql) in steps {
             if version < target {
-                self.conn.execute_batch(&format!(
+                // Rebuilding a table needs foreign keys off, which can only
+                // be switched outside a transaction.
+                self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+                let result = self.conn.execute_batch(&format!(
                     "BEGIN;\n{sql}\nPRAGMA user_version = {target};\nCOMMIT;"
-                ))?;
+                ));
+                if result.is_err() {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                }
+                self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                result?;
             }
         }
+        Ok(())
+    }
+
+    /// Forgets local changes left pending by a previous run (its jobs are
+    /// gone): hidden rows come back, server flags apply again.
+    pub fn clear_pending(&self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE messages SET seen_pending = 0, hidden = 0
+             WHERE seen_pending != 0 OR hidden != 0",
+            [],
+        )?;
         Ok(())
     }
 
@@ -340,6 +360,7 @@ impl Store {
                  FROM messages m JOIN folders f ON f.id = m.folder_id
                  WHERE (?1 IS NULL OR f.role = ?1)
                    AND (?2 IS NULL OR f.account_id = ?2)
+                   AND m.hidden = 0
                    {fts_condition}
              ),
              ranked AS (
@@ -404,7 +425,7 @@ impl Store {
             "SELECT COUNT(*) FROM (
                  SELECT 1
                  FROM messages m JOIN folders f ON f.id = m.folder_id
-                 WHERE f.role = ?1 AND (?2 IS NULL OR f.account_id = ?2)
+                 WHERE f.role = ?1 AND (?2 IS NULL OR f.account_id = ?2) AND m.hidden = 0
                  GROUP BY COALESCE(m.message_id, 'row:' || m.id)
                  HAVING MIN(m.seen) = 0
              )",
@@ -476,13 +497,46 @@ impl Store {
         Ok(())
     }
 
-    /// Marks rows as read or unread locally.
+    /// Marks rows as read or unread locally. The change stays pending
+    /// (the server's flag does not overwrite it) until `confirm_seen`.
     pub fn set_seen(&self, row_ids: &[i64], seen: bool) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt = tx.prepare("UPDATE messages SET seen = ?1 WHERE id = ?2")?;
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET seen = ?1, seen_pending = seen_pending + 1 WHERE id = ?2",
+            )?;
             for &id in row_ids {
                 stmt.execute(params![seen, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One pending read/unread change of these rows reached the server
+    /// (or failed): the server's flags apply again once none is left.
+    pub fn confirm_seen(&self, row_ids: &[i64]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET seen_pending = MAX(seen_pending - 1, 0) WHERE id = ?1",
+            )?;
+            for &id in row_ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hides rows from every list (while they are being moved on the
+    /// server) or shows them again (the move failed).
+    pub fn set_hidden(&self, row_ids: &[i64], hidden: bool) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE messages SET hidden = ?1 WHERE id = ?2")?;
+            for &id in row_ids {
+                stmt.execute(params![hidden, id])?;
             }
         }
         tx.commit()?;
@@ -512,24 +566,29 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Applies the flags the server reported for a folder: `present` holds
-    /// `(uid, seen)` for every message from UID 1 up to the highest one.
+    /// Applies the flags the server reported for the UIDs `from..=to` of a
+    /// folder: `present` holds `(uid, seen)` for every message the server
+    /// has in that range.
     ///
-    /// Stored UIDs listed in `present` get its seen flag. Stored UIDs at or
-    /// below the highest listed UID but missing from it were expunged on the
-    /// server and are removed. UIDs above it are kept: they may be newer
-    /// than the flag listing. An empty `present` changes nothing.
-    pub fn apply_flags(&self, folder: FolderId, present: &[(u32, bool)]) -> Result<(), StoreError> {
-        let Some(highest) = present.iter().map(|&(uid, _)| uid).max() else {
-            return Ok(());
-        };
+    /// Stored UIDs listed in `present` get its seen flag, unless a local
+    /// read/unread change is still on its way to the server. Stored UIDs in
+    /// the range but missing from `present` were expunged on the server and
+    /// are removed. UIDs outside the range are not touched.
+    pub fn apply_flags(
+        &self,
+        folder: FolderId,
+        from: u32,
+        to: u32,
+        present: &[(u32, bool)],
+    ) -> Result<(), StoreError> {
         let listed: std::collections::HashSet<u32> = present.iter().map(|&(uid, _)| uid).collect();
         let stored = self.inbox_uids(folder)?;
 
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut update = tx.prepare(
-                "UPDATE messages SET seen = ?1 WHERE folder_id = ?2 AND uid = ?3 AND seen != ?1",
+                "UPDATE messages SET seen = ?1
+                 WHERE folder_id = ?2 AND uid = ?3 AND seen != ?1 AND seen_pending = 0",
             )?;
             for &(uid, seen) in present {
                 update.execute(params![seen, folder.0, uid])?;
@@ -537,7 +596,7 @@ impl Store {
             let mut delete =
                 tx.prepare("DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2")?;
             for (uid, _) in stored {
-                if uid <= highest && !listed.contains(&uid) {
+                if (from..=to).contains(&uid) && !listed.contains(&uid) {
                     delete.execute(params![folder.0, uid])?;
                 }
             }
@@ -1111,18 +1170,89 @@ mod tests {
         let msgs: Vec<NewMessage> = [1, 2, 3, 4, 7].iter().map(|&u| msg(u, None, 1)).collect();
         s.insert_messages(f.id, &msgs).unwrap();
 
-        // 2 was expunged, 1 and 4 were read elsewhere; 7 is above the
-        // highest listed UID, so it stays.
-        s.apply_flags(f.id, &[(1, true), (3, false), (4, true)])
+        // 2 was expunged, 1 and 4 were read elsewhere; 7 is outside the
+        // range asked, so it stays.
+        s.apply_flags(f.id, 1, 4, &[(1, true), (3, false), (4, true)])
             .unwrap();
 
         assert_eq!(
             s.inbox_uids(f.id).unwrap(),
             vec![(1, true), (3, false), (4, true), (7, false)]
         );
-        // Nothing listed: nothing changes.
-        s.apply_flags(f.id, &[]).unwrap();
-        assert_eq!(s.inbox_uids(f.id).unwrap().len(), 4);
+        // An empty range on the server: its stored messages are gone.
+        s.apply_flags(f.id, 5, 9, &[]).unwrap();
+        assert_eq!(s.inbox_uids(f.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn pending_local_seen_change_survives_server_flags() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let f = inbox(&s, a);
+        s.insert_messages(f.id, &[msg(1, None, 1), msg(2, None, 2)])
+            .unwrap();
+        let row1 = inbox_rows(&s)[1];
+
+        // Read locally; a sync that started before the SetSeen job still
+        // sees the old flag on the server.
+        s.set_seen(&[row1], true).unwrap();
+        s.apply_flags(f.id, 1, 2, &[(1, false), (2, true)]).unwrap();
+        assert_eq!(s.inbox_uids(f.id).unwrap(), vec![(1, true), (2, true)]);
+
+        // Read, then unread at once: two changes pending.
+        s.set_seen(&[row1], false).unwrap();
+        s.confirm_seen(&[row1]).unwrap();
+        s.apply_flags(f.id, 1, 2, &[(1, true), (2, true)]).unwrap();
+        assert_eq!(s.inbox_uids(f.id).unwrap()[0], (1, false));
+
+        // Both confirmed: the server's flag applies again.
+        s.confirm_seen(&[row1]).unwrap();
+        s.confirm_seen(&[row1]).unwrap();
+        s.apply_flags(f.id, 1, 2, &[(1, true), (2, true)]).unwrap();
+        assert_eq!(s.inbox_uids(f.id).unwrap()[0], (1, true));
+    }
+
+    #[test]
+    fn hidden_rows_leave_lists_and_counts_until_shown() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let f = inbox(&s, a);
+        s.insert_messages(f.id, &[msg(1, None, 1), msg(2, None, 2)])
+            .unwrap();
+        let rows = inbox_rows(&s);
+        s.set_hidden(&rows[..1], true).unwrap();
+        assert_eq!(inbox_rows(&s), rows[1..].to_vec());
+        assert_eq!(
+            s.unread_count(FolderRole::Inbox, AccountFilter::All)
+                .unwrap(),
+            1
+        );
+        assert!(
+            s.search("subject", None, AccountFilter::All, 10)
+                .unwrap()
+                .iter()
+                .all(|i| i.row_ids != rows[..1])
+        );
+        s.set_hidden(&rows[..1], false).unwrap();
+        assert_eq!(inbox_rows(&s), rows);
+
+        s.set_hidden(&rows, true).unwrap();
+        s.set_seen(&rows, true).unwrap();
+        s.clear_pending().unwrap();
+        assert_eq!(inbox_rows(&s), rows);
+        s.apply_flags(f.id, 1, 2, &[(1, false), (2, false)])
+            .unwrap();
+        assert!(all_inbox(&s).iter().all(|i| !i.seen));
+    }
+
+    #[test]
+    fn deleted_account_id_is_never_reused() {
+        let s = Store::open_in_memory().unwrap();
+        let _a = acct(&s, "a@x");
+        let b = acct(&s, "b@x");
+        s.delete_account(b).unwrap();
+        let c = acct(&s, "c@x");
+        assert!(c.0 > b.0, "{c:?} reuses {b:?}");
     }
 
     #[test]
@@ -1191,7 +1321,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);
@@ -1205,6 +1335,13 @@ mod tests {
         let found = s.search("marie", None, AccountFilter::All, 10).unwrap();
         assert_eq!(found.len(), 1);
         s.put_body(item.row_ids[0], b"raw", "texte", false).unwrap();
+
+        // The accounts table was rebuilt: folders still point to it and
+        // ids are not reused any more.
+        assert_eq!(s.folders(AccountId(1)).unwrap().len(), 1);
+        s.delete_account(AccountId(1)).unwrap();
+        let again = s.add_account(new_account("b@x")).unwrap();
+        assert_eq!(again.id, AccountId(2));
         drop(s);
 
         // Opening again does not run the migration twice.

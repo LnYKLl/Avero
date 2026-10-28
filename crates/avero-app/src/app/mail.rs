@@ -1,15 +1,15 @@
 //! The message list, the reading pane and the actions on a message.
 
-use super::{App, Body, Message, PAGE, Reading};
+use super::{App, Body, Message, Overlay, PAGE, RELOAD_EVERY, Reading};
+use crate::background::{self, OpenedBody};
 use crate::compose::Mode;
-use crate::worker::{Destination, Job};
+use crate::worker::{Destination, Event, Job};
 use avero_core::{AccountFilter, AccountId, FolderRole, MessageRef, UnifiedItem};
-use avero_sync::parse::{attachment_data, parse_body};
 use iced::Task;
 use iced::widget::text_editor;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Delay between the last key typed in the search field and the search.
 const SEARCH_DELAY: Duration = Duration::from_millis(250);
@@ -109,6 +109,33 @@ impl App {
         self.refresh_unread();
     }
 
+    /// `reload`, and remember when (for `reload_soon`).
+    pub(super) fn reload_now(&mut self) {
+        self.last_reload = Some(Instant::now());
+        self.reload();
+    }
+
+    /// Reload for sync progress: at most once per [`RELOAD_EVERY`]; a
+    /// reload asked too early is done when its turn comes.
+    pub(super) fn reload_soon(&mut self) -> Task<Message> {
+        let since = self.last_reload.map(|at| at.elapsed());
+        match since {
+            Some(elapsed) if elapsed < RELOAD_EVERY => {
+                if self.reload_scheduled {
+                    return Task::none();
+                }
+                self.reload_scheduled = true;
+                Task::perform(super::sleep(RELOAD_EVERY - elapsed), |()| {
+                    Message::ReloadDue
+                })
+            }
+            _ => {
+                self.reload_now();
+                Task::none()
+            }
+        }
+    }
+
     /// The first `limit` items for the current view; on a database error
     /// logs it and returns nothing so the window keeps working.
     fn fetch(&self, limit: usize) -> Vec<UnifiedItem> {
@@ -123,6 +150,23 @@ impl App {
     }
 
     fn refresh_unread(&mut self) {
+        self.trash_accounts = self
+            .accounts
+            .iter()
+            .filter(|a| {
+                matches!(
+                    self.store.folder_by_role(a.id, FolderRole::Trash),
+                    Ok(Some(_))
+                )
+            })
+            .map(|a| a.id)
+            .collect();
+        self.archive_view = self.accounts.iter().any(|a| {
+            matches!(
+                self.store.folder_by_role(a.id, FolderRole::Archive),
+                Ok(Some(_))
+            )
+        });
         self.unread = self
             .accounts
             .iter()
@@ -170,17 +214,14 @@ impl App {
             return Task::none();
         };
         let mut tasks = Vec::new();
-        let body = match self.store.body(row) {
-            Ok(Some((raw, _))) => ready_body(raw),
-            _ => {
-                tasks.push(self.fetch_body(row));
-                Body::Loading
-            }
-        };
+        match self.store.body(row) {
+            Ok(Some((raw, _))) => tasks.push(parse_task(row, raw)),
+            _ => tasks.push(self.fetch_body(row)),
+        }
         self.reading = Some(Reading {
             rows: item.row_ids.clone(),
             accounts: item.accounts.clone(),
-            body,
+            body: Body::Loading,
         });
         if !item.seen {
             let _ = self.store.set_seen(&item.row_ids, true);
@@ -198,8 +239,26 @@ impl App {
         self.request(account, |reply| Job::FetchBody { target, reply })
     }
 
-    /// Called when a worker cached a body.
-    pub(super) fn body_arrived(&mut self, row: i64, result: Result<(), String>) {
+    /// Called when a worker cached a body: it is parsed off the UI thread.
+    pub(super) fn body_arrived(&mut self, row: i64, result: Result<(), String>) -> Task<Message> {
+        let Some(reading) = &mut self.reading else {
+            return Task::none();
+        };
+        if reading.rows.first() != Some(&row) {
+            return Task::none();
+        }
+        match result {
+            Ok(()) => match self.store.body(row) {
+                Ok(Some((raw, _))) => return parse_task(row, raw),
+                _ => reading.body = Body::Failed("Le message n'a pas pu être lu".to_string()),
+            },
+            Err(e) => reading.body = Body::Failed(e),
+        }
+        Task::none()
+    }
+
+    /// A parsed body is ready: show it if it is still the one being read.
+    pub(super) fn body_parsed(&mut self, row: i64, result: Result<Arc<OpenedBody>, String>) {
         let Some(reading) = &mut self.reading else {
             return;
         };
@@ -207,12 +266,18 @@ impl App {
             return;
         }
         reading.body = match result {
-            Ok(()) => match self.store.body(row) {
-                Ok(Some((raw, _))) => ready_body(raw),
-                _ => Body::Failed("Le message n'a pas pu être lu".to_string()),
-            },
+            Ok(opened) => ready_body(opened),
             Err(e) => Body::Failed(e),
         };
+    }
+
+    /// A worker lost the job of the message being loaded.
+    pub(super) fn body_lost(&mut self) {
+        if let Some(reading) = &mut self.reading
+            && matches!(reading.body, Body::Loading)
+        {
+            reading.body = Body::Failed("Le message n'a pas pu être chargé".to_string());
+        }
     }
 
     fn refs(&self, rows: &[i64]) -> Vec<MessageRef> {
@@ -240,65 +305,220 @@ impl App {
         self.remote_seen(&rows, false)
     }
 
-    /// Whether "Archiver" can be used on the selection.
+    /// Whether "Archiver" can be used on the selection: some account of
+    /// the message has a known archive folder.
     pub fn can_archive(&self) -> bool {
-        let Some(item) = self.selected_item() else {
-            return false;
-        };
-        self.folder != FolderRole::Archive
-            && item
-                .accounts
-                .iter()
-                .any(|id| self.status.get(id).and_then(|s| s.archive) != Some(false))
+        self.selected_item().is_some() && self.archive_problem().is_none()
+    }
+
+    /// Why "Archiver" cannot be used, for its tooltip.
+    pub fn archive_problem(&self) -> Option<&'static str> {
+        let item = self.selected_item()?;
+        if self.folder == FolderRole::Archive && self.search_query.is_none() {
+            return Some("Déjà dans les archives");
+        }
+        let known: Vec<Option<bool>> = item
+            .accounts
+            .iter()
+            .map(|id| self.status.get(id).and_then(|s| s.archive))
+            .collect();
+        if known.contains(&Some(true)) {
+            None
+        } else if known.contains(&None) {
+            Some("Disponible après la première synchronisation")
+        } else {
+            Some("Aucun dossier d'archives sur ce compte")
+        }
     }
 
     /// Whether "Supprimer" can be used on the selection.
     pub fn can_delete(&self) -> bool {
-        self.selected.is_some() && (self.folder != FolderRole::Trash || self.search_query.is_some())
+        self.selected_item().is_some() && self.delete_problem().is_none()
     }
 
-    /// Archive or delete: removes the rows locally at once, selects the
-    /// next message, then moves them on the servers.
+    /// Why "Supprimer" cannot be used, for its tooltip.
+    pub fn delete_problem(&self) -> Option<&'static str> {
+        let item = self.selected_item()?;
+        if item
+            .accounts
+            .iter()
+            .any(|id| self.trash_accounts.contains(id))
+        {
+            None
+        } else if item
+            .accounts
+            .iter()
+            .any(|id| self.status.get(id).and_then(|s| s.archive).is_none())
+        {
+            Some("Disponible après la première synchronisation")
+        } else {
+            Some("Aucune corbeille sur ce compte")
+        }
+    }
+
+    /// Whether every copy of the selection is already in a trash folder
+    /// (deleting it then means deleting it for good).
+    pub fn selection_in_trash(&self) -> bool {
+        let Some(rows) = &self.selected else {
+            return false;
+        };
+        let refs = self.refs(rows);
+        !refs.is_empty() && refs.iter().all(|r| self.is_trash_folder(r))
+    }
+
+    fn is_trash_folder(&self, target: &MessageRef) -> bool {
+        matches!(
+            self.store.folder_by_role(target.account_id, FolderRole::Trash),
+            Ok(Some(folder)) if folder.id == target.folder_id
+        )
+    }
+
+    /// Archive or delete: hides the rows at once and selects the next
+    /// message; the rows are only removed when the server confirms (shown
+    /// again otherwise). Messages already in the trash are deleted for
+    /// good, after a confirmation.
     fn move_selected(&mut self, to: Destination) -> Task<Message> {
         let allowed = match to {
             Destination::Archive => self.can_archive(),
             Destination::Trash => self.can_delete(),
         };
-        let (Some(rows), Some(index)) = (self.selected.clone(), self.selected_index()) else {
+        let Some(rows) = self.selected.clone() else {
             return Task::none();
         };
         if !allowed {
             return Task::none();
         }
+        if to == Destination::Trash && self.selection_in_trash() {
+            self.overlay = Some(Overlay::ConfirmDeleteForever(rows));
+            return Task::none();
+        }
+        let has_destination = |app: &App, account: AccountId| match to {
+            Destination::Archive => app.status.get(&account).and_then(|s| s.archive) == Some(true),
+            Destination::Trash => app.trash_accounts.contains(&account),
+        };
+        // Copies already in the destination, or on an account without
+        // one, stay where they are.
+        let targets: Vec<MessageRef> = self
+            .refs(&rows)
+            .into_iter()
+            .filter(|r| has_destination(self, r.account_id))
+            .filter(|r| match to {
+                Destination::Trash => !self.is_trash_folder(r),
+                Destination::Archive => !matches!(
+                    self.store.folder_by_role(r.account_id, FolderRole::Archive),
+                    Ok(Some(folder)) if folder.id == r.folder_id
+                ),
+            })
+            .collect();
+        if targets.is_empty() {
+            return Task::none();
+        }
+        let toast = self.toast(super::destination_label(to), false);
+        Task::batch([
+            self.hide_and_send(targets, move |targets, reply| Job::Move {
+                targets,
+                to,
+                reply,
+            }),
+            toast,
+        ])
+    }
+
+    /// "Supprimer définitivement" was confirmed.
+    pub(super) fn delete_forever(&mut self) -> Task<Message> {
+        let Some(Overlay::ConfirmDeleteForever(rows)) = self.overlay.take() else {
+            return Task::none();
+        };
         let targets = self.refs(&rows);
-        if let Err(e) = self.store.delete_messages(&rows) {
+        let toast = self.toast("Supprimé définitivement", false);
+        Task::batch([
+            self.hide_and_send(targets, |targets, reply| Job::DeleteForever {
+                targets,
+                reply,
+            }),
+            toast,
+        ])
+    }
+
+    /// Hides the rows, opens the next message and sends one job per
+    /// account; the answers come back as `Message::Moved`.
+    fn hide_and_send(
+        &mut self,
+        targets: Vec<MessageRef>,
+        make: impl Fn(Vec<MessageRef>, crate::worker::Reply) -> Job,
+    ) -> Task<Message> {
+        let index = self.selected_index();
+        let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
+        if let Err(e) = self.store.set_hidden(&rows, true) {
             return self.toast(format!("Erreur de la base locale : {e}"), true);
         }
-        self.selected = None;
-        self.reading = None;
-        self.reload();
+        let reading_hidden = self
+            .reading
+            .as_ref()
+            .is_some_and(|r| r.rows.iter().any(|row| rows.contains(row)));
+        if reading_hidden {
+            self.selected = None;
+            self.reading = None;
+        }
+        self.reload_now();
         let mut tasks: Vec<Task<Message>> = by_account(targets)
             .into_iter()
             .map(|(account, targets)| {
-                self.request(account, |reply| Job::Move { targets, to, reply })
+                let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
+                self.request(account, |reply| make(targets, reply)).map(
+                    move |message| match message {
+                        Message::Worker(_, event) => Message::Moved(rows.clone(), event),
+                        other => other,
+                    },
+                )
             })
             .collect();
-        if !self.items.is_empty() {
+        if reading_hidden
+            && let Some(index) = index
+            && !self.items.is_empty()
+        {
             tasks.push(self.open(index.min(self.items.len() - 1)));
         }
-        tasks.push(self.toast(super::destination_label(to), false));
         Task::batch(tasks)
+    }
+
+    /// A worker answered an archive or delete: confirmed rows go away,
+    /// refused ones come back with the reason.
+    pub(super) fn moved(&mut self, rows: Vec<i64>, event: Event) -> Task<Message> {
+        match event {
+            Event::Done(Ok(())) => {
+                // The worker already removed them; in demo mode it is us.
+                let _ = self.store.delete_messages(&rows);
+                self.reload_now();
+                Task::none()
+            }
+            Event::Done(Err(error)) => {
+                let _ = self.store.set_hidden(&rows, false);
+                self.reload_now();
+                self.toast(error.message, true)
+            }
+            Event::Gone => {
+                let _ = self.store.set_hidden(&rows, false);
+                self.reload_now();
+                self.toast(
+                    "Le service de ce compte s'est arrêté ; redémarrez Avero",
+                    true,
+                )
+            }
+            _ => Task::none(),
+        }
     }
 
     fn answer(&mut self, mode: Mode) -> Task<Message> {
         let Some(Reading {
-            body: Body::Ready { parsed, raw, .. },
+            body: Body::Ready { opened, .. },
             accounts,
             ..
         }) = &self.reading
         else {
             return Task::none();
         };
+        let parsed = &opened.parsed;
         let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
         let fields = crate::compose::answer(parsed, mode, &own);
         let from = accounts.first().copied().or_else(|| self.default_sender());
@@ -313,7 +533,7 @@ impl App {
                     Some(crate::compose::Attached {
                         name: a.name.clone(),
                         mime: a.mime.clone(),
-                        data: Arc::new(attachment_data(raw, a.index)?),
+                        data: opened.attachments.get(a.index)?.clone(),
                     })
                 })
                 .collect()
@@ -340,16 +560,16 @@ impl App {
 
     fn save_attachment(&mut self, index: usize) -> Task<Message> {
         let Some(Reading {
-            body: Body::Ready { parsed, raw, .. },
+            body: Body::Ready { opened, .. },
             ..
         }) = &self.reading
         else {
             return Task::none();
         };
-        let Some(attachment) = parsed.attachments.get(index) else {
+        let Some(attachment) = opened.parsed.attachments.get(index) else {
             return Task::none();
         };
-        let Some(data) = attachment_data(raw, attachment.index) else {
+        let Some(data) = opened.attachments.get(attachment.index).cloned() else {
             return self.toast("Pièce jointe illisible", true);
         };
         let name = attachment.name.clone();
@@ -357,23 +577,29 @@ impl App {
     }
 }
 
-/// Parses a cached body for the reader.
-fn ready_body(raw: Vec<u8>) -> Body {
-    let parsed = parse_body(&raw);
-    let text = if parsed.text.trim().is_empty() {
+/// Parses a raw body off the UI thread; the result comes back as
+/// `Message::BodyParsed`.
+fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
+    Task::perform(background::parse_message(raw), move |result| {
+        Message::BodyParsed(row, result.map(Arc::new))
+    })
+}
+
+/// The reader's state for a parsed body.
+fn ready_body(opened: Arc<OpenedBody>) -> Body {
+    let text = if opened.parsed.text.trim().is_empty() {
         "(Ce message ne contient pas de texte.)".to_string()
     } else {
-        parsed.text.trim_end().to_string()
+        opened.parsed.text.trim_end().to_string()
     };
     Body::Ready {
         content: text_editor::Content::with_text(&text),
-        parsed: Box::new(parsed),
-        raw: Arc::new(raw),
+        opened,
     }
 }
 
 /// Asks where to save, then writes the file.
-async fn save_file(name: String, data: Vec<u8>) -> Result<Option<String>, String> {
+async fn save_file(name: String, data: Arc<Vec<u8>>) -> Result<Option<String>, String> {
     let Some(handle) = rfd::AsyncFileDialog::new()
         .set_title("Enregistrer la pièce jointe")
         .set_file_name(&name)

@@ -13,9 +13,8 @@ use crate::background::oauth_message;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{Account, AccountFilter, Credentials, FolderRole, MessageRef};
-use avero_oauth::OAuthError;
 use avero_sync::imap::ImapSource;
-use avero_sync::parse::parse_body;
+use avero_sync::parse::{guarded, parse_body};
 use avero_sync::smtp::{self, Outgoing, SendError};
 use avero_sync::source::{MailSource, SyncError};
 use avero_sync::sync::sync_account;
@@ -116,9 +115,18 @@ pub enum Job {
         seen: bool,
         reply: Reply,
     },
+    /// Moves messages (already hidden in the list) to the archive or the
+    /// trash; their rows are deleted once the server confirms, shown
+    /// again otherwise.
     Move {
         targets: Vec<MessageRef>,
         to: Destination,
+        reply: Reply,
+    },
+    /// Deletes messages for good (they are in the trash), same contract
+    /// as `Move`.
+    DeleteForever {
+        targets: Vec<MessageRef>,
         reply: Reply,
     },
     Send {
@@ -173,8 +181,16 @@ impl WorkerHandle {
 /// State of a [`deferred`] stream.
 enum Pending {
     Start(UnboundedSender<Job>, Job, UnboundedReceiver<Event>),
-    Wait(UnboundedReceiver<Event>),
+    /// Waiting for events; `true` once the job's final event came.
+    Wait(UnboundedReceiver<Event>, bool),
     Finished,
+}
+
+impl Event {
+    /// Whether this event ends a job (everything but `Progress`).
+    pub fn is_final(&self) -> bool {
+        !matches!(self, Event::Progress)
+    }
 }
 
 fn deferred(
@@ -188,19 +204,26 @@ fn deferred(
                 if jobs.send(job).is_err() {
                     return Some((Event::Gone, Pending::Finished));
                 }
-                next_event(events).await
+                next_event(events, false).await
             }
-            Pending::Wait(events) => next_event(events).await,
+            Pending::Wait(events, done) => next_event(events, done).await,
             Pending::Finished => None,
         }
     })
 }
 
-async fn next_event(mut events: UnboundedReceiver<Event>) -> Option<(Event, Pending)> {
-    events
-        .recv()
-        .await
-        .map(|event| (event, Pending::Wait(events)))
+/// The next event; when the worker drops the reply without having sent
+/// a final event (it panicked, or lost the job), a `Gone` so the UI never
+/// waits forever.
+async fn next_event(mut events: UnboundedReceiver<Event>, done: bool) -> Option<(Event, Pending)> {
+    match events.recv().await {
+        Some(event) => {
+            let done = done || event.is_final();
+            Some((event, Pending::Wait(events, done)))
+        }
+        None if done => None,
+        None => Some((Event::Gone, Pending::Finished)),
+    }
 }
 
 /// Turns a receiver filled synchronously (demo mode) into a stream.
@@ -249,7 +272,8 @@ fn refuse(job: Job, message: &str) {
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
-        | Job::Move { reply, .. } => {
+        | Job::Move { reply, .. }
+        | Job::DeleteForever { reply, .. } => {
             let _ = reply.send(Event::Done(Err(error())));
         }
         Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
@@ -367,6 +391,10 @@ impl Worker {
                 let result = self.move_to(&targets, to).await;
                 let _ = reply.send(Event::Done(result));
             }
+            Job::DeleteForever { targets, reply } => {
+                let result = self.delete_forever(&targets).await;
+                let _ = reply.send(Event::Done(result));
+            }
             Job::Send { outgoing, reply } => {
                 let result = self.send(&outgoing).await;
                 let _ = reply.send(Event::Sent(result));
@@ -451,7 +479,7 @@ impl Worker {
                 });
                 Ok(tokens.access_token)
             }
-            Err(OAuthError::Server(code)) if code == "invalid_grant" => Err(reconnect()),
+            Err(e) if auth::needs_reconnect(&e) => Err(reconnect()),
             Err(e) => Err(AccountError::new(ErrorKind::Network, oauth_message(&e))),
         }
     }
@@ -464,9 +492,19 @@ impl Worker {
     }
 
     /// Runs `op` on the IMAP session, connecting first if needed. A lost
-    /// connection is retried once on a new session.
+    /// or silent connection is retried once on a new session.
     async fn with_session<T>(
         &mut self,
+        op: impl AsyncFnMut(&mut ImapSource, &Store) -> Result<T, SyncError>,
+    ) -> Result<T, AccountError> {
+        self.with_session_retrying(true, op).await
+    }
+
+    /// Like `with_session`; a timeout is retried only if `retry_timeout`
+    /// (not for an APPEND, which the server may have done anyway).
+    async fn with_session_retrying<T>(
+        &mut self,
+        retry_timeout: bool,
         mut op: impl AsyncFnMut(&mut ImapSource, &Store) -> Result<T, SyncError>,
     ) -> Result<T, AccountError> {
         for attempt in 0..2 {
@@ -480,7 +518,10 @@ impl Worker {
                     return Ok(value);
                 }
                 Err(SyncError::Connect(_)) if attempt == 0 => continue,
-                Err(error @ SyncError::Connect(_)) => return Err(self.classify(error)),
+                Err(SyncError::Timeout(_)) if attempt == 0 && retry_timeout => continue,
+                Err(error @ (SyncError::Connect(_) | SyncError::Timeout(_))) => {
+                    return Err(self.classify(error));
+                }
                 Err(error) => {
                     self.session = Some(session);
                     return Err(self.classify(error));
@@ -583,7 +624,8 @@ impl Worker {
                 "Ce message n'existe plus sur le serveur",
             ));
         };
-        let parsed = parse_body(&raw);
+        let parsed =
+            guarded(|| parse_body(&raw)).map_err(|e| AccountError::new(ErrorKind::Other, e))?;
         self.store
             .put_body(
                 target.row_id,
@@ -596,15 +638,70 @@ impl Worker {
             })
     }
 
+    /// Sends the flag, then lets the server's flags apply to these rows
+    /// again (on failure too: the next sync brings the truth back).
     async fn set_seen(&mut self, targets: &[MessageRef], seen: bool) -> Result<(), AccountError> {
-        for (folder, uids) in by_folder(targets) {
-            self.with_session(async |session, _store| {
-                session.select(&folder).await?;
-                session.set_seen(&uids, seen).await
-            })
-            .await?;
+        let mut result = Ok(());
+        for (folder, (uids, _rows)) in by_folder(targets) {
+            result = self
+                .with_session(async |session, _store| {
+                    session.select(&folder).await?;
+                    session.set_seen(&uids, seen).await
+                })
+                .await;
+            if result.is_err() {
+                break;
+            }
         }
-        Ok(())
+        let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
+        let _ = self.store.confirm_seen(&rows);
+        result
+    }
+
+    /// Shows rows hidden for a move that did not happen.
+    fn show(&self, rows: &[i64]) {
+        let _ = self.store.set_hidden(rows, false);
+    }
+
+    /// Runs `op` on each folder's messages; rows are deleted when the
+    /// server confirms, shown again otherwise (and after a failure, the
+    /// remaining folders are not tried).
+    async fn act_per_folder(
+        &mut self,
+        targets: &[MessageRef],
+        skip: Option<&str>,
+        op: impl AsyncFn(&mut ImapSource, &[u32]) -> Result<(), SyncError>,
+    ) -> Result<(), AccountError> {
+        let mut result = Ok(());
+        for (folder, (uids, rows)) in by_folder(targets) {
+            if result.is_err() || skip == Some(folder.as_str()) {
+                self.show(&rows);
+                continue;
+            }
+            let done = self
+                .with_session(async |session, _store| {
+                    session.select(&folder).await?;
+                    op(session, &uids).await
+                })
+                .await;
+            match done {
+                Ok(()) => {
+                    let _ = self.store.delete_messages(&rows);
+                }
+                Err(error) => {
+                    self.show(&rows);
+                    result = Err(error);
+                }
+            }
+        }
+        result
+    }
+
+    async fn delete_forever(&mut self, targets: &[MessageRef]) -> Result<(), AccountError> {
+        self.act_per_folder(targets, None, async |session, uids| {
+            session.delete_permanently(uids).await
+        })
+        .await
     }
 
     async fn move_to(
@@ -622,23 +719,20 @@ impl Worker {
                 .map(|f| f.path),
         };
         let Some(destination) = destination else {
+            let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
+            self.show(&rows);
             let what = match to {
                 Destination::Archive => "Aucun dossier d'archives sur ce compte",
                 Destination::Trash => "Aucune corbeille sur ce compte",
             };
             return Err(AccountError::new(ErrorKind::Other, what));
         };
-        for (folder, uids) in by_folder(targets) {
-            if folder == destination {
-                continue;
-            }
-            self.with_session(async |session, _store| {
-                session.select(&folder).await?;
-                session.move_to(&uids, &destination).await
-            })
-            .await?;
-        }
-        Ok(())
+        // Messages already in the destination stay where they are.
+        let skip = destination.clone();
+        self.act_per_folder(targets, Some(&skip), async |session, uids| {
+            session.move_to(uids, &destination).await
+        })
+        .await
     }
 
     /// The archive folder: one with the Archive role, else (Gmail) the
@@ -672,6 +766,9 @@ impl Worker {
     }
 
     async fn send(&mut self, outgoing: &Outgoing) -> Result<Option<String>, String> {
+        if self.account.smtp.host.trim().is_empty() {
+            return Err(SMTP_MISSING.to_string());
+        }
         let creds = self.credentials().await.map_err(|e| e.message)?;
         let raw = smtp::send(&self.account.smtp, &creds, outgoing)
             .await
@@ -689,8 +786,11 @@ impl Worker {
                 "Message envoyé, mais aucun dossier « Envoyés » pour en garder une copie".into(),
             ));
         };
+        // Never retried after a timeout: the copy may already be there.
         let appended = self
-            .with_session(async |session, _store| session.append(&sent.path, &raw, true).await)
+            .with_session_retrying(false, async |session, _store| {
+                session.append(&sent.path, &raw, true).await
+            })
             .await;
         Ok(appended.err().map(|e| {
             format!(
@@ -701,14 +801,17 @@ impl Worker {
     }
 }
 
-/// Groups messages by folder, keeping UIDs in order.
-fn by_folder(targets: &[MessageRef]) -> BTreeMap<String, Vec<u32>> {
-    let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+/// Shown when an account has no SMTP server (accounts made before V1).
+pub const SMTP_MISSING: &str =
+    "Le serveur d'envoi de ce compte n'est pas configuré (Réglages › Serveurs).";
+
+/// Groups messages by folder: their UIDs and row ids, in order.
+fn by_folder(targets: &[MessageRef]) -> BTreeMap<String, (Vec<u32>, Vec<i64>)> {
+    let mut groups: BTreeMap<String, (Vec<u32>, Vec<i64>)> = BTreeMap::new();
     for target in targets {
-        groups
-            .entry(target.folder_path.clone())
-            .or_default()
-            .push(target.uid);
+        let (uids, rows) = groups.entry(target.folder_path.clone()).or_default();
+        uids.push(target.uid);
+        rows.push(target.row_id);
     }
     groups
 }
@@ -721,6 +824,10 @@ pub fn user_error(error: &SyncError, account: &Account) -> AccountError {
         SyncError::Connect(detail) => AccountError::new(
             ErrorKind::Network,
             format!("Connexion impossible à {} : {detail}", cfg.host),
+        ),
+        SyncError::Timeout(detail) => AccountError::new(
+            ErrorKind::Network,
+            format!("Le serveur {} ne répond pas : {detail}", cfg.host),
         ),
         SyncError::Auth(_) => AccountError::new(
             ErrorKind::Auth,
@@ -948,7 +1055,141 @@ mod tests {
             uid,
         };
         let groups = by_folder(&[target("INBOX", 3), target("Spam", 9), target("INBOX", 1)]);
-        assert_eq!(groups["INBOX"], vec![3, 1]);
-        assert_eq!(groups["Spam"], vec![9]);
+        assert_eq!(groups["INBOX"], (vec![3, 1], vec![3, 1]));
+        assert_eq!(groups["Spam"], (vec![9], vec![9]));
+    }
+
+    #[tokio::test]
+    async fn closed_reply_without_final_event_gives_gone() {
+        let (jobs, mut receiver) = mpsc::unbounded_channel::<Job>();
+        // A "worker" that drops every reply after a progress event.
+        std::thread::spawn(move || {
+            while let Some(job) = receiver.blocking_recv() {
+                if let Job::Sync { reply } = job {
+                    let _ = reply.send(Event::Progress);
+                }
+            }
+        });
+        let handle = WorkerHandle { jobs };
+        let events: Vec<Event> = handle.request(|reply| Job::Sync { reply }).collect().await;
+        assert!(
+            matches!(events.as_slice(), [Event::Progress, Event::Gone]),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_event_then_close_ends_quietly() {
+        let (jobs, mut receiver) = mpsc::unbounded_channel::<Job>();
+        std::thread::spawn(move || {
+            while let Some(job) = receiver.blocking_recv() {
+                if let Job::Sync { reply } = job {
+                    let _ = reply.send(Event::Synced(Ok(true)));
+                    let _ = reply.send(Event::Progress);
+                }
+            }
+        });
+        let handle = WorkerHandle { jobs };
+        let events: Vec<Event> = handle.request(|reply| Job::Sync { reply }).collect().await;
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn sending_without_smtp_server_is_explained() {
+        let db = temp_db("nosmtp");
+        let mut account = account_at(&db, "127.0.0.1", 1, AuthKind::Password);
+        account.smtp.host.clear();
+        let secrets = Arc::new(MemorySecrets::new());
+        secrets.set(account.id, "pw").unwrap();
+        let worker = spawn(&db, account, secrets);
+        let outgoing = Outgoing {
+            from_name: None,
+            from_addr: "a@x.fr".into(),
+            to: vec![avero_sync::smtp::Recipient::new(None, "b@x.fr")],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "s".into(),
+            body: "b".into(),
+            in_reply_to: None,
+            references: None,
+            attachments: Vec::new(),
+        };
+        let events: Vec<Event> = worker
+            .request(|reply| Job::Send {
+                outgoing: Box::new(outgoing),
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Sent(Err(e))) if e == SMTP_MISSING),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_move_shows_the_rows_again_and_seen_is_confirmed() {
+        let db = temp_db("move");
+        let account = account_at(&db, "127.0.0.1", 1, AuthKind::Password);
+        let store = Store::open(&db).unwrap();
+        let inbox = store
+            .upsert_folder(account.id, "INBOX", FolderRole::Inbox)
+            .unwrap();
+        store
+            .upsert_folder(account.id, "Trash", FolderRole::Trash)
+            .unwrap();
+        let message = avero_core::NewMessage {
+            uid: 1,
+            message_id: None,
+            subject: "s".into(),
+            from_name: None,
+            from_addr: "x@y.z".into(),
+            date: 1,
+            seen: false,
+            has_attachments: false,
+        };
+        store.insert_messages(inbox.id, &[message]).unwrap();
+        let rows: Vec<i64> = store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap()
+            .into_iter()
+            .flat_map(|i| i.row_ids)
+            .collect();
+        let targets = store.message_refs(&rows).unwrap();
+        store.set_hidden(&rows, true).unwrap();
+        store.set_seen(&rows, true).unwrap();
+
+        let secrets = Arc::new(MemorySecrets::new());
+        secrets.set(account.id, "pw").unwrap();
+        let worker = spawn(&db, account, secrets);
+        // The server is unreachable: the move fails, the row comes back.
+        let events: Vec<Event> = worker
+            .request(|reply| Job::Move {
+                targets: targets.clone(),
+                to: Destination::Trash,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Done(Err(_)))),
+            "{events:?}"
+        );
+        let visible = store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap();
+        assert_eq!(visible.len(), 1, "row shown again, not deleted");
+
+        // The failed SetSeen still releases the pending marker.
+        let _: Vec<Event> = worker
+            .request(|reply| Job::SetSeen {
+                targets,
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        store.apply_flags(inbox.id, 1, 1, &[(1, false)]).unwrap();
+        assert_eq!(store.inbox_uids(inbox.id).unwrap(), vec![(1, false)]);
     }
 }

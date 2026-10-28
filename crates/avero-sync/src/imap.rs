@@ -102,7 +102,7 @@ async fn open_client(cfg: &ServerConfig) -> Result<Client<TlsStream<TcpStream>>,
     }
 }
 
-/// Runs `work`, but gives up with a connection error after `limit`.
+/// Runs `work`, but gives up with a timeout error after `limit`.
 async fn with_timeout<T>(
     limit: Duration,
     command: &str,
@@ -110,7 +110,7 @@ async fn with_timeout<T>(
 ) -> Result<T, SyncError> {
     match timeout(limit, work).await {
         Ok(result) => result,
-        Err(_) => Err(SyncError::Connect(format!(
+        Err(_) => Err(SyncError::Timeout(format!(
             "délai dépassé ({command}, {} s)",
             limit.as_secs()
         ))),
@@ -327,20 +327,60 @@ where
     Ok(headers)
 }
 
-/// `(uid, seen)` of every message from `from_uid` up.
-async fn fetch_flags_from<T>(
+/// Headers (with UID and flags) of the messages with sequence numbers
+/// `from_seq..=to_seq`. A plain FETCH with `UID` in the items returns the
+/// real UIDs, so no request is spent on UID ranges that hold nothing.
+async fn fetch_headers_seq<T>(
+    session: &mut Session<T>,
+    from_seq: u32,
+    to_seq: u32,
+) -> Result<Vec<FetchedHeader>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("FETCH {from_seq}:{to_seq} (UID FLAGS BODY.PEEK[HEADER])");
+    let mut headers = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        headers.extend(header_from_fetch(attributes, 0));
+    })
+    .await?;
+    Ok(headers)
+}
+
+/// UIDs of the messages from `from_uid` up, in increasing order.
+async fn fetch_uids_from<T>(session: &mut Session<T>, from_uid: u32) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("UID FETCH {from_uid}:* (UID)");
+    let mut uids = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        let (uid, _, _) = read_fetch(attributes);
+        // `N:*` always returns the last message, even below N.
+        if let Some(uid) = uid.filter(|&uid| uid >= from_uid) {
+            uids.push(uid);
+        }
+    })
+    .await?;
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(uids)
+}
+
+/// `(uid, seen)` of every message with a UID in `from_uid..=to_uid`.
+async fn fetch_flags_range<T>(
     session: &mut Session<T>,
     from_uid: u32,
+    to_uid: u32,
 ) -> Result<Vec<(u32, bool)>, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
-    let command = format!("UID FETCH {from_uid}:* (UID FLAGS)");
+    let command = format!("UID FETCH {from_uid}:{to_uid} (UID FLAGS)");
     let mut flags = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         let (uid, seen, _) = read_fetch(attributes);
-        // `N:*` always returns the last message, even below N.
-        if let Some(uid) = uid.filter(|&uid| uid >= from_uid) {
+        if let Some(uid) = uid.filter(|uid| (from_uid..=to_uid).contains(uid)) {
             flags.push((uid, seen));
         }
     })
@@ -454,6 +494,24 @@ where
         return run_checked(session, &format!("UID MOVE {set} {dest}")).await;
     }
     run_checked(session, &format!("UID COPY {set} {dest}")).await?;
+    expunge_uids(session, caps, uids).await
+}
+
+/// Marks messages `\Deleted` and expunges them: only those UIDs with
+/// UIDPLUS; a plain EXPUNGE also removes other messages already marked
+/// `\Deleted` in the folder.
+async fn expunge_uids<T>(
+    session: &mut Session<T>,
+    caps: ServerCaps,
+    uids: &[u32],
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let set = uid_set(uids);
     run_checked(
         session,
         &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
@@ -541,8 +599,26 @@ impl MailSource for ImapSource {
         with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
 
-    async fn fetch_flags(&mut self, from_uid: u32) -> Result<Vec<(u32, bool)>, SyncError> {
-        let fetching = fetch_flags_from(&mut self.session, from_uid);
+    async fn fetch_headers_by_seq(
+        &mut self,
+        from_seq: u32,
+        to_seq: u32,
+    ) -> Result<Vec<FetchedHeader>, SyncError> {
+        let fetching = fetch_headers_seq(&mut self.session, from_seq, to_seq);
+        with_timeout(FETCH_TIMEOUT, "FETCH", fetching).await
+    }
+
+    async fn fetch_uids(&mut self, from_uid: u32) -> Result<Vec<u32>, SyncError> {
+        let fetching = fetch_uids_from(&mut self.session, from_uid);
+        with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
+    }
+
+    async fn fetch_flags(
+        &mut self,
+        from_uid: u32,
+        to_uid: u32,
+    ) -> Result<Vec<(u32, bool)>, SyncError> {
+        let fetching = fetch_flags_range(&mut self.session, from_uid, to_uid);
         with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
 
@@ -557,6 +633,10 @@ impl MailSource for ImapSource {
 
     async fn move_to(&mut self, uids: &[u32], dest: &str) -> Result<(), SyncError> {
         move_uids(&mut self.session, self.caps, uids, dest).await
+    }
+
+    async fn delete_permanently(&mut self, uids: &[u32]) -> Result<(), SyncError> {
+        expunge_uids(&mut self.session, self.caps, uids).await
     }
 
     async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError> {
@@ -683,7 +763,7 @@ mod tests {
         let client = client_for(vec![String::new()]).await;
         let result = login(client, "user", "pw").await;
         match result {
-            Err(SyncError::Connect(text)) => assert!(text.contains("délai dépassé"), "{text}"),
+            Err(SyncError::Timeout(text)) => assert!(text.contains("délai dépassé"), "{text}"),
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("login should time out"),
         }
@@ -837,24 +917,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_flags_reads_seen_and_skips_lower_uids() {
+    async fn fetch_flags_reads_seen_in_the_range_only() {
         let reply = "* 1 FETCH (UID 3 FLAGS (\\Seen))\r\n\
                      * 2 FETCH (UID 7 FLAGS (\\Answered \\Seen))\r\n\
                      * 3 FETCH (UID 9 FLAGS ())\r\n\
+                     * 4 FETCH (UID 12 FLAGS ())\r\n\
                      {tag} OK done\r\n";
         let (mut session, server) = session_recording(vec![reply]).await;
 
-        let flags = fetch_flags_from(&mut session, 5).await.unwrap();
+        let flags = fetch_flags_range(&mut session, 5, 10).await.unwrap();
 
         assert_eq!(flags, vec![(7, true), (9, false)]);
         let sent = commands(session, server).await;
-        assert_eq!(sent, vec!["UID FETCH 5:* (UID FLAGS)"]);
+        assert_eq!(sent, vec!["UID FETCH 5:10 (UID FLAGS)"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_by_sequence_returns_real_uids() {
+        let header = "Subject: hello\r\n\r\n";
+        let reply = format!(
+            "{}{}{{tag}} OK done\r\n",
+            fetch_line(1999, 40_017, "", header),
+            fetch_line(2000, 90_123, r"\Seen", header),
+        );
+        let (mut session, server) = session_recording(vec![&reply]).await;
+
+        let headers = fetch_headers_seq(&mut session, 1999, 2000).await.unwrap();
+
+        let uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
+        assert_eq!(uids, vec![40_017, 90_123]);
+        assert!(headers[1].seen);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["FETCH 1999:2000 (UID FLAGS BODY.PEEK[HEADER])"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_uids_lists_existing_uids_only() {
+        let reply = "* 1 FETCH (UID 3)\r\n\
+                     * 2 FETCH (UID 900)\r\n\
+                     * 3 FETCH (UID 70000)\r\n\
+                     {tag} OK done\r\n";
+        let (mut session, server) = session_recording(vec![reply]).await;
+        let uids = fetch_uids_from(&mut session, 5).await.unwrap();
+        assert_eq!(uids, vec![900, 70000]);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID FETCH 5:* (UID)"]);
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_flags_and_expunges_only_those_uids() {
+        let (mut session, server) = session_recording(vec![OK, OK]).await;
+        let caps = ServerCaps {
+            move_command: true,
+            uidplus: true,
+        };
+        expunge_uids(&mut session, caps, &[4, 8]).await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec!["UID STORE 4,8 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 4,8"]
+        );
     }
 
     #[tokio::test]
     async fn fetch_flags_refused_is_protocol_error() {
         let (mut session, _server) = session_recording(vec!["{tag} BAD invalid set\r\n"]).await;
-        let result = fetch_flags_from(&mut session, 1).await;
+        let result = fetch_flags_range(&mut session, 1, 9).await;
         assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
     }
 

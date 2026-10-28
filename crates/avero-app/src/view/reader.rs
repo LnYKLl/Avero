@@ -52,7 +52,7 @@ fn empty<'a>() -> Element<'a, Message> {
 
 fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Element<'a, Message> {
     let parsed = match &reading.body {
-        Body::Ready { parsed, .. } => Some(parsed.as_ref()),
+        Body::Ready { opened, .. } => Some(&opened.parsed),
         _ => None,
     };
     let body: Element<'a, Message> = match &reading.body {
@@ -103,15 +103,14 @@ fn action_bar<'a>(
 ) -> Element<'a, Message> {
     let ready = matches!(reading.body, Body::Ready { .. });
     let when_ready = |message: Message| ready.then_some(message);
-    let archive_label = if app.can_archive() {
-        "Archiver"
-    } else {
-        "Archiver (aucun dossier d'archives)"
+    let archive_label = match app.archive_problem() {
+        None => "Archiver".to_string(),
+        Some(why) => format!("Archiver ({})", why.to_lowercase()),
     };
-    let delete_label = if app.can_delete() {
-        "Supprimer (Suppr)"
-    } else {
-        "Déjà dans la corbeille"
+    let delete_label = match app.delete_problem() {
+        None if app.selection_in_trash() => "Supprimer définitivement (Suppr)".to_string(),
+        None => "Supprimer (Suppr)".to_string(),
+        Some(why) => format!("Supprimer ({})", why.to_lowercase()),
     };
     let mut accounts = Row::new().spacing(6).align_y(Alignment::Center);
     for id in &item.accounts {

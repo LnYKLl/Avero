@@ -151,6 +151,12 @@ impl App {
         let Some(account) = self.account(composer.from) else {
             return Task::none();
         };
+        if account.smtp.host.trim().is_empty() {
+            if let Some(composer) = &mut self.composer {
+                composer.error = Some(crate::worker::SMTP_MISSING.to_string());
+            }
+            return Task::none();
+        }
         let built = compose::build(Draft {
             from_name: &account.name,
             from_addr: &account.email,
