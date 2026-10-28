@@ -106,6 +106,15 @@ const LIST_CONDITIONS: &str = "(?1 IS NULL OR f.role = ?1)
                        WHERE s.key = COALESCE(m.message_id, 'row:' || m.id)
                          AND s.woke_at IS NULL)";
 
+/// Added to `LIST_CONDITIONS` for a small folder (sent, drafts, trash...):
+/// its messages are read through the `(folder_id, uid)` index instead of
+/// going through every message. Not for the inbox, nor for the lists over
+/// every folder: they hold most messages, and reading them all in order
+/// is faster.
+const SMALL_FOLDER: &str = "AND m.folder_id IN (
+         SELECT id FROM folders
+         WHERE role = ?1 AND (?2 IS NULL OR account_id IN (SELECT value FROM json_each(?2))))";
+
 /// The conditions of a `Listing`, as parameters of `LIST_CONDITIONS`.
 struct Scope {
     role: Option<&'static str>,
@@ -118,6 +127,15 @@ struct Scope {
 }
 
 impl Scope {
+    /// `SMALL_FOLDER` when the listing is one folder other than the
+    /// inbox, else nothing.
+    fn folder_condition(&self) -> &'static str {
+        match self.role {
+            Some(role) if role != FolderRole::Inbox.as_str() => SMALL_FOLDER,
+            _ => "",
+        }
+    }
+
     /// Every folder, no condition (a search).
     fn everywhere() -> Scope {
         Scope {
@@ -934,14 +952,31 @@ impl Store {
         } else {
             "r.sort_date DESC, m.id DESC"
         };
+        // The window functions below cost a sort of every row of the list
+        // (35,000 in a big inbox) for each page. Sorted by date, the page
+        // can only hold the groups whose date is at least that of the
+        // last group of the page: only their rows are ranked. Groups of
+        // the same date at the cut are all kept, so the page is the same.
+        // ("Plus tard" is sorted otherwise, and small.)
+        let cut = if scope.snoozed {
+            ""
+        } else {
+            "AND k IN (
+                 SELECT k FROM sel GROUP BY k
+                 HAVING MAX(sort_date) >= COALESCE(
+                     (SELECT MAX(sort_date) AS d FROM sel GROUP BY k
+                      ORDER BY d DESC LIMIT 1 OFFSET ?4 + ?5 - 1),
+                     -9223372036854775808))"
+        };
+        let folders = scope.folder_condition();
         let sql = format!(
-            "WITH sel AS (
+            "WITH sel AS MATERIALIZED (
                  SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, m.flagged,
                         {key} AS k, s.until AS snoozed,
                         MAX(m.date, COALESCE(s.woke_at, 0)) AS sort_date
                  FROM messages m JOIN folders f ON f.id = m.folder_id
                  LEFT JOIN snoozes s ON s.key = {MESSAGE_KEY}
-                 WHERE {LIST_CONDITIONS}
+                 WHERE {LIST_CONDITIONS} {folders}
                    {fts_condition}
              ),
              ranked AS (
@@ -955,6 +990,7 @@ impl Store {
                         MAX(sort_date) OVER whole AS sort_date,
                         CASE WHEN ?10 THEN MIN(snoozed) OVER whole END AS snoozed_until
                  FROM sel
+                 WHERE true {cut}
                  WINDOW newest AS (PARTITION BY k ORDER BY date DESC, id DESC),
                         whole AS (PARTITION BY k ORDER BY date DESC, id DESC
                                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
@@ -1057,12 +1093,14 @@ impl Store {
             MESSAGE_KEY
         };
         let none: Option<&str> = None;
+        let folders = scope.folder_condition();
         let count: i64 = self.conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM (
                      SELECT 1
                      FROM messages m JOIN folders f ON f.id = m.folder_id
-                     WHERE {LIST_CONDITIONS} AND ?3 IS NULL AND ?4 IS NULL AND ?5 IS NULL
+                     WHERE {LIST_CONDITIONS} {folders}
+                       AND ?3 IS NULL AND ?4 IS NULL AND ?5 IS NULL
                      GROUP BY {key}
                      {having}
                  )"
@@ -2028,6 +2066,78 @@ mod tests {
     }
 
     #[test]
+    fn pages_are_the_same_with_many_lines_of_the_same_date() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let b = acct(&s, "b@x.fr");
+        let (fa, fb) = (inbox(&s, a), inbox(&s, b));
+        // Dates repeat (4 lines per date), some messages are in both
+        // inboxes, conversations span dates.
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for uid in 1..=40u32 {
+            let date = i64::from(uid / 4);
+            let id = format!("<{uid}@x>");
+            let m = if uid % 5 == 0 {
+                reply(uid, &id, Some(&format!("<{}@x>", uid - 3)), &[], date)
+            } else {
+                msg(uid, Some(&id), date)
+            };
+            if uid % 3 == 0 {
+                second.push(m.clone());
+            }
+            first.push(m);
+        }
+        s.insert_messages(fa.id, &first).unwrap();
+        s.insert_messages(fb.id, &second).unwrap();
+        for by_thread in [false, true] {
+            let listing = Listing::Folder(FolderRole::Inbox);
+            let whole = s
+                .list(&listing, AccountFilter::All, by_thread, 1000, 0)
+                .unwrap();
+            for size in [1, 3, 4, 7] {
+                let mut paged = Vec::new();
+                for page in 0..whole.len().div_ceil(size) {
+                    paged.extend(
+                        s.list(&listing, AccountFilter::All, by_thread, size, page * size)
+                            .unwrap(),
+                    );
+                }
+                assert_eq!(paged, whole, "pages of {size}, threads {by_thread}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_left_to_complete_is_found_through_an_index() {
+        let s = Store::open_in_memory().unwrap();
+        for (query, index) in [
+            (
+                "SELECT uid FROM messages WHERE folder_id = 1 AND headers_v2 = 0
+                 ORDER BY uid DESC LIMIT 500",
+                "messages_missing_headers",
+            ),
+            (
+                "SELECT uid FROM messages WHERE folder_id = 1 AND size IS NULL
+                 ORDER BY uid DESC LIMIT 500",
+                "messages_missing_sizes",
+            ),
+        ] {
+            let plan: Vec<String> = {
+                let mut stmt = s
+                    .conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                    .unwrap();
+                stmt.query_map([], |row| row.get(3))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+            };
+            assert!(plan.iter().any(|step| step.contains(index)), "{plan:?}");
+        }
+    }
+
+    #[test]
     fn merged_item_shows_newest_copy_and_paginates_groups() {
         let s = Store::open_in_memory().unwrap();
         let a = acct(&s, "a@x");
@@ -2745,10 +2855,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Undoes versions 11 (its trigger), 10, 9 and 8 (to test older
+    /// Undoes versions 11 (its trigger and indexes), 10, 9 and 8 (to test older
     /// migrations).
     const UNDO_V8: &str = "
         DROP TRIGGER messages_forget_row_keys;
+        DROP INDEX messages_missing_headers;
+        DROP INDEX messages_missing_sizes;
         DROP TABLE space_accounts;
         DROP TABLE spaces;
         DROP TABLE draft_files;

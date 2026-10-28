@@ -47,3 +47,11 @@ WHERE key LIKE 'row:%'
 UPDATE spam_learned SET key = 'gone:' || hex(randomblob(8))
 WHERE key LIKE 'row:%'
   AND key NOT IN (SELECT 'row:' || id FROM messages WHERE message_id IS NULL);
+
+-- The messages whose extra headers or size are still to be fetched again
+-- (see `Store::missing_headers` and `missing_sizes`), asked at every
+-- sync: once none is left, finding that out reads nothing.
+CREATE INDEX IF NOT EXISTS messages_missing_headers ON messages(folder_id, uid)
+    WHERE headers_v2 = 0;
+CREATE INDEX IF NOT EXISTS messages_missing_sizes ON messages(folder_id, uid)
+    WHERE size IS NULL;
