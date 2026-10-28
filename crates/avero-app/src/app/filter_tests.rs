@@ -120,6 +120,7 @@ fn arrival(uid: u32, from: &str, subject: &str) -> Arrival {
         from_name: None,
         from_addr: from.to_string(),
         subject: subject.to_string(),
+        seen: false,
     }
 }
 
@@ -496,4 +497,51 @@ fn demo_has_rules_spam_and_senders_to_clean() {
     let _ = app.view();
     let _ = app.update(Message::Rule(RuleMsg::Edit(app.rules[0].id)));
     let _ = app.view();
+}
+
+#[test]
+fn rules_also_move_new_mail_read_elsewhere_without_notifying_it() {
+    let mut ids = (AccountId(0), FolderId(0), FolderId(0));
+    let mut app = app_with(|s| {
+        ids = account(s, "moi@x.fr");
+        s.add_rule(&RuleDef {
+            name: "Lettres".into(),
+            conditions: vec![Condition {
+                field: RuleField::From,
+                value: "lettre@".into(),
+            }],
+            match_all: true,
+            mark_read: false,
+            move_to: Some(RuleMove::Trash),
+            account: None,
+        })
+        .unwrap();
+        let mut read = mail(1, "lettre@journal.fr", "La lettre du jour");
+        read.seen = true;
+        let unread = mail(2, "lea@atelier.fr", "Planning");
+        let mut read_too = mail(3, "lea@atelier.fr", "Planning (lu)");
+        read_too.seen = true;
+        s.insert_messages(ids.1, &[read, unread, read_too]).unwrap();
+    });
+    let (account_id, inbox, _) = ids;
+    let rows: Vec<i64> = (1..=3)
+        .map(|uid| row_of(&app, inbox, uid).unwrap())
+        .collect();
+    let mut arrivals = vec![
+        arrival(1, "lettre@journal.fr", "La lettre du jour"),
+        arrival(2, "lea@atelier.fr", "Planning"),
+        arrival(3, "lea@atelier.fr", "Planning (lu)"),
+    ];
+    arrivals[0].seen = true;
+    arrivals[2].seen = true;
+    // Only the unread one that stays is worth a notification.
+    let facts = app.store.arrival_facts(account_id, &[1, 2, 3]).unwrap();
+    let plan = app.plan_for_new_mail(&facts);
+    let told = super::filters::to_notify(arrivals.clone(), &facts, &plan.rows());
+    let told: Vec<u32> = told.iter().map(|a| a.uid).collect();
+    assert_eq!(told, vec![2]);
+    // The rule moves the letter read on the phone.
+    let _ = app.update(Message::Background(account_id, Event::NewMail(arrivals)));
+    assert!(moving(&app, rows[0]));
+    assert!(!moving(&app, rows[1]) && !moving(&app, rows[2]));
 }

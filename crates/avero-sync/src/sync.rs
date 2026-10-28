@@ -11,6 +11,11 @@ pub const BATCH: u32 = 500;
 pub const FIRST_SYNC: u32 = 2000;
 /// Maximum number of stored messages whose flags are asked in one request.
 pub const FLAG_CHUNK: usize = 2000;
+/// At most this many batches of headers, and as many of sizes, are
+/// fetched again per sync for the messages an older Avero stored (see
+/// [`complete_headers`]): after an update, a big mailbox is completed
+/// over several syncs instead of making one last for minutes.
+pub const REPRISE_BATCHES: usize = 4;
 
 /// What a synchronisation did.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -20,30 +25,37 @@ pub struct SyncReport {
     pub new_messages: usize,
     /// Folders left aside because the server refused a command on them.
     pub skipped_folders: usize,
-    /// Unread messages that just came into the inbox: worth a
-    /// notification. Empty on the first fill of the inbox (or after a
-    /// UIDVALIDITY change): those messages are not new, only new here.
+    /// Messages that just came into the inbox, read or not: the rules
+    /// look at them all, a notification only shows the unread ones. Empty
+    /// on the first fill of the inbox (or after a UIDVALIDITY change):
+    /// those messages are not new, only new here.
     pub arrivals: Vec<Arrival>,
+    /// Every folder is up to date (only the completion of the messages
+    /// an older Avero stored is left): `arrivals` is complete.
+    pub folders_synced: bool,
     /// Messages stored by an older Avero whose extra headers (threading,
     /// mailing lists) were fetched again.
     pub completed_headers: usize,
 }
 
-/// A new unread message of the inbox, with only what a notification
-/// shows.
+/// A new message of the inbox, with only what a notification shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arrival {
     pub uid: u32,
     pub from_name: Option<String>,
     pub from_addr: String,
     pub subject: String,
+    /// Already read elsewhere: no notification for it.
+    pub seen: bool,
 }
 
 /// Brings the local copy of the special folders (inbox, sent, drafts,
 /// archive, trash, junk) up to date, INBOX first, then resynchronises the
 /// INBOX's flags and deletions. Last, messages stored by an older Avero
 /// get the headers it did not keep (see [`complete_headers`]), INBOX
-/// first; the list is usable meanwhile.
+/// first, at most [`REPRISE_BATCHES`] batches per sync; the list is
+/// usable meanwhile. `on_progress` is called with `folders_synced` set
+/// before that last part, so new mail need not wait for it.
 ///
 /// Other folders (user folders, Gmail labels) are left aside for now: on
 /// a big account they would make the first sync very long. Folders marked
@@ -93,18 +105,30 @@ pub async fn sync_account<S: MailSource>(
         }
     }
 
+    report.folders_synced = true;
+    on_progress(&report);
+
     // Read again: the sync updated their UID validity.
     let folders = store.folders(account)?;
+    let (mut headers_left, mut sizes_left) = (REPRISE_BATCHES, REPRISE_BATCHES);
     for id in synced {
         let Some(folder) = folders.iter().find(|f| f.id == id) else {
             continue;
         };
-        match complete_headers(store, source, folder, &mut report, &mut on_progress).await {
+        let completing = complete_headers(
+            store,
+            source,
+            folder,
+            &mut headers_left,
+            &mut report,
+            &mut on_progress,
+        );
+        match completing.await {
             // A refusal leaves them for the next sync.
             Ok(()) | Err(SyncError::Protocol(_)) => {}
             Err(other) => return Err(other),
         }
-        match complete_sizes(store, source, folder).await {
+        match complete_sizes(store, source, folder, &mut sizes_left).await {
             Ok(()) | Err(SyncError::Protocol(_)) => {}
             Err(other) => return Err(other),
         }
@@ -129,22 +153,26 @@ pub async fn sync_inbox<S: MailSource>(
     let mut report = SyncReport::default();
     sync_folder(store, source, &folder, &mut report, &mut on_progress).await?;
     report.folders = 1;
+    report.folders_synced = true;
+    on_progress(&report);
     Ok(report)
 }
 
 /// Fetches again, [`BATCH`] at a time and newest first, the headers of
 /// the folder's messages stored before Avero kept the threading and
 /// mailing-list headers, so that they join their conversations. Selects
-/// the folder only if there is something to do.
+/// the folder only if there is something to do. Each batch uses one of
+/// `batches_left`; none left: the rest waits for the next sync.
 async fn complete_headers<S: MailSource>(
     store: &Store,
     source: &mut S,
     folder: &Folder,
+    batches_left: &mut usize,
     report: &mut SyncReport,
     on_progress: &mut impl FnMut(&SyncReport),
 ) -> Result<(), SyncError> {
     let mut selected = false;
-    loop {
+    while *batches_left > 0 {
         let mut uids = store.missing_headers(folder.id, BATCH as usize)?;
         if uids.is_empty() {
             return Ok(());
@@ -169,21 +197,25 @@ async fn complete_headers<S: MailSource>(
             .collect();
         // Every UID asked is marked done, so this loop always ends.
         store.complete_headers(folder.id, &uids, &messages)?;
+        *batches_left -= 1;
         report.completed_headers += messages.len();
         on_progress(report);
     }
+    Ok(())
 }
 
 /// Fetches, [`BATCH`] at a time and newest first, the size of the
 /// folder's messages stored before Avero kept it ("Grand nettoyage"
-/// shows it). Selects the folder only if there is something to do.
+/// shows it). Selects the folder only if there is something to do. Like
+/// [`complete_headers`], at most `batches_left` batches.
 async fn complete_sizes<S: MailSource>(
     store: &Store,
     source: &mut S,
     folder: &Folder,
+    batches_left: &mut usize,
 ) -> Result<(), SyncError> {
     let mut selected = false;
-    loop {
+    while *batches_left > 0 {
         let mut uids = store.missing_sizes(folder.id, BATCH as usize)?;
         if uids.is_empty() {
             return Ok(());
@@ -200,7 +232,9 @@ async fn complete_sizes<S: MailSource>(
         let sizes = source.fetch_sizes(first, last).await?;
         // Every UID asked gets a size (0 if gone), so this loop ends.
         store.set_sizes(folder.id, &uids, &sizes)?;
+        *batches_left -= 1;
     }
+    Ok(())
 }
 
 /// `\Noselect` and `\NonExistent` folders cannot be opened.
@@ -343,18 +377,16 @@ fn save_batch(
     Ok(messages)
 }
 
-/// The unread ones among messages just saved (read ones were already
-/// seen elsewhere: no notification for them).
+/// The messages just saved into the inbox, read or not (the rules look
+/// at them all; read ones get no notification).
 fn arrivals(messages: Vec<NewMessage>) -> impl Iterator<Item = Arrival> {
-    messages
-        .into_iter()
-        .filter(|message| !message.seen)
-        .map(|message| Arrival {
-            uid: message.uid,
-            from_name: message.from_name,
-            from_addr: message.from_addr,
-            subject: message.subject,
-        })
+    messages.into_iter().map(|message| Arrival {
+        uid: message.uid,
+        from_name: message.from_name,
+        from_addr: message.from_addr,
+        subject: message.subject,
+        seen: message.seen,
+    })
 }
 
 #[cfg(test)]
@@ -845,7 +877,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn only_new_unread_inbox_messages_are_arrivals() {
+    async fn only_new_inbox_messages_are_arrivals() {
         let (store, account) = setup();
         let mut source = FakeSource::default();
         source.add_folder("INBOX", &[], 1, vec![1, 2]);
@@ -860,15 +892,15 @@ pub(crate) mod tests {
         source.folder("INBOX").seen.push(4);
         source.folder("Sent").uids.push(2);
         let report = sync(&store, &mut source, account).await.unwrap();
-        assert_eq!(
-            report.arrivals,
-            vec![Arrival {
-                uid: 3,
-                from_name: None,
-                from_addr: "a@b.c".into(),
-                subject: "m3".into(),
-            }]
-        );
+        // Read or not: the rules look at both, the notification at 3.
+        let arrival = |uid: u32, seen| Arrival {
+            uid,
+            from_name: None,
+            from_addr: "a@b.c".into(),
+            subject: format!("m{uid}"),
+            seen,
+        };
+        assert_eq!(report.arrivals, vec![arrival(3, false), arrival(4, true)]);
 
         // Nothing new: nothing to tell.
         let report = sync(&store, &mut source, account).await.unwrap();
@@ -1051,8 +1083,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        // Three INBOX batches, the INBOX flags, then the Sent batch.
-        assert_eq!(seen, vec![500, 1000, 1203, 1203, 1204]);
+        // Three INBOX batches, the INBOX flags, the Sent batch, then
+        // every folder done.
+        assert_eq!(seen, vec![500, 1000, 1203, 1203, 1204, 1204]);
         assert_eq!(report.new_messages, 1204);
     }
 
@@ -1389,6 +1422,55 @@ pub(crate) mod tests {
         let report = sync(&store, &mut source, account).await.unwrap();
         assert_eq!(report.completed_headers, 0);
         assert_eq!(source.selects, vec!["INBOX", "Sent"]);
+    }
+
+    #[tokio::test]
+    async fn a_big_reprise_is_spread_over_syncs_and_new_mail_comes_first() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        let total = BATCH * (REPRISE_BATCHES as u32 + 1) + 10;
+        source.add_folder("INBOX", &[], 1, (1..=total).collect());
+        source.folder("INBOX").no_sizes = true;
+        // A first fill takes the newest FIRST_SYNC: start from a stored
+        // mailbox instead, as an older Avero left it.
+        let inbox = store
+            .upsert_folder(account, "INBOX", FolderRole::Inbox)
+            .unwrap();
+        store.reset_folder(inbox.id, 1).unwrap();
+        let old: Vec<NewMessage> = (1..=total)
+            .map(|uid| NewMessage {
+                uid,
+                message_id: Some(format!("<{uid}@old>")),
+                from_addr: "a@b.c".into(),
+                ..Default::default()
+            })
+            .collect();
+        store.insert_messages(inbox.id, &old).unwrap();
+        store.mark_headers_missing(inbox.id).unwrap();
+        source.folder("INBOX").uids.push(total + 1);
+
+        let mut seen_new_mail_at = None;
+        let mut calls = 0;
+        let report = sync_account(&store, &mut source, account, |report| {
+            calls += 1;
+            if report.folders_synced && seen_new_mail_at.is_none() {
+                seen_new_mail_at = Some((calls, report.arrivals.len(), report.completed_headers));
+            }
+        })
+        .await
+        .unwrap();
+        // The new mail was told before any old header was fetched again.
+        assert_eq!(seen_new_mail_at.map(|(_, n, done)| (n, done)), Some((1, 0)));
+        assert_eq!(report.completed_headers, BATCH as usize * REPRISE_BATCHES);
+        assert_eq!(source.size_fetches.len(), REPRISE_BATCHES);
+        // The next sync goes on where this one stopped.
+        let report = sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(
+            report.completed_headers,
+            (total - BATCH * REPRISE_BATCHES as u32) as usize
+        );
+        assert!(store.missing_headers(inbox.id, 10).unwrap().is_empty());
+        assert!(store.missing_sizes(inbox.id, 10).unwrap().is_empty());
     }
 
     #[tokio::test]

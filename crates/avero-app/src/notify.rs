@@ -158,6 +158,7 @@ mod tests {
             from_name: name.map(String::from),
             from_addr: format!("n{uid}@exemple.fr"),
             subject: subject.to_string(),
+            seen: false,
         }
     }
 

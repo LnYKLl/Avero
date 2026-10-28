@@ -1183,6 +1183,7 @@ fn new_mail_notices_follow_the_setting() {
         from_name: Some("Alice".to_string()),
         from_addr: "alice@x.fr".to_string(),
         subject: "Bonjour".to_string(),
+        seen: false,
     };
     let notices = app.notices(a, std::slice::from_ref(&arrival));
     assert_eq!(notices.len(), 1);

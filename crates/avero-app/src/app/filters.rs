@@ -194,7 +194,7 @@ impl Plan {
     }
 
     /// The rows it touches.
-    fn rows(&self) -> HashSet<i64> {
+    pub(super) fn rows(&self) -> HashSet<i64> {
         self.read
             .iter()
             .chain(self.moves.values().flatten())
@@ -365,21 +365,13 @@ impl App {
 
     // ------------------------------------------------------------ new mail
 
-    /// New mail of `account` after a sync: the rules first, then the
-    /// spam filter, then a notification for what is left.
+    /// New mail of `account` after a sync: the rules first (read or not),
+    /// then the spam filter, then a notification for what is left unread.
     pub(super) fn new_mail(&mut self, account: AccountId, arrivals: Vec<Arrival>) -> Task<Message> {
         let uids: Vec<u32> = arrivals.iter().map(|a| a.uid).collect();
         let facts = self.store.arrival_facts(account, &uids).unwrap_or_default();
         let plan = self.plan_for_new_mail(&facts);
-        let handled = plan.rows();
-        let kept: Vec<Arrival> = arrivals
-            .into_iter()
-            .filter(|arrival| {
-                !facts
-                    .iter()
-                    .any(|f| handled.contains(&f.row) && f.uid == arrival.uid)
-            })
-            .collect();
+        let kept = to_notify(arrivals, &facts, &plan.rows());
         self.notify(account, &kept);
         let spam = plan.spam;
         let task = self.run_plan(plan);
@@ -398,14 +390,15 @@ impl App {
     }
 
     /// What the enabled rules, then the spam filter (if on), do to new
-    /// messages. The filter only looks at what no rule moved, and never
-    /// at a sender the user wrote to or said "Pas spam" for.
+    /// messages. The filter only looks at what no rule moved and is
+    /// still unread (a message read elsewhere is the user's choice), and
+    /// never at a sender the user wrote to or said "Pas spam" for.
     pub(super) fn plan_for_new_mail(&self, facts: &[RuleFacts]) -> Plan {
         let mut plan = Plan::default();
         for f in facts {
             let outcome = rules::outcome(&self.rules, f);
             plan.add(f, outcome);
-            if outcome.move_to.is_some() || !self.settings.spam_filter {
+            if outcome.move_to.is_some() || !self.settings.spam_filter || f.seen {
                 continue;
             }
             let exempt = self.store.spam_exempt(&f.from_addr).unwrap_or(true);
@@ -553,4 +546,22 @@ async fn bootstrap(path: PathBuf, account: AccountId) -> Result<usize, String> {
     receiver
         .await
         .unwrap_or_else(|_| Err("le calcul s'est arrêté".to_string()))
+}
+
+/// The new mail worth a notification: unread, and left alone by the
+/// rules and the spam filter (`handled` holds the rows they act on).
+pub(super) fn to_notify(
+    arrivals: Vec<Arrival>,
+    facts: &[RuleFacts],
+    handled: &HashSet<i64>,
+) -> Vec<Arrival> {
+    arrivals
+        .into_iter()
+        .filter(|arrival| {
+            !arrival.seen
+                && !facts
+                    .iter()
+                    .any(|f| handled.contains(&f.row) && f.uid == arrival.uid)
+        })
+        .collect()
 }

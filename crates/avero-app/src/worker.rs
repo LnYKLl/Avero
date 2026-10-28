@@ -643,7 +643,8 @@ fn lock(listeners: &Listeners) -> std::sync::MutexGuard<'_, Vec<Reply>> {
 /// How a sync ended.
 struct SyncEnd {
     result: Result<(), AccountError>,
-    /// The new unread inbox messages it found (even if it failed later,
+    /// The new inbox messages it found and did not tell about yet (when
+    /// it failed before every folder was synced: even if it failed later,
     /// in another folder).
     arrivals: Vec<Arrival>,
 }
@@ -723,6 +724,9 @@ struct SyncTask<C> {
     login: Arc<Login<C>>,
     listeners: Listeners,
     scope: SyncScope,
+    /// Where new mail is told (`Event::NewMail`) as soon as every folder
+    /// is synced: the watch subscriber, if any.
+    news: Option<Reply>,
 }
 
 impl<C: Connector> SyncTask<C> {
@@ -761,8 +765,11 @@ impl<C: Connector> SyncTask<C> {
         let id = self.account.id;
         let scope = self.scope;
         let listeners = &self.listeners;
+        let news = &self.news;
         let mut session = None;
         let mut arrivals: Vec<Arrival> = Vec::new();
+        // The UIDs already told about (see `SyncTask::news`).
+        let mut told: Vec<u32> = Vec::new();
         let result = self
             .login
             .with_session(
@@ -778,6 +785,22 @@ impl<C: Connector> SyncTask<C> {
                         found.clone_from(&report.arrivals);
                         for reply in lock(listeners).iter() {
                             let _ = reply.send(Event::Progress);
+                        }
+                        // Every folder is done: the new mail is told now,
+                        // not after the completion of old messages.
+                        if report.folders_synced
+                            && let Some(news) = news
+                        {
+                            let fresh: Vec<Arrival> = report
+                                .arrivals
+                                .iter()
+                                .filter(|a| !told.contains(&a.uid))
+                                .cloned()
+                                .collect();
+                            if !fresh.is_empty() {
+                                told.extend(fresh.iter().map(|a| a.uid));
+                                let _ = news.send(Event::NewMail(fresh));
+                            }
                         }
                     };
                     let result = once_more_if_busy(BUSY_RETRY, async || match scope {
@@ -796,6 +819,8 @@ impl<C: Connector> SyncTask<C> {
             )
             .await
             .map(|_| ());
+        // What was told already is not told again at the end.
+        arrivals.retain(|a| !told.contains(&a.uid));
         SyncEnd { result, arrivals }
     }
 }
@@ -1317,6 +1342,7 @@ impl<C: Connector> Worker<C> {
             login: self.login.clone(),
             listeners: listeners.clone(),
             scope,
+            news: self.events.clone(),
         };
         // If the thread cannot start, `finished` is dropped and the
         // listeners get `sync_stopped`.
