@@ -6,7 +6,8 @@
 use crate::theme::{self, Tokens};
 use iced::widget::svg::{self, Handle};
 use iced::{Color, Element, Theme};
-use std::sync::LazyLock;
+use std::f32::consts::TAU;
+use std::sync::{LazyLock, Mutex};
 
 /// Every icon the app draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,17 +200,53 @@ pub fn icon_rotated<'a, Message: 'a>(
     tone: Tone,
     radians: f32,
 ) -> Element<'a, Message> {
-    let mut widget =
-        svg(handle(icon))
-            .width(size)
-            .height(size)
-            .style(move |theme: &Theme, _status| svg::Style {
-                color: tone.color(theme::tokens(theme)),
-            });
-    if radians != 0.0 {
-        widget = widget.rotation(iced::Rotation::Solid(iced::Radians(radians)));
+    svg(rotated_handle(icon, radians))
+        .width(size)
+        .height(size)
+        .style(move |theme: &Theme, _status| svg::Style {
+            color: tone.color(theme::tokens(theme)),
+        })
+        .into()
+}
+
+/// Positions of a spinning icon per turn.
+const SPIN_FRAMES: usize = 12;
+
+/// The icon turned by `radians`, rounded to a twelfth of a turn. The
+/// rotation is written into the SVG: iced's software renderer leaves
+/// streaks behind rotated SVG widgets.
+fn rotated_handle(icon: Icon, radians: f32) -> Handle {
+    static FRAMES: Mutex<Vec<((Icon, usize), Handle)>> = Mutex::new(Vec::new());
+    let turn = radians.rem_euclid(TAU) / TAU;
+    let frame = (turn * SPIN_FRAMES as f32).round() as usize % SPIN_FRAMES;
+    if frame == 0 {
+        return handle(icon);
     }
-    widget.into()
+    let mut frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, h)) = frames.iter().find(|(key, _)| *key == (icon, frame)) {
+        return h.clone();
+    }
+    let degrees = frame as f32 * 360.0 / SPIN_FRAMES as f32;
+    let h = Handle::from_memory(rotate_svg(bytes(icon), degrees).into_bytes());
+    frames.push(((icon, frame), h.clone()));
+    h
+}
+
+/// Wraps the content of a 24×24 icon in a rotation around its centre.
+fn rotate_svg(svg: &[u8], degrees: f32) -> String {
+    let text = String::from_utf8_lossy(svg);
+    let open_end = text
+        .find("<svg")
+        .and_then(|start| text[start..].find('>').map(|end| start + end + 1));
+    match (open_end, text.rfind("</svg>")) {
+        (Some(open), Some(close)) if open <= close => format!(
+            "{}<g transform=\"rotate({degrees} 12 12)\">{}</g>{}",
+            &text[..open],
+            &text[open..close],
+            &text[close..]
+        ),
+        _ => text.into_owned(),
+    }
 }
 
 fn svg<'a>(handle: Handle) -> iced::widget::Svg<'a> {
@@ -226,6 +263,21 @@ mod tests {
             let text = std::str::from_utf8(bytes(icon)).expect("utf-8");
             assert!(text.contains("<svg"), "{icon:?}");
         }
+    }
+
+    #[test]
+    fn spinning_icons_are_rotated_inside_the_svg() {
+        let text = rotate_svg(bytes(Icon::Refresh), 90.0);
+        let open = text.find("<g transform=\"rotate(90 12 12)\">").unwrap();
+        assert!(open > text.find("viewBox").unwrap(), "inside the <svg> tag");
+        assert!(text.trim_end().ends_with("</g></svg>"));
+        assert_eq!(text.matches("<path").count(), 4);
+        // Rounded to twelfths of a turn; a full turn is the plain icon.
+        assert_eq!(rotated_handle(Icon::Refresh, TAU), handle(Icon::Refresh));
+        assert_eq!(
+            rotated_handle(Icon::Loader, 0.5),
+            rotated_handle(Icon::Loader, 0.52)
+        );
     }
 
     #[test]
