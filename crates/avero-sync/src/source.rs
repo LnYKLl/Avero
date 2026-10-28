@@ -1,5 +1,7 @@
 //! What the sync logic needs from a mail server, as a trait.
 
+use crate::parse::parse_headers;
+use avero_core::model::{NewMessage, ServerFlags};
 use avero_core::store::StoreError;
 
 /// A folder as listed by the server.
@@ -23,7 +25,18 @@ pub struct FolderStatus {
 pub struct FetchedHeader {
     pub uid: u32,
     pub seen: bool,
+    /// Starred (`\Flagged`).
+    pub flagged: bool,
     pub raw: Vec<u8>,
+}
+
+impl FetchedHeader {
+    /// The message these headers describe, with its flags.
+    pub fn parse(&self) -> NewMessage {
+        let mut message = parse_headers(self.uid, self.seen, &self.raw);
+        message.flagged = self.flagged;
+        message
+    }
 }
 
 /// Everything that can go wrong while synchronising.
@@ -71,12 +84,12 @@ pub trait MailSource {
     /// UIDs of the messages from `from_uid` up, in increasing order.
     async fn fetch_uids(&mut self, from_uid: u32) -> Result<Vec<u32>, SyncError>;
 
-    /// `(uid, seen)` of every message with a UID in `from_uid..=to_uid`.
+    /// The flags of every message with a UID in `from_uid..=to_uid`.
     async fn fetch_flags(
         &mut self,
         from_uid: u32,
         to_uid: u32,
-    ) -> Result<Vec<(u32, bool)>, SyncError>;
+    ) -> Result<Vec<ServerFlags>, SyncError>;
 
     /// The full raw message `uid` of the selected folder, without marking it
     /// as read. `None` when the server has no such message.
@@ -84,6 +97,9 @@ pub trait MailSource {
 
     /// Marks messages of the selected folder as read or unread.
     async fn set_seen(&mut self, uids: &[u32], seen: bool) -> Result<(), SyncError>;
+
+    /// Stars or unstars (`\Flagged`) messages of the selected folder.
+    async fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<(), SyncError>;
 
     /// Moves messages of the selected folder to the folder at `dest`.
     async fn move_to(&mut self, uids: &[u32], dest: &str) -> Result<(), SyncError>;

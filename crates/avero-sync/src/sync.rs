@@ -1,6 +1,6 @@
 //! Incremental synchronisation of one account.
 
-use crate::parse::{detect_role, parse_headers};
+use crate::parse::detect_role;
 use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncError};
 use avero_core::model::{AccountId, Folder, FolderId, FolderRole, NewMessage};
 use avero_core::store::Store;
@@ -142,7 +142,7 @@ async fn complete_headers<S: MailSource>(
             .await?
             .iter()
             .filter(|h| uids.binary_search(&h.uid).is_ok())
-            .map(|h| parse_headers(h.uid, h.seen, &h.raw))
+            .map(FetchedHeader::parse)
             .collect();
         // Every UID asked is marked done, so this loop always ends.
         store.complete_headers(folder.id, &uids, &messages)?;
@@ -237,7 +237,7 @@ async fn sync_folder<S: MailSource>(
     Ok(())
 }
 
-/// Copies the server's seen flags to the stored messages of the selected
+/// Copies the server's seen and starred flags to the stored messages of the selected
 /// folder and removes the ones expunged on the server. Only the UID span
 /// of the stored messages is asked, [`FLAG_CHUNK`] messages at a time.
 async fn resync_flags<S: MailSource>(
@@ -286,10 +286,7 @@ fn save_batch(
     folder: FolderId,
     headers: Vec<FetchedHeader>,
 ) -> Result<Vec<NewMessage>, SyncError> {
-    let messages: Vec<NewMessage> = headers
-        .iter()
-        .map(|h| parse_headers(h.uid, h.seen, &h.raw))
-        .collect();
+    let messages: Vec<NewMessage> = headers.iter().map(FetchedHeader::parse).collect();
     store.insert_messages(folder, &messages)?;
     Ok(messages)
 }
@@ -311,7 +308,9 @@ fn arrivals(messages: Vec<NewMessage>) -> impl Iterator<Item = Arrival> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use avero_core::model::{AccountFilter, AuthKind, NewAccount, Security, ServerConfig};
+    use avero_core::model::{
+        AccountFilter, AuthKind, Listing, NewAccount, Security, ServerConfig, ServerFlags,
+    };
 
     /// Kind of error a fake folder can be told to return.
     #[derive(Clone, Copy)]
@@ -336,6 +335,8 @@ mod tests {
         uids: Vec<u32>,
         /// UIDs carrying `\Seen`.
         seen: Vec<u32>,
+        /// UIDs carrying `\Flagged`.
+        flagged: Vec<u32>,
         /// UIDNEXT to announce; `None` means "highest UID + 1".
         uid_next: Option<u32>,
         /// SELECT on this folder fails.
@@ -386,6 +387,7 @@ mod tests {
                 uid_validity: validity,
                 uids,
                 seen: Vec::new(),
+                flagged: Vec::new(),
                 uid_next: None,
                 select_fails: None,
                 fetch_fails_from: None,
@@ -454,6 +456,7 @@ mod tests {
                 .map(|&uid| FetchedHeader {
                     uid,
                     seen: folder.seen.contains(&uid),
+                    flagged: folder.flagged.contains(&uid),
                     raw: folder.raw(uid),
                 })
                 .collect())
@@ -484,6 +487,7 @@ mod tests {
                 .map(|uid| FetchedHeader {
                     uid,
                     seen: folder.seen.contains(&uid),
+                    flagged: folder.flagged.contains(&uid),
                     raw: folder.raw(uid),
                 })
                 .collect())
@@ -505,14 +509,18 @@ mod tests {
             &mut self,
             from_uid: u32,
             to_uid: u32,
-        ) -> Result<Vec<(u32, bool)>, SyncError> {
+        ) -> Result<Vec<ServerFlags>, SyncError> {
             let folder = self.selected();
             let path = folder.path.clone();
             let flags = folder
                 .uids
                 .iter()
                 .filter(|&&uid| (from_uid..=to_uid).contains(&uid))
-                .map(|&uid| (uid, folder.seen.contains(&uid)))
+                .map(|&uid| ServerFlags {
+                    uid,
+                    seen: folder.seen.contains(&uid),
+                    flagged: folder.flagged.contains(&uid),
+                })
                 .collect();
             self.flag_fetches.push(path);
             self.flag_ranges.push((from_uid, to_uid));
@@ -534,6 +542,15 @@ mod tests {
             folder.seen.retain(|uid| !uids.contains(uid));
             if seen {
                 folder.seen.extend(uids);
+            }
+            Ok(())
+        }
+
+        async fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<(), SyncError> {
+            let folder = self.selected();
+            folder.flagged.retain(|uid| !uids.contains(uid));
+            if flagged {
+                folder.flagged.extend(uids);
             }
             Ok(())
         }
@@ -916,6 +933,48 @@ mod tests {
         assert_eq!(stored, vec![(1, true), (3, false), (4, true)]);
     }
 
+    /// Subjects of the starred messages, as "Favoris" lists them.
+    fn starred(store: &Store) -> Vec<String> {
+        store
+            .list(&Listing::Starred, AccountFilter::All, false, 100, 0)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.subject)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stars_are_stored_then_resynced() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("INBOX", &[], 1, vec![1, 2]);
+        source.add_folder("Archive", &["\\Archive"], 1, vec![5]);
+        source.folder("INBOX").flagged = vec![1];
+        source.folder("Archive").flagged = vec![5];
+        sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(starred(&store), vec!["m5", "m1"]);
+
+        // Starred elsewhere: 2 gains its star, 1 loses it.
+        source.folder("INBOX").flagged = vec![2];
+        sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(starred(&store), vec!["m5", "m2"]);
+
+        // A local star waiting for the server is not undone by a sync.
+        let row = store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.subject == "m1")
+            .unwrap()
+            .row_ids[0];
+        store.set_flagged(&[row], true).unwrap();
+        sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(starred(&store).len(), 3);
+        store.confirm_flagged(&[row]).unwrap();
+        sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(starred(&store), vec!["m5", "m2"]);
+    }
+
     #[tokio::test]
     async fn only_the_inbox_gets_its_flags_resynced() {
         let (store, account) = setup();
@@ -1188,10 +1247,13 @@ mod tests {
         assert!(source.fetch_body(1).await.unwrap().is_some());
         assert!(source.fetch_body(9).await.unwrap().is_none());
         source.set_seen(&[1], true).await.unwrap();
+        source.set_flagged(&[2], true).await.unwrap();
+        let flag = |uid, seen, flagged| ServerFlags { uid, seen, flagged };
         assert_eq!(
             source.fetch_flags(1, 2).await.unwrap(),
-            vec![(1, true), (2, false)]
+            vec![flag(1, true, false), flag(2, false, true)]
         );
+        source.set_flagged(&[2], false).await.unwrap();
         source.move_to(&[2], "Trash").await.unwrap();
         source.append("Trash", b"raw", true).await.unwrap();
 

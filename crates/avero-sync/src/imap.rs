@@ -10,7 +10,7 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
 use async_imap::types::NameAttribute;
 use async_imap::{Authenticator, Client, Session};
-use avero_core::model::{Credentials, Security, ServerConfig};
+use avero_core::model::{Credentials, Security, ServerConfig, ServerFlags};
 use futures::TryStreamExt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -387,21 +387,25 @@ where
     Ok(uids)
 }
 
-/// `(uid, seen)` of every message with a UID in `from_uid..=to_uid`.
+/// The flags of every message with a UID in `from_uid..=to_uid`.
 async fn fetch_flags_range<T>(
     session: &mut Session<T>,
     from_uid: u32,
     to_uid: u32,
-) -> Result<Vec<(u32, bool)>, SyncError>
+) -> Result<Vec<ServerFlags>, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
     let command = format!("UID FETCH {from_uid}:{to_uid} (UID FLAGS)");
     let mut flags = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
-        let (uid, seen, _) = read_fetch(attributes);
+        let (uid, read, _) = read_fetch(attributes);
         if let Some(uid) = uid.filter(|uid| (from_uid..=to_uid).contains(uid)) {
-            flags.push((uid, seen));
+            flags.push(ServerFlags {
+                uid,
+                seen: read.seen,
+                flagged: read.flagged,
+            });
         }
     })
     .await?;
@@ -426,17 +430,26 @@ where
     Ok(body)
 }
 
-/// UID, seen flag and body section (whole message or header) of one
-/// FETCH answer.
-fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, bool, Option<Vec<u8>>) {
+/// The flags of a FETCH answer that Avero keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReadFlags {
+    seen: bool,
+    flagged: bool,
+}
+
+/// UID, flags and body section (whole message or header) of one FETCH
+/// answer.
+fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, ReadFlags, Option<Vec<u8>>) {
     let mut uid = None;
-    let mut seen = false;
+    let mut read = ReadFlags::default();
     let mut data = None;
     for attribute in attributes {
         match attribute {
             AttributeValue::Uid(value) => uid = Some(*value),
             AttributeValue::Flags(flags) => {
-                seen = flags.iter().any(|flag| flag.eq_ignore_ascii_case(r"\Seen"));
+                let has = |name: &str| flags.iter().any(|flag| flag.eq_ignore_ascii_case(name));
+                read.seen = has(r"\Seen");
+                read.flagged = has(r"\Flagged");
             }
             AttributeValue::BodySection {
                 section: None | Some(SectionPath::Full(MessageSection::Header)),
@@ -448,20 +461,25 @@ fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, bool, Option<V
             _ => {}
         }
     }
-    (uid, seen, data)
+    (uid, read, data)
 }
 
 /// Builds a `FetchedHeader` from the attributes of one FETCH answer.
 /// Returns `None` if the UID or the header block is missing.
 fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option<FetchedHeader> {
-    let (Some(uid), seen, Some(raw)) = read_fetch(attributes) else {
+    let (Some(uid), read, Some(raw)) = read_fetch(attributes) else {
         return None;
     };
     // `N:*` always returns the last message, even below N.
     if uid < from_uid {
         return None;
     }
-    Some(FetchedHeader { uid, seen, raw })
+    Some(FetchedHeader {
+        uid,
+        seen: read.seen,
+        flagged: read.flagged,
+        raw,
+    })
 }
 
 /// Runs a command that only needs a tagged OK (STORE, COPY, EXPUNGE...).
@@ -489,6 +507,24 @@ where
     }
     let sign = if seen { '+' } else { '-' };
     let command = format!("UID STORE {} {sign}FLAGS.SILENT (\\Seen)", uid_set(uids));
+    run_checked(session, &command).await
+}
+
+/// Adds or removes `\Flagged` (the star) on the given messages of the
+/// selected folder.
+async fn store_flagged<T>(
+    session: &mut Session<T>,
+    uids: &[u32],
+    flagged: bool,
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let sign = if flagged { '+' } else { '-' };
+    let command = format!("UID STORE {} {sign}FLAGS.SILENT (\\Flagged)", uid_set(uids));
     run_checked(session, &command).await
 }
 
@@ -791,7 +827,7 @@ impl MailSource for ImapSource {
         &mut self,
         from_uid: u32,
         to_uid: u32,
-    ) -> Result<Vec<(u32, bool)>, SyncError> {
+    ) -> Result<Vec<ServerFlags>, SyncError> {
         let fetching = fetch_flags_range(&mut self.session, from_uid, to_uid);
         with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
@@ -803,6 +839,10 @@ impl MailSource for ImapSource {
 
     async fn set_seen(&mut self, uids: &[u32], seen: bool) -> Result<(), SyncError> {
         store_seen(&mut self.session, uids, seen).await
+    }
+
+    async fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<(), SyncError> {
+        store_flagged(&mut self.session, uids, flagged).await
     }
 
     async fn move_to(&mut self, uids: &[u32], dest: &str) -> Result<(), SyncError> {
@@ -1092,17 +1132,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_flags_reads_seen_in_the_range_only() {
+    async fn fetch_flags_reads_seen_and_star_in_the_range_only() {
         let reply = "* 1 FETCH (UID 3 FLAGS (\\Seen))\r\n\
                      * 2 FETCH (UID 7 FLAGS (\\Answered \\Seen))\r\n\
-                     * 3 FETCH (UID 9 FLAGS ())\r\n\
+                     * 3 FETCH (UID 9 FLAGS (\\flagged))\r\n\
                      * 4 FETCH (UID 12 FLAGS ())\r\n\
                      {tag} OK done\r\n";
         let (mut session, server) = session_recording(vec![reply]).await;
 
         let flags = fetch_flags_range(&mut session, 5, 10).await.unwrap();
 
-        assert_eq!(flags, vec![(7, true), (9, false)]);
+        let flag = |uid, seen, flagged| ServerFlags { uid, seen, flagged };
+        assert_eq!(flags, vec![flag(7, true, false), flag(9, false, true)]);
         let sent = commands(session, server).await;
         assert_eq!(sent, vec!["UID FETCH 5:10 (UID FLAGS)"]);
     }
@@ -1112,7 +1153,7 @@ mod tests {
         let header = "Subject: hello\r\n\r\n";
         let reply = format!(
             "{}{}{{tag}} OK done\r\n",
-            fetch_line(1999, 40_017, "", header),
+            fetch_line(1999, 40_017, r"\Flagged", header),
             fetch_line(2000, 90_123, r"\Seen", header),
         );
         let (mut session, server) = session_recording(vec![&reply]).await;
@@ -1121,7 +1162,8 @@ mod tests {
 
         let uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
         assert_eq!(uids, vec![40_017, 90_123]);
-        assert!(headers[1].seen);
+        assert!(headers[1].seen && !headers[1].flagged);
+        assert!(!headers[0].seen && headers[0].flagged);
         let sent = commands(session, server).await;
         assert_eq!(
             sent,
@@ -1224,6 +1266,22 @@ mod tests {
             vec![
                 "UID STORE 1,4 +FLAGS.SILENT (\\Seen)",
                 "UID STORE 2 -FLAGS.SILENT (\\Seen)"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_flagged_stores_the_star_silently() {
+        let (mut session, server) = session_recording(vec![OK, OK]).await;
+        store_flagged(&mut session, &[3, 7], true).await.unwrap();
+        store_flagged(&mut session, &[3], false).await.unwrap();
+        store_flagged(&mut session, &[], true).await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec![
+                "UID STORE 3,7 +FLAGS.SILENT (\\Flagged)",
+                "UID STORE 3 -FLAGS.SILENT (\\Flagged)"
             ]
         );
     }

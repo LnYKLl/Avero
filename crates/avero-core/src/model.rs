@@ -242,6 +242,8 @@ pub struct NewMessage {
     /// Unix time in seconds.
     pub date: i64,
     pub seen: bool,
+    /// Starred (`\Flagged` on the server).
+    pub flagged: bool,
     /// Guessed from the header block (see `avero_sync::parse`).
     pub has_attachments: bool,
     /// Threading, mailing-list and recipient headers.
@@ -275,6 +277,29 @@ pub struct MessageHeaders {
     pub auto_submitted: Option<String>,
 }
 
+/// The flags of one message, as the server reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerFlags {
+    pub uid: u32,
+    /// `\Seen`: read.
+    pub seen: bool,
+    /// `\Flagged`: starred.
+    pub flagged: bool,
+}
+
+/// What a list shows, besides the accounts (see `Store::list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listing {
+    /// Every message of a folder role.
+    Folder(FolderRole),
+    /// The inbox messages of one tab (see `crate::category`).
+    Tab(crate::Category),
+    /// The starred messages of every folder but the trash and spam ones.
+    Starred,
+    /// Every message from this address (any case), in every folder.
+    Sender(String),
+}
+
 /// Which accounts the message list shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountFilter {
@@ -292,6 +317,8 @@ pub struct UnifiedItem {
     pub from_addr: String,
     pub date: i64,
     pub seen: bool,
+    /// Starred: one of its rows has `\Flagged`.
+    pub flagged: bool,
     pub has_attachments: bool,
     /// Start of the body text when the body is cached, else empty.
     pub snippet: String,

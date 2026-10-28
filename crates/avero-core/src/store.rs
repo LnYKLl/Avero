@@ -6,9 +6,11 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::category::{classify, sender_key};
 use crate::{
-    Account, AccountColor, AccountFilter, AccountId, AuthKind, Folder, FolderId, FolderRole,
-    MessageHeaders, MessageRef, NewAccount, NewMessage, Security, ServerConfig, UnifiedItem,
+    Account, AccountColor, AccountFilter, AccountId, AuthKind, Category, Folder, FolderId,
+    FolderRole, Listing, MessageHeaders, MessageRef, NewAccount, NewMessage, Security,
+    ServerConfig, ServerFlags, UnifiedItem,
 };
 
 /// Error returned by every `Store` operation.
@@ -43,7 +45,59 @@ const FOLDER_COLUMNS: &str = "id, account_id, path, role, uid_validity, last_see
 /// Columns read by `item_from_row`, in order (`r` is a ranked group, `m`
 /// its message shown, `b` that message's cached body).
 const ITEM_COLUMNS: &str = "r.ids, r.accounts, m.subject, m.from_name, m.from_addr, m.date,
-     r.all_seen, r.any_attachment, substr(b.text, 1, 1000), m.thread_id";
+     r.all_seen, r.any_attachment, substr(b.text, 1, 1000), m.thread_id, r.any_flagged";
+
+/// Which messages a list (and its unread count) takes, on `m` (a message)
+/// and `f` (its folder). Parameters: ?1 folder role, ?2 account, ?6 tab
+/// (category), ?7 sender, ?8 starred only, ?9 trash and spam left out;
+/// NULL or 0 means "no condition". ?3 (search), ?4 and ?5 (paging) are
+/// the caller's.
+const LIST_CONDITIONS: &str = "(?1 IS NULL OR f.role = ?1)
+     AND (?2 IS NULL OR f.account_id = ?2)
+     AND m.hidden = 0
+     AND (?6 IS NULL OR COALESCE(m.category, 'important') = ?6)
+     AND (?7 IS NULL OR lower(trim(m.from_addr)) = ?7)
+     AND (?8 = 0 OR m.flagged = 1)
+     AND (?9 = 0 OR f.role NOT IN ('trash', 'junk'))";
+
+/// The conditions of a `Listing`, as parameters of `LIST_CONDITIONS`.
+struct Scope {
+    role: Option<&'static str>,
+    category: Option<&'static str>,
+    sender: Option<String>,
+    starred: bool,
+    skip_trash: bool,
+}
+
+impl Scope {
+    /// Every folder, no condition (a search).
+    fn everywhere() -> Scope {
+        Scope {
+            role: None,
+            category: None,
+            sender: None,
+            starred: false,
+            skip_trash: false,
+        }
+    }
+
+    fn of(listing: &Listing) -> Scope {
+        let mut scope = Scope::everywhere();
+        match listing {
+            Listing::Folder(role) => scope.role = Some(role.as_str()),
+            Listing::Tab(category) => {
+                scope.role = Some(FolderRole::Inbox.as_str());
+                scope.category = Some(category.as_str());
+            }
+            Listing::Starred => {
+                scope.starred = true;
+                scope.skip_trash = true;
+            }
+            Listing::Sender(addr) => scope.sender = Some(sender_key(addr)),
+        }
+        scope
+    }
+}
 
 /// What makes two rows the same message: the Message-ID, or the row
 /// itself when there is none.
@@ -128,6 +182,13 @@ impl Store {
             tx.execute_batch("PRAGMA user_version = 6;")?;
             tx.commit()?;
         }
+        if version < 7 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(include_str!("schema_v7.sql"))?;
+            classify_unsorted(&tx)?;
+            tx.execute_batch("PRAGMA user_version = 7;")?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -161,8 +222,8 @@ impl Store {
     /// gone): hidden rows come back, server flags apply again.
     pub fn clear_pending(&self) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE messages SET seen_pending = 0, hidden = 0
-             WHERE seen_pending != 0 OR hidden != 0",
+            "UPDATE messages SET seen_pending = 0, flag_pending = 0, hidden = 0
+             WHERE seen_pending != 0 OR flag_pending != 0 OR hidden != 0",
             [],
         )?;
         Ok(())
@@ -345,8 +406,9 @@ impl Store {
     }
 
     /// Stores messages in one transaction; an existing `(folder, uid)` is ignored.
-    /// Each new message is also added to the search index (by trigger) and
-    /// joins its conversation (see `link_thread`).
+    /// Each new message is also added to the search index (by trigger),
+    /// joins its conversation (see `link_thread`) and gets its tab (see
+    /// `category_for`).
     pub fn insert_messages(&self, folder: FolderId, msgs: &[NewMessage]) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         {
@@ -355,12 +417,13 @@ impl Store {
                      (folder_id, uid, message_id, subject, from_name, from_addr, date, seen,
                       has_attachments, in_reply_to, refs, to_addrs, delivered_to,
                       list_unsubscribe, list_unsubscribe_post, list_id, precedence,
-                      auto_submitted, headers_v2)
+                      auto_submitted, headers_v2, flagged, category)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                         ?14, ?15, ?16, ?17, ?18, 1)",
+                         ?14, ?15, ?16, ?17, ?18, 1, ?19, ?20)",
             )?;
             for m in msgs {
                 let h = &m.headers;
+                let category = category_for(&tx, &m.from_addr, h)?;
                 let inserted = stmt.execute(params![
                     folder.0,
                     m.uid,
@@ -380,6 +443,8 @@ impl Store {
                     h.list_id,
                     h.precedence,
                     h.auto_submitted,
+                    m.flagged,
+                    category.as_str(),
                 ])?;
                 if inserted == 1 {
                     let row = tx.last_insert_rowid();
@@ -436,25 +501,30 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut find = tx
-                .prepare("SELECT id, message_id FROM messages WHERE folder_id = ?1 AND uid = ?2")?;
+            let mut find = tx.prepare(
+                "SELECT id, message_id, from_addr FROM messages
+                 WHERE folder_id = ?1 AND uid = ?2",
+            )?;
             let mut update = tx.prepare(
                 "UPDATE messages SET in_reply_to = ?1, refs = ?2, to_addrs = ?3,
                      delivered_to = ?4, list_unsubscribe = ?5, list_unsubscribe_post = ?6,
-                     list_id = ?7, precedence = ?8, auto_submitted = ?9, headers_v2 = 1
+                     list_id = ?7, precedence = ?8, auto_submitted = ?9, headers_v2 = 1,
+                     category = ?11
                  WHERE id = ?10",
             )?;
             for m in fetched.iter().filter(|m| asked.contains(&m.uid)) {
-                let found: Option<(i64, Option<String>)> = find
+                let found: Option<(i64, Option<String>, String)> = find
                     .query_row(params![folder.0, m.uid], |row| {
-                        Ok((row.get(0)?, row.get(1)?))
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                     })
                     .optional()?;
                 // The Message-ID stored at the time is the one that counts.
-                let Some((row, message_id)) = found else {
+                let Some((row, message_id, from_addr)) = found else {
                     continue;
                 };
                 let h = &m.headers;
+                // Its list headers were unknown until now: sort it again.
+                let category = category_for(&tx, &from_addr, h)?;
                 update.execute(params![
                     h.in_reply_to,
                     joined(&h.references, " "),
@@ -466,7 +536,9 @@ impl Store {
                     h.precedence,
                     h.auto_submitted,
                     row,
+                    category.as_str(),
                 ])?;
+
                 link_thread(&tx, row, message_id.as_deref(), h)?;
             }
             let mut done =
@@ -544,18 +616,11 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        self.grouped(Some(role), filter, None, false, limit, offset)
+        self.list(&Listing::Folder(role), filter, false, limit, offset)
     }
 
-    /// The list for one folder role with one item per conversation, the
-    /// most recent first. An item shows the conversation's newest message
-    /// in the folder; its `row_ids` are all the conversation's rows in the
-    /// folder (every copy), so an action on the item acts on all of them.
-    /// It is unread when one of these rows is.
-    ///
-    /// `count` and `senders` describe the whole conversation as the reader
-    /// shows it (see `thread_messages`): other folders included, except
-    /// the trash and spam ones (unless the list is one of them).
+    /// The list for one folder role with one item per conversation (see
+    /// `list`).
     pub fn threads(
         &self,
         role: FolderRole,
@@ -563,7 +628,35 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        let mut items = self.grouped(Some(role), filter, None, true, limit, offset)?;
+        self.list(&Listing::Folder(role), filter, true, limit, offset)
+    }
+
+    /// The items of a listing (a folder, a tab of the inbox, the starred
+    /// messages, one sender's messages), the most recent first.
+    ///
+    /// Without `by_thread`, one item per message, copies merged like
+    /// `unified`. With it, one item per conversation: it shows the
+    /// conversation's newest message in the listing; its `row_ids` are
+    /// all the conversation's rows in the listing (every copy), so an
+    /// action on the item acts on all of them. It is unread when one of
+    /// these rows is.
+    ///
+    /// `count` and `senders` describe the whole conversation as the reader
+    /// shows it (see `thread_messages`): other folders included, except
+    /// the trash and spam ones (unless the listing is one of them).
+    pub fn list(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<UnifiedItem>, StoreError> {
+        let scope = Scope::of(listing);
+        let mut items = self.grouped(&scope, filter, None, by_thread, limit, offset)?;
+        if !by_thread {
+            return Ok(items);
+        }
         let own = self.own_addresses()?;
         let mut stmt = self.conn.prepare(&format!(
             "SELECT COALESCE(m.message_id, 'row:' || m.id), m.from_name, m.from_addr
@@ -575,16 +668,14 @@ impl Store {
             let Some(thread) = item.thread_id else {
                 continue;
             };
-            let rows = stmt.query_map(
-                params![thread, filter_account(filter), role.as_str()],
-                |row| {
+            let rows =
+                stmt.query_map(params![thread, filter_account(filter), scope.role], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                     ))
-                },
-            )?;
+                })?;
             let mut messages = HashSet::new();
             let mut people: Vec<(String, String)> = Vec::new();
             for found in rows {
@@ -619,7 +710,7 @@ impl Store {
     ) -> Result<Vec<UnifiedItem>, StoreError> {
         let sql = format!(
             "WITH sel AS (
-                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments,
+                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, m.flagged,
                         COALESCE(m.message_id, 'row:' || m.id) AS k,
                         EXISTS (SELECT 1 FROM bodies b WHERE b.message_row = m.id) AS cached
                  FROM messages m JOIN folders f ON f.id = m.folder_id
@@ -631,7 +722,8 @@ impl Store {
                         group_concat(id) OVER whole AS ids,
                         group_concat(account_id) OVER whole AS accounts,
                         MIN(seen) OVER whole AS all_seen,
-                        MAX(has_attachments) OVER whole AS any_attachment
+                        MAX(has_attachments) OVER whole AS any_attachment,
+                        MAX(flagged) OVER whole AS any_flagged
                  FROM sel
                  WINDOW best AS (PARTITION BY k ORDER BY cached DESC, date DESC, id DESC),
                         whole AS (PARTITION BY k ORDER BY cached DESC, date DESC, id DESC
@@ -666,27 +758,28 @@ impl Store {
         filter: AccountFilter,
         limit: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
+        let scope = match role {
+            Some(role) => Scope::of(&Listing::Folder(role)),
+            None => Scope::everywhere(),
+        };
         match fts_query(query) {
-            Some(fts) => self.grouped(role, filter, Some(&fts), false, limit, 0),
+            Some(fts) => self.grouped(&scope, filter, Some(&fts), false, limit, 0),
             None => Ok(Vec::new()),
         }
     }
 
-    /// Shared by `unified`, `threads` and `search`: one item per
-    /// Message-ID (or per row when it has none), or per conversation when
-    /// `by_thread`, showing the newest row.
+    /// Shared by `list` and `search`: one item per Message-ID (or per row
+    /// when it has none), or per conversation when `by_thread`, showing
+    /// the newest row.
     fn grouped(
         &self,
-        role: Option<FolderRole>,
+        scope: &Scope,
         filter: AccountFilter,
         fts: Option<&str>,
         by_thread: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        // `None` means "no condition" (`?n IS NULL` is true).
-        let role = role.map(|r| r.as_str());
-        let account_id = filter_account(filter);
         let fts_condition = match fts {
             Some(_) => "AND m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3)",
             None => "AND ?3 IS NULL",
@@ -698,11 +791,10 @@ impl Store {
         };
         let sql = format!(
             "WITH sel AS (
-                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, {key} AS k
+                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, m.flagged,
+                        {key} AS k
                  FROM messages m JOIN folders f ON f.id = m.folder_id
-                 WHERE (?1 IS NULL OR f.role = ?1)
-                   AND (?2 IS NULL OR f.account_id = ?2)
-                   AND m.hidden = 0
+                 WHERE {LIST_CONDITIONS}
                    {fts_condition}
              ),
              ranked AS (
@@ -711,7 +803,8 @@ impl Store {
                         group_concat(id) OVER whole AS ids,
                         group_concat(account_id) OVER whole AS accounts,
                         MIN(seen) OVER whole AS all_seen,
-                        MAX(has_attachments) OVER whole AS any_attachment
+                        MAX(has_attachments) OVER whole AS any_attachment,
+                        MAX(flagged) OVER whole AS any_flagged
                  FROM sel
                  WINDOW newest AS (PARTITION BY k ORDER BY date DESC, id DESC),
                         whole AS (PARTITION BY k ORDER BY date DESC, id DESC
@@ -727,7 +820,17 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![role, account_id, fts, limit as i64, offset as i64],
+            params![
+                scope.role,
+                filter_account(filter),
+                fts,
+                limit as i64,
+                offset as i64,
+                scope.category,
+                scope.sender,
+                scope.starred,
+                scope.skip_trash,
+            ],
             |row| item_from_row(row, by_thread),
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -748,7 +851,7 @@ impl Store {
         role: FolderRole,
         filter: AccountFilter,
     ) -> Result<usize, StoreError> {
-        self.count_unread(role, filter, MESSAGE_KEY)
+        self.list_unread(&Listing::Folder(role), filter, false)
     }
 
     /// Number of conversations of the folder with an unread message
@@ -758,27 +861,44 @@ impl Store {
         role: FolderRole,
         filter: AccountFilter,
     ) -> Result<usize, StoreError> {
-        self.count_unread(role, filter, "m.thread_id")
+        self.list_unread(&Listing::Folder(role), filter, true)
     }
 
-    /// Unread groups of the folder, grouped by the SQL expression `key`.
-    fn count_unread(
+    /// Number of unread items of `list` (the same arguments, all pages).
+    pub fn list_unread(
         &self,
-        role: FolderRole,
+        listing: &Listing,
         filter: AccountFilter,
-        key: &str,
+        by_thread: bool,
     ) -> Result<usize, StoreError> {
+        let scope = Scope::of(listing);
+        let key = if by_thread {
+            "m.thread_id"
+        } else {
+            MESSAGE_KEY
+        };
+        let none: Option<&str> = None;
         let count: i64 = self.conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM (
                      SELECT 1
                      FROM messages m JOIN folders f ON f.id = m.folder_id
-                     WHERE f.role = ?1 AND (?2 IS NULL OR f.account_id = ?2) AND m.hidden = 0
+                     WHERE {LIST_CONDITIONS} AND ?3 IS NULL AND ?4 IS NULL AND ?5 IS NULL
                      GROUP BY {key}
                      HAVING MIN(m.seen) = 0
                  )"
             ),
-            params![role.as_str(), filter_account(filter)],
+            params![
+                scope.role,
+                filter_account(filter),
+                none,
+                none,
+                none,
+                scope.category,
+                scope.sender,
+                scope.starred,
+                scope.skip_trash,
+            ],
             |row| row.get(0),
         )?;
         Ok(count as usize)
@@ -878,6 +998,151 @@ impl Store {
         Ok(())
     }
 
+    /// Stars or unstars rows locally. Like `set_seen`, the change stays
+    /// pending (the server's flag does not overwrite it) until
+    /// `confirm_flagged`.
+    pub fn set_flagged(&self, row_ids: &[i64], flagged: bool) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET flagged = ?1, flag_pending = flag_pending + 1 WHERE id = ?2",
+            )?;
+            for &id in row_ids {
+                stmt.execute(params![flagged, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One pending star change of these rows reached the server (or
+    /// failed): the server's flag applies again once none is left.
+    pub fn confirm_flagged(&self, row_ids: &[i64]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET flag_pending = MAX(flag_pending - 1, 0) WHERE id = ?1",
+            )?;
+            for &id in row_ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The starred rows of the conversations of `row_ids` (in any folder
+    /// but the trash and spam ones, of the accounts allowed by `filter`),
+    /// besides `row_ids` themselves: unstarring a conversation unstars
+    /// them too, so that it leaves "Favoris".
+    pub fn starred_in_threads(
+        &self,
+        row_ids: &[i64],
+        filter: AccountFilter,
+    ) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE m.thread_id = (SELECT thread_id FROM messages WHERE id = ?1)
+               AND m.flagged = 1 AND m.hidden = 0
+               AND (?2 IS NULL OR f.account_id = ?2)
+               AND f.role NOT IN ('trash', 'junk')
+             ORDER BY m.id",
+        )?;
+        let mut found: Vec<i64> = Vec::new();
+        for &id in row_ids {
+            let rows = stmt.query_map(params![id, filter_account(filter)], |row| row.get(0))?;
+            for row in rows {
+                let row = row?;
+                if !row_ids.contains(&row) && !found.contains(&row) {
+                    found.push(row);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The tab of a stored message.
+    pub fn category(&self, row_id: i64) -> Result<Option<Category>, StoreError> {
+        let category: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT category FROM messages WHERE id = ?1",
+                params![row_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(category.map(|c| Category::parse(c.as_deref().unwrap_or(""))))
+    }
+
+    /// Puts a sender's messages in a tab, now and for the messages to
+    /// come (it wins over `classify`), along with the rows `also` (the
+    /// rest of the conversation being reclassified, whoever wrote it).
+    pub fn set_sender_category(
+        &self,
+        addr: &str,
+        category: Category,
+        also: &[i64],
+    ) -> Result<(), StoreError> {
+        let key = sender_key(addr);
+        let tx = self.conn.unchecked_transaction()?;
+        if !key.is_empty() {
+            tx.execute(
+                "INSERT INTO senders (addr, category) VALUES (?1, ?2)
+                 ON CONFLICT(addr) DO UPDATE SET category = excluded.category",
+                params![key, category.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE messages SET category = ?1 WHERE lower(trim(from_addr)) = ?2",
+                params![category.as_str(), key],
+            )?;
+        }
+        {
+            let mut stmt = tx.prepare("UPDATE messages SET category = ?1 WHERE id = ?2")?;
+            for &id in also {
+                stmt.execute(params![category.as_str(), id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The tab chosen by hand for a sender, if any.
+    pub fn sender_category(&self, addr: &str) -> Result<Option<Category>, StoreError> {
+        let category: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT category FROM senders WHERE addr = ?1",
+                params![sender_key(addr)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(category.flatten().map(|c| Category::parse(&c)))
+    }
+
+    /// Remembers that unsubscribing from a sender was asked at `at`
+    /// (Unix time in seconds).
+    pub fn mark_unsubscribed(&self, addr: &str, at: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO senders (addr, unsubscribed_at) VALUES (?1, ?2)
+             ON CONFLICT(addr) DO UPDATE SET unsubscribed_at = excluded.unsubscribed_at",
+            params![sender_key(addr), at],
+        )?;
+        Ok(())
+    }
+
+    /// When unsubscribing from a sender was asked, if it was.
+    pub fn unsubscribed_at(&self, addr: &str) -> Result<Option<i64>, StoreError> {
+        let at: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT unsubscribed_at FROM senders WHERE addr = ?1",
+                params![sender_key(addr)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(at.flatten())
+    }
+
     /// Hides rows from every list (while they are being moved on the
     /// server) or shows them again (the move failed).
     pub fn set_hidden(&self, row_ids: &[i64], hidden: bool) -> Result<(), StoreError> {
@@ -916,31 +1181,37 @@ impl Store {
     }
 
     /// Applies the flags the server reported for the UIDs `from..=to` of a
-    /// folder: `present` holds `(uid, seen)` for every message the server
-    /// has in that range.
+    /// folder: `present` holds the flags of every message the server has
+    /// in that range.
     ///
-    /// Stored UIDs listed in `present` get its seen flag, unless a local
-    /// read/unread change is still on its way to the server. Stored UIDs in
-    /// the range but missing from `present` were expunged on the server and
-    /// are removed. UIDs outside the range are not touched.
+    /// Stored UIDs listed in `present` get its seen and starred flags,
+    /// unless a local change of that flag is still on its way to the
+    /// server. Stored UIDs in the range but missing from `present` were
+    /// expunged on the server and are removed. UIDs outside the range are
+    /// not touched.
     pub fn apply_flags(
         &self,
         folder: FolderId,
         from: u32,
         to: u32,
-        present: &[(u32, bool)],
+        present: &[ServerFlags],
     ) -> Result<(), StoreError> {
-        let listed: std::collections::HashSet<u32> = present.iter().map(|&(uid, _)| uid).collect();
+        let listed: std::collections::HashSet<u32> = present.iter().map(|f| f.uid).collect();
         let stored = self.inbox_uids(folder)?;
 
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut update = tx.prepare(
+            let mut seen = tx.prepare(
                 "UPDATE messages SET seen = ?1
                  WHERE folder_id = ?2 AND uid = ?3 AND seen != ?1 AND seen_pending = 0",
             )?;
-            for &(uid, seen) in present {
-                update.execute(params![seen, folder.0, uid])?;
+            let mut flagged = tx.prepare(
+                "UPDATE messages SET flagged = ?1
+                 WHERE folder_id = ?2 AND uid = ?3 AND flagged != ?1 AND flag_pending = 0",
+            )?;
+            for flags in present {
+                seen.execute(params![flags.seen, folder.0, flags.uid])?;
+                flagged.execute(params![flags.flagged, folder.0, flags.uid])?;
             }
             let mut delete =
                 tx.prepare("DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2")?;
@@ -1022,6 +1293,57 @@ fn link_thread(
     Ok(())
 }
 
+/// The tab of a message about to be stored or completed: the one chosen
+/// by hand for its sender, else what `classify` says.
+fn category_for(
+    conn: &Connection,
+    from_addr: &str,
+    headers: &MessageHeaders,
+) -> Result<Category, StoreError> {
+    let chosen: Option<Option<String>> = conn
+        .query_row(
+            "SELECT category FROM senders WHERE addr = ?1",
+            params![sender_key(from_addr)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match chosen.flatten() {
+        Some(category) => Category::parse(&category),
+        None => classify(from_addr, headers),
+    })
+}
+
+/// Gives a tab to the messages that have none (those stored before
+/// version 7), inside the caller's transaction.
+fn classify_unsorted(conn: &Connection) -> Result<(), StoreError> {
+    let unsorted: Vec<(i64, String, MessageHeaders)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, from_addr, list_unsubscribe, list_id, precedence, auto_submitted
+             FROM messages WHERE category IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                MessageHeaders {
+                    list_unsubscribe: row.get(2)?,
+                    list_id: row.get(3)?,
+                    precedence: row.get(4)?,
+                    auto_submitted: row.get(5)?,
+                    ..Default::default()
+                },
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut update = conn.prepare("UPDATE messages SET category = ?1 WHERE id = ?2")?;
+    for (id, from_addr, headers) in unsorted {
+        let category = category_for(conn, &from_addr, &headers)?;
+        update.execute(params![category.as_str(), id])?;
+    }
+    Ok(())
+}
+
 /// `None` for an empty list, else the items joined by `separator`.
 fn joined(items: &[String], separator: &str) -> Option<String> {
     (!items.is_empty()).then(|| items.join(separator))
@@ -1067,6 +1389,7 @@ fn item_from_row(row: &rusqlite::Row, in_thread: bool) -> rusqlite::Result<Unifi
     let from_addr: String = row.get(4)?;
     let body: Option<String> = row.get(8)?;
     let thread: Option<i64> = row.get(9)?;
+    let flagged: bool = row.get(10)?;
     let mut accounts: Vec<AccountId> = parse_id_list(&accounts)
         .into_iter()
         .map(AccountId)
@@ -1083,7 +1406,9 @@ fn item_from_row(row: &rusqlite::Row, in_thread: bool) -> rusqlite::Result<Unifi
         from_addr,
         date: row.get(5)?,
         seen: row.get(6)?,
+        flagged,
         has_attachments: row.get(7)?,
+
         snippet: body.as_deref().map(snippet).unwrap_or_default(),
         thread_id: thread.filter(|_| in_thread),
         count: 1,
@@ -1695,7 +2020,7 @@ mod tests {
 
         // 2 was expunged, 1 and 4 were read elsewhere; 7 is outside the
         // range asked, so it stays.
-        s.apply_flags(f.id, 1, 4, &[(1, true), (3, false), (4, true)])
+        s.apply_flags(f.id, 1, 4, &seen_flags(&[(1, true), (3, false), (4, true)]))
             .unwrap();
 
         assert_eq!(
@@ -1703,7 +2028,7 @@ mod tests {
             vec![(1, true), (3, false), (4, true), (7, false)]
         );
         // An empty range on the server: its stored messages are gone.
-        s.apply_flags(f.id, 5, 9, &[]).unwrap();
+        s.apply_flags(f.id, 5, 9, &seen_flags(&[])).unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap().len(), 3);
     }
 
@@ -1719,19 +2044,22 @@ mod tests {
         // Read locally; a sync that started before the SetSeen job still
         // sees the old flag on the server.
         s.set_seen(&[row1], true).unwrap();
-        s.apply_flags(f.id, 1, 2, &[(1, false), (2, true)]).unwrap();
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, false), (2, true)]))
+            .unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap(), vec![(1, true), (2, true)]);
 
         // Read, then unread at once: two changes pending.
         s.set_seen(&[row1], false).unwrap();
         s.confirm_seen(&[row1]).unwrap();
-        s.apply_flags(f.id, 1, 2, &[(1, true), (2, true)]).unwrap();
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, true), (2, true)]))
+            .unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap()[0], (1, false));
 
         // Both confirmed: the server's flag applies again.
         s.confirm_seen(&[row1]).unwrap();
         s.confirm_seen(&[row1]).unwrap();
-        s.apply_flags(f.id, 1, 2, &[(1, true), (2, true)]).unwrap();
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, true), (2, true)]))
+            .unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap()[0], (1, true));
     }
 
@@ -1763,7 +2091,7 @@ mod tests {
         s.set_seen(&rows, true).unwrap();
         s.clear_pending().unwrap();
         assert_eq!(inbox_rows(&s), rows);
-        s.apply_flags(f.id, 1, 2, &[(1, false), (2, false)])
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, false), (2, false)]))
             .unwrap();
         assert!(all_inbox(&s).iter().all(|i| !i.seen));
     }
@@ -2134,7 +2462,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let ids = thread_ids(&s);
         assert_eq!(ids["Un"], 1);
         assert_eq!(ids["Deux"], 3);
@@ -2155,8 +2483,14 @@ mod tests {
     }
 
     /// Takes a database back to version 4 (to test older migrations): undoes
-    /// versions 6 and 5.
+    /// versions 7, 6 and 5.
     const UNDO_V5: &str = "
+        DROP TABLE senders;
+        DROP INDEX messages_sender;
+        DROP INDEX messages_flagged;
+        ALTER TABLE messages DROP COLUMN flagged;
+        ALTER TABLE messages DROP COLUMN flag_pending;
+        ALTER TABLE messages DROP COLUMN category;
         ALTER TABLE accounts DROP COLUMN signature;
         DROP INDEX messages_thread;
         DROP TABLE thread_links;
@@ -2172,6 +2506,309 @@ mod tests {
         ALTER TABLE messages DROP COLUMN headers_v2;
         ALTER TABLE messages DROP COLUMN thread_id;
     ";
+
+    /// Server flags with only `\Seen` (`(uid, seen)`).
+    fn seen_flags(list: &[(u32, bool)]) -> Vec<ServerFlags> {
+        list.iter()
+            .map(|&(uid, seen)| ServerFlags {
+                uid,
+                seen,
+                flagged: false,
+            })
+            .collect()
+    }
+
+    /// A message from `from` with some list headers.
+    fn from(uid: u32, from: &str, date: i64) -> NewMessage {
+        let mut m = msg(uid, Some(&format!("<{uid}@x>")), date);
+        m.from_addr = from.to_string();
+        m.subject = format!("{from} {uid}");
+        m
+    }
+
+    fn subjects(items: &[UnifiedItem]) -> Vec<String> {
+        items.iter().map(|i| i.subject.clone()).collect()
+    }
+
+    fn tab(store: &Store, category: Category) -> Vec<String> {
+        subjects(
+            &store
+                .list(&Listing::Tab(category), AccountFilter::All, true, 200, 0)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn new_messages_are_sorted_in_tabs() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        let mut news = from(1, "news@shop.fr", 10);
+        news.headers.list_unsubscribe = Some("<https://shop.fr/u>".into());
+        let mut github = from(2, "notifications@github.com", 20);
+        github.headers.list_id = Some("<repo.github.com>".into());
+        let mut person = from(3, "marie@x.fr", 30);
+        person.seen = true;
+        s.insert_messages(f.id, &[news, github, person]).unwrap();
+
+        assert_eq!(tab(&s, Category::Important), vec!["marie@x.fr 3"]);
+        assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
+        assert_eq!(
+            tab(&s, Category::Notification),
+            vec!["notifications@github.com 2"]
+        );
+        // The whole inbox still lists them all.
+        assert_eq!(threads_of(&s, FolderRole::Inbox).len(), 3);
+        let unread = |c| {
+            s.list_unread(&Listing::Tab(c), AccountFilter::All, true)
+                .unwrap()
+        };
+        assert_eq!(unread(Category::Important), 0);
+        assert_eq!(unread(Category::Newsletter), 1);
+        assert_eq!(unread(Category::Notification), 1);
+        // Tabs follow the account filter.
+        let b = acct(&s, "b@x.fr");
+        let only_b = s
+            .list(
+                &Listing::Tab(Category::Newsletter),
+                AccountFilter::Only(b),
+                true,
+                200,
+                0,
+            )
+            .unwrap();
+        assert!(only_b.is_empty());
+    }
+
+    #[test]
+    fn reclassified_sender_is_remembered() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        let mut first = from(1, "Club@Asso.fr", 10);
+        first.headers.list_id = Some("<club.asso.fr>".into());
+        s.insert_messages(f.id, &[first, from(2, "paul@x.fr", 20)])
+            .unwrap();
+        assert_eq!(tab(&s, Category::Newsletter), vec!["Club@Asso.fr 1"]);
+        let paul_row = threads_of(&s, FolderRole::Inbox)[0].row_ids[0];
+
+        // Moved to Important by hand, with Paul's message of the thread.
+        s.set_sender_category(" club@asso.FR", Category::Important, &[paul_row])
+            .unwrap();
+        assert!(tab(&s, Category::Newsletter).is_empty());
+        assert_eq!(
+            s.sender_category("CLUB@asso.fr").unwrap(),
+            Some(Category::Important)
+        );
+        assert_eq!(s.category(paul_row).unwrap(), Some(Category::Important));
+        // The next message of that sender goes to Important too.
+        let mut next = from(3, "club@asso.fr", 30);
+        next.headers.list_id = Some("<club.asso.fr>".into());
+        s.insert_messages(f.id, &[next]).unwrap();
+        assert_eq!(tab(&s, Category::Important).len(), 3);
+        // And to Notifications once chosen so.
+        s.set_sender_category("club@asso.fr", Category::Notification, &[])
+            .unwrap();
+        assert_eq!(tab(&s, Category::Notification).len(), 2);
+        assert_eq!(s.sender_category("paul@x.fr").unwrap(), None);
+    }
+
+    #[test]
+    fn completed_headers_sort_old_messages_again() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        s.insert_messages(f.id, &[from(1, "news@shop.fr", 10)])
+            .unwrap();
+        assert_eq!(tab(&s, Category::Important).len(), 1);
+        s.mark_headers_missing(f.id).unwrap();
+        let mut again = from(1, "news@shop.fr", 10);
+        again.headers.list_unsubscribe = Some("<mailto:u@shop.fr>".into());
+        s.complete_headers(f.id, &[1], &[again]).unwrap();
+        assert_eq!(tab(&s, Category::Newsletter).len(), 1);
+    }
+
+    #[test]
+    fn unsubscribing_is_remembered_per_sender() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.unsubscribed_at("news@shop.fr").unwrap(), None);
+        s.set_sender_category("news@shop.fr", Category::Newsletter, &[])
+            .unwrap();
+        s.mark_unsubscribed(" News@Shop.fr", 1234).unwrap();
+        assert_eq!(s.unsubscribed_at("news@shop.fr").unwrap(), Some(1234));
+        // The tab chosen for the sender stays.
+        assert_eq!(
+            s.sender_category("news@shop.fr").unwrap(),
+            Some(Category::Newsletter)
+        );
+    }
+
+    #[test]
+    fn sender_view_lists_every_folder_and_account() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let b = acct(&s, "b@x.fr");
+        let fa = inbox(&s, a);
+        let archive = folder(&s, a, "Archive", FolderRole::Archive);
+        let fb = inbox(&s, b);
+        s.insert_messages(
+            fa.id,
+            &[from(1, "marie@x.fr", 10), from(2, "paul@x.fr", 20)],
+        )
+        .unwrap();
+        s.insert_messages(archive, &[from(3, "Marie@X.fr", 5)])
+            .unwrap();
+        s.insert_messages(fb.id, &[from(4, "marie@x.fr ", 30)])
+            .unwrap();
+
+        let marie = Listing::Sender("MARIE@x.fr".into());
+        let all = s.list(&marie, AccountFilter::All, false, 200, 0).unwrap();
+        assert_eq!(
+            subjects(&all),
+            vec!["marie@x.fr  4", "marie@x.fr 1", "Marie@X.fr 3"]
+        );
+        let only_a = s
+            .list(&marie, AccountFilter::Only(a), false, 200, 0)
+            .unwrap();
+        assert_eq!(only_a.len(), 2);
+        assert_eq!(s.list_unread(&marie, AccountFilter::All, false).unwrap(), 3);
+    }
+
+    #[test]
+    fn starred_messages_of_every_folder_are_listed() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let fa = inbox(&s, a);
+        let archive = folder(&s, a, "Archive", FolderRole::Archive);
+        let trash = folder(&s, a, "Trash", FolderRole::Trash);
+        let mut starred = from(1, "marie@x.fr", 10);
+        starred.flagged = true;
+        s.insert_messages(fa.id, &[starred, from(2, "paul@x.fr", 20)])
+            .unwrap();
+        let mut archived = from(3, "luc@x.fr", 30);
+        archived.flagged = true;
+        s.insert_messages(archive, &[archived]).unwrap();
+        let mut binned = from(4, "zoe@x.fr", 40);
+        binned.flagged = true;
+        s.insert_messages(trash, &[binned]).unwrap();
+
+        let list = s
+            .list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+            .unwrap();
+        assert_eq!(subjects(&list), vec!["luc@x.fr 3", "marie@x.fr 1"]);
+        assert!(list.iter().all(|i| i.flagged));
+        assert!(!threads_of(&s, FolderRole::Inbox)[0].flagged);
+
+        // Unstarred locally: gone from Favoris, and the server's flag
+        // does not bring it back while the change is pending.
+        let row = list[1].row_ids[0];
+        s.set_flagged(&[row], false).unwrap();
+        let flags = |flagged| {
+            vec![ServerFlags {
+                uid: 1,
+                seen: false,
+                flagged,
+            }]
+        };
+        s.apply_flags(fa.id, 1, 1, &flags(true)).unwrap();
+        let list = s
+            .list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+            .unwrap();
+        assert_eq!(subjects(&list), vec!["luc@x.fr 3"]);
+        // Once confirmed, the server is right again (starred elsewhere).
+        s.confirm_flagged(&[row]).unwrap();
+        s.apply_flags(fa.id, 1, 1, &flags(true)).unwrap();
+        assert_eq!(
+            s.list_unread(&Listing::Starred, AccountFilter::All, true)
+                .unwrap(),
+            2
+        );
+        s.apply_flags(fa.id, 1, 1, &flags(false)).unwrap();
+        assert_eq!(
+            s.list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        // A pending change is forgotten at the next start.
+        s.set_flagged(&[row], true).unwrap();
+        s.clear_pending().unwrap();
+        s.apply_flags(fa.id, 1, 1, &flags(false)).unwrap();
+        assert_eq!(
+            s.list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unstarring_a_conversation_finds_its_other_starred_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let fa = inbox(&s, a);
+        let sent = folder(&s, a, "Sent", FolderRole::Sent);
+        let mut first = reply(1, "<p>", None, &[], 10);
+        first.flagged = true;
+        s.insert_messages(fa.id, &[first]).unwrap();
+        let mut answer = reply(2, "<r>", Some("<p>"), &["<p>"], 20);
+        answer.flagged = true;
+        s.insert_messages(sent, &[answer]).unwrap();
+        s.insert_messages(fa.id, &[msg(3, Some("<other>"), 30)])
+            .unwrap();
+
+        let inbox_item = threads_of(&s, FolderRole::Inbox)
+            .into_iter()
+            .find(|i| i.subject == "subject 1")
+            .unwrap();
+        let others = s
+            .starred_in_threads(&inbox_item.row_ids, AccountFilter::All)
+            .unwrap();
+        assert_eq!(others.len(), 1);
+        assert_ne!(others[0], inbox_item.row_ids[0]);
+        assert!(
+            s.starred_in_threads(&inbox_item.row_ids, AccountFilter::Only(AccountId(99)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn version_6_messages_are_sorted_by_the_migration() {
+        let path = std::env::temp_dir().join(format!("avero-v7-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            let a = acct(&s, "a@x.fr");
+            let f = inbox(&s, a);
+            let mut news = from(1, "news@shop.fr", 10);
+            news.headers.precedence = Some("bulk".into());
+            s.insert_messages(f.id, &[news, from(2, "noreply@banque.fr", 20)])
+                .unwrap();
+            s.conn
+                .execute_batch(
+                    "DROP TABLE senders;
+                     DROP INDEX messages_sender;
+                     DROP INDEX messages_flagged;
+                     ALTER TABLE messages DROP COLUMN flagged;
+                     ALTER TABLE messages DROP COLUMN flag_pending;
+                     ALTER TABLE messages DROP COLUMN category;
+                     PRAGMA user_version = 6;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let version: i64 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
+        assert_eq!(tab(&s, Category::Notification), vec!["noreply@banque.fr 2"]);
+        assert!(tab(&s, Category::Important).is_empty());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn fts_query_quotes_every_word() {
@@ -2226,7 +2863,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);
