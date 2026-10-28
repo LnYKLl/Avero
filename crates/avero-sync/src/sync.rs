@@ -639,6 +639,14 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn append_draft(&mut self, folder: &str, raw: &[u8]) -> Result<(), SyncError> {
+            self.append(folder, raw, true).await
+        }
+
+        async fn search_message_id(&mut self, _message_id: &str) -> Result<Vec<u32>, SyncError> {
+            Ok(Vec::new())
+        }
     }
 
     fn setup() -> (Store, AccountId) {

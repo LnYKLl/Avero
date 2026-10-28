@@ -7,7 +7,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 mod cleanup;
+mod drafts;
 mod filters;
+mod later;
 
 use crate::category::{classify, sender_key};
 use crate::{
@@ -48,20 +50,25 @@ const FOLDER_COLUMNS: &str = "id, account_id, path, role, uid_validity, last_see
 /// Columns read by `item_from_row`, in order (`r` is a ranked group, `m`
 /// its message shown, `b` that message's cached body).
 const ITEM_COLUMNS: &str = "r.ids, r.accounts, m.subject, m.from_name, m.from_addr, m.date,
-     r.all_seen, r.any_attachment, substr(b.text, 1, 1000), m.thread_id, r.any_flagged";
+     r.all_seen, r.any_attachment, substr(b.text, 1, 1000), m.thread_id, r.any_flagged,
+     r.snoozed_until";
 
 /// Which messages a list (and its unread count) takes, on `m` (a message)
 /// and `f` (its folder). Parameters: ?1 folder role, ?2 account, ?6 tab
 /// (category), ?7 sender, ?8 starred only, ?9 trash and spam left out;
-/// NULL or 0 means "no condition". ?3 (search), ?4 and ?5 (paging) are
-/// the caller's.
+/// NULL or 0 means "no condition". ?10 is 1 for "Plus tard" (only the
+/// snoozed messages), else 0 (every list but that one leaves them out).
+/// ?3 (search), ?4 and ?5 (paging) are the caller's.
 const LIST_CONDITIONS: &str = "(?1 IS NULL OR f.role = ?1)
      AND (?2 IS NULL OR f.account_id = ?2)
      AND m.hidden = 0
      AND (?6 IS NULL OR COALESCE(m.category, 'important') = ?6)
      AND (?7 IS NULL OR lower(trim(m.from_addr)) = ?7)
      AND (?8 = 0 OR m.flagged = 1)
-     AND (?9 = 0 OR f.role NOT IN ('trash', 'junk'))";
+     AND (?9 = 0 OR f.role NOT IN ('trash', 'junk'))
+     AND ?10 = EXISTS (SELECT 1 FROM snoozes s
+                       WHERE s.key = COALESCE(m.message_id, 'row:' || m.id)
+                         AND s.woke_at IS NULL)";
 
 /// The conditions of a `Listing`, as parameters of `LIST_CONDITIONS`.
 struct Scope {
@@ -70,6 +77,8 @@ struct Scope {
     sender: Option<String>,
     starred: bool,
     skip_trash: bool,
+    /// "Plus tard": the snoozed messages only.
+    snoozed: bool,
 }
 
 impl Scope {
@@ -81,6 +90,7 @@ impl Scope {
             sender: None,
             starred: false,
             skip_trash: false,
+            snoozed: false,
         }
     }
 
@@ -97,6 +107,10 @@ impl Scope {
                 scope.skip_trash = true;
             }
             Listing::Sender(addr) => scope.sender = Some(sender_key(addr)),
+            Listing::Snoozed => {
+                scope.snoozed = true;
+                scope.skip_trash = true;
+            }
         }
         scope
     }
@@ -196,6 +210,12 @@ impl Store {
             let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(include_str!("schema_v8.sql"))?;
             tx.execute_batch("PRAGMA user_version = 8;")?;
+            tx.commit()?;
+        }
+        if version < 9 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(include_str!("schema_v9.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 9;")?;
             tx.commit()?;
         }
         Ok(())
@@ -733,7 +753,8 @@ impl Store {
                         group_concat(account_id) OVER whole AS accounts,
                         MIN(seen) OVER whole AS all_seen,
                         MAX(has_attachments) OVER whole AS any_attachment,
-                        MAX(flagged) OVER whole AS any_flagged
+                        MAX(flagged) OVER whole AS any_flagged,
+                        NULL AS snoozed_until
                  FROM sel
                  WINDOW best AS (PARTITION BY k ORDER BY cached DESC, date DESC, id DESC),
                         whole AS (PARTITION BY k ORDER BY cached DESC, date DESC, id DESC
@@ -799,11 +820,21 @@ impl Store {
         } else {
             MESSAGE_KEY
         };
+        // "Plus tard" shows the next to wake first; the other lists the
+        // most recent first, a conversation back from "Plus tard" counting
+        // as new from the time it woke up.
+        let order = if scope.snoozed {
+            "r.snoozed_until, m.id"
+        } else {
+            "r.sort_date DESC, m.id DESC"
+        };
         let sql = format!(
             "WITH sel AS (
                  SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, m.flagged,
-                        {key} AS k
+                        {key} AS k, s.until AS snoozed,
+                        MAX(m.date, COALESCE(s.woke_at, 0)) AS sort_date
                  FROM messages m JOIN folders f ON f.id = m.folder_id
+                 LEFT JOIN snoozes s ON s.key = {MESSAGE_KEY}
                  WHERE {LIST_CONDITIONS}
                    {fts_condition}
              ),
@@ -814,7 +845,9 @@ impl Store {
                         group_concat(account_id) OVER whole AS accounts,
                         MIN(seen) OVER whole AS all_seen,
                         MAX(has_attachments) OVER whole AS any_attachment,
-                        MAX(flagged) OVER whole AS any_flagged
+                        MAX(flagged) OVER whole AS any_flagged,
+                        MAX(sort_date) OVER whole AS sort_date,
+                        CASE WHEN ?10 THEN MIN(snoozed) OVER whole END AS snoozed_until
                  FROM sel
                  WINDOW newest AS (PARTITION BY k ORDER BY date DESC, id DESC),
                         whole AS (PARTITION BY k ORDER BY date DESC, id DESC
@@ -825,7 +858,7 @@ impl Store {
              JOIN messages m ON m.id = r.id
              LEFT JOIN bodies b ON b.message_row = m.id
              WHERE r.rn = 1
-             ORDER BY m.date DESC, m.id DESC
+             ORDER BY {order}
              LIMIT ?4 OFFSET ?5"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -840,6 +873,7 @@ impl Store {
                 scope.sender,
                 scope.starred,
                 scope.skip_trash,
+                scope.snoozed,
             ],
             |row| item_from_row(row, by_thread),
         )?;
@@ -908,6 +942,7 @@ impl Store {
                 scope.sender,
                 scope.starred,
                 scope.skip_trash,
+                scope.snoozed,
             ],
             |row| row.get(0),
         )?;
@@ -1400,6 +1435,7 @@ fn item_from_row(row: &rusqlite::Row, in_thread: bool) -> rusqlite::Result<Unifi
     let body: Option<String> = row.get(8)?;
     let thread: Option<i64> = row.get(9)?;
     let flagged: bool = row.get(10)?;
+    let snoozed_until: Option<i64> = row.get(11)?;
     let mut accounts: Vec<AccountId> = parse_id_list(&accounts)
         .into_iter()
         .map(AccountId)
@@ -1422,6 +1458,7 @@ fn item_from_row(row: &rusqlite::Row, in_thread: bool) -> rusqlite::Result<Unifi
         snippet: body.as_deref().map(snippet).unwrap_or_default(),
         thread_id: thread.filter(|_| in_thread),
         count: 1,
+        snoozed_until,
     })
 }
 
@@ -2478,7 +2515,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let ids = thread_ids(&s);
         assert_eq!(ids["Un"], 1);
         assert_eq!(ids["Deux"], 3);
@@ -2498,8 +2535,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Undoes version 8 (to test older migrations).
+    /// Undoes versions 9 and 8 (to test older migrations).
     const UNDO_V8: &str = "
+        DROP TABLE draft_files;
+        DROP TABLE drafts;
+        DROP TABLE snoozes;
         DROP TABLE spam_learned;
         DROP TABLE spam_tokens;
         DROP TABLE rule_conditions;
@@ -2830,7 +2870,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
         assert_eq!(tab(&s, Category::Notification), vec!["noreply@banque.fr 2"]);
         assert!(tab(&s, Category::Important).is_empty());
@@ -2891,7 +2931,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

@@ -630,6 +630,19 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
     let flags = if seen { Some(r"(\Seen)") } else { None };
+    append_flagged(session, folder, raw, flags).await
+}
+
+/// Adds a raw message to `folder` with these flags (`(\Seen \Draft)`).
+async fn append_flagged<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    raw: &[u8],
+    flags: Option<&str>,
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
     let appending = async {
         session
             .append(folder, flags, None, raw)
@@ -637,6 +650,19 @@ where
             .map_err(command_error)
     };
     with_timeout(TRANSFER_TIMEOUT, "APPEND", appending).await
+}
+
+/// UID SEARCH for a Message-ID in the selected folder, sorted.
+async fn search_id<T>(session: &mut Session<T>, message_id: &str) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let query = format!("HEADER Message-ID {}", quote_mailbox(message_id)?);
+    let searching = async { session.uid_search(query).await.map_err(command_error) };
+    let found = with_timeout(COMMAND_TIMEOUT, "UID SEARCH", searching).await?;
+    let mut uids: Vec<u32> = found.into_iter().collect();
+    uids.sort_unstable();
+    Ok(uids)
 }
 
 /// Sends CREATE for `path`, quoted.
@@ -903,6 +929,14 @@ impl MailSource for ImapSource {
 
     async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError> {
         append_to(&mut self.session, folder, raw, seen).await
+    }
+
+    async fn append_draft(&mut self, folder: &str, raw: &[u8]) -> Result<(), SyncError> {
+        append_flagged(&mut self.session, folder, raw, Some(r"(\Seen \Draft)")).await
+    }
+
+    async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError> {
+        search_id(&mut self.session, message_id).await
     }
 }
 
@@ -1413,6 +1447,26 @@ mod tests {
         let sent = commands(session, server).await;
         assert_eq!(sent[0], "APPEND \"Sent\" (\\Seen) {5}");
         assert_eq!(sent[1], "hello");
+    }
+
+    #[tokio::test]
+    async fn draft_is_appended_seen_and_draft() {
+        let (mut session, server) = session_recording(vec!["+ go ahead\r\n", OK]).await;
+        append_flagged(&mut session, "Drafts", b"hello", Some(r"(\Seen \Draft)"))
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent[0], r#"APPEND "Drafts" (\Seen \Draft) {5}"#);
+    }
+
+    #[tokio::test]
+    async fn message_id_search_lists_the_uids() {
+        let (mut session, server) =
+            session_recording(vec!["* SEARCH 12 4\r\n{tag} OK done\r\n"]).await;
+        let uids = search_id(&mut session, "<d1@ex.fr>").await.unwrap();
+        assert_eq!(uids, vec![4, 12]);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID SEARCH HEADER Message-ID \"<d1@ex.fr>\""]);
     }
 
     #[tokio::test]

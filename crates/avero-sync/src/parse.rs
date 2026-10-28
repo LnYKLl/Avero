@@ -134,12 +134,16 @@ pub struct ParsedBody {
     pub from: Option<Address>,
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
+    /// Only a draft has one (a sent message never shows its Bcc).
+    pub bcc: Vec<Address>,
     pub reply_to: Vec<Address>,
     /// Unix time in seconds (0 if unknown).
     pub date: i64,
     pub subject: String,
     /// With angle brackets, like `NewMessage::message_id`.
     pub message_id: Option<String>,
+    /// The parent's Message-ID, with angle brackets.
+    pub in_reply_to: Option<String>,
     /// The References header (or In-Reply-To when absent), ids with angle
     /// brackets separated by spaces: what a reply's References starts with.
     pub references: Option<String>,
@@ -186,10 +190,12 @@ fn empty_body() -> ParsedBody {
         from: None,
         to: Vec::new(),
         cc: Vec::new(),
+        bcc: Vec::new(),
         reply_to: Vec::new(),
         date: 0,
         subject: "(sans objet)".to_string(),
         message_id: None,
+        in_reply_to: None,
         references: None,
         text: String::new(),
         attachments: Vec::new(),
@@ -201,13 +207,15 @@ fn body_of(message: &mail_parser::Message<'_>) -> ParsedBody {
     body.from = message.from().and_then(|a| addresses(a).into_iter().next());
     body.to = message.to().map(addresses).unwrap_or_default();
     body.cc = message.cc().map(addresses).unwrap_or_default();
+    body.bcc = message.bcc().map(addresses).unwrap_or_default();
     body.reply_to = message.reply_to().map(addresses).unwrap_or_default();
     body.date = message.date().map_or(0, |d| d.to_timestamp());
     if let Some(subject) = message.subject() {
         body.subject = subject.to_string();
     }
     body.message_id = message.message_id().map(|id| format!("<{id}>"));
-    body.references = id_list(message.references()).or_else(|| id_list(message.in_reply_to()));
+    body.in_reply_to = id_list(message.in_reply_to());
+    body.references = id_list(message.references()).or_else(|| body.in_reply_to.clone());
     body.text = normalize_text(&readable_text(message));
     body.attachments = message
         .attachments()

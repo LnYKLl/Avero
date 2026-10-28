@@ -1,7 +1,7 @@
 //! Base data types: accounts, folders, messages.
 
 /// Database identifier of an account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AccountId(pub i64);
 
 /// Database identifier of a folder.
@@ -301,6 +301,8 @@ pub enum Listing {
     Starred,
     /// Every message from this address (any case), in every folder.
     Sender(String),
+    /// The snoozed conversations ("Plus tard"), the next to wake first.
+    Snoozed,
 }
 
 /// Which accounts the message list shows.
@@ -334,6 +336,70 @@ pub struct UnifiedItem {
     /// the user's own addresses are `moi`. Just the sender for a single
     /// message.
     pub senders: Vec<String>,
+    /// When it comes back, if it is snoozed ("Plus tard"; Unix time).
+    pub snoozed_until: Option<i64>,
+}
+
+/// A conversation whose snooze just ended (see `Store::wake_snoozed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Woken {
+    /// Every copy of its newest message: marked unread again.
+    pub rows: Vec<i64>,
+    pub from_name: Option<String>,
+    pub from_addr: String,
+    pub subject: String,
+}
+
+/// Where the copy of a draft lives in a server's drafts folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftCopy {
+    pub account: AccountId,
+    pub folder: String,
+    pub uid: u32,
+}
+
+/// What the user wrote in a draft, as the composer holds it (addresses
+/// as typed, not checked yet).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftFields {
+    pub account: AccountId,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: Option<String>,
+    pub references: Option<String>,
+    /// The Message-ID of its copies on the server (one per draft, kept
+    /// from one save to the next).
+    pub message_id: String,
+}
+
+/// A draft kept on this computer, possibly scheduled (see `schema_v9.sql`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftRecord {
+    pub id: i64,
+    pub fields: DraftFields,
+    /// A composer shows it.
+    pub open: bool,
+    /// Changed since its copy on the server (or it has none).
+    pub server_dirty: bool,
+    pub server: Option<DraftCopy>,
+    /// When to send it ("Programmés"), Unix time.
+    pub send_at: Option<i64>,
+    /// When it really left (kept only when that was late).
+    pub sent_at: Option<i64>,
+    /// Why sending failed.
+    pub error: Option<String>,
+    pub updated_at: i64,
+}
+
+/// A file attached to a draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftFile {
+    pub name: String,
+    pub mime: String,
+    pub data: Vec<u8>,
 }
 
 /// One sender of "Grand nettoyage": how much mail they left in the

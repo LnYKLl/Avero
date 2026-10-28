@@ -62,7 +62,8 @@ pub enum SyncError {
 /// A mail server we can read from and act on (the real IMAP one, or a fake
 /// in tests).
 ///
-/// Every method but `list_folders`, `select` and `append` acts on the
+/// Every method but `list_folders`, `select`, `append` and `append_draft`
+/// acts on the
 /// folder chosen by the last `select(path)`: call it first.
 // We only use this trait with generics, never as `dyn`, and never need `Send`.
 #[allow(async_fn_in_trait)]
@@ -121,4 +122,12 @@ pub trait MailSource {
 
     /// Adds a raw message to `folder` (no selection needed).
     async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError>;
+
+    /// Adds a draft to `folder`, flagged `\Seen` and `\Draft` (no
+    /// selection needed).
+    async fn append_draft(&mut self, folder: &str, raw: &[u8]) -> Result<(), SyncError>;
+
+    /// UIDs of the messages of the selected folder whose Message-ID
+    /// header is `message_id` (with its angle brackets).
+    async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError>;
 }
