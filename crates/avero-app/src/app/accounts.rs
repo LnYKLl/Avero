@@ -43,7 +43,7 @@ impl App {
                     Err(error) => status.error = Some(error),
                 }
                 self.reload_now();
-                Task::none()
+                self.learn_from_folders(account)
             }
             Event::Body { row_id, result } => {
                 let parse = self.body_arrived(row_id, result);
@@ -56,10 +56,7 @@ impl App {
                 Task::batch([toast, self.sync_account(account)])
             }
             Event::Sent(result) => self.sent(result),
-            Event::NewMail(arrivals) => {
-                self.notify(account, &arrivals);
-                Task::none()
-            }
+            Event::NewMail(arrivals) => self.new_mail(account, arrivals),
             Event::Gone => {
                 let status = self.status.entry(account).or_default();
                 status.syncing = false;
@@ -101,12 +98,9 @@ impl App {
                     Err(error) => status.error = Some(error),
                 }
                 self.reload_now();
-                Task::none()
+                self.learn_from_folders(account)
             }
-            Event::NewMail(arrivals) => {
-                self.notify(account, &arrivals);
-                Task::none()
-            }
+            Event::NewMail(arrivals) => self.new_mail(account, arrivals),
             Event::Body { .. } | Event::Done(_) | Event::Sent(_) | Event::Gone => Task::none(),
         }
     }
@@ -121,7 +115,7 @@ impl App {
         notify::notices(arrivals, name)
     }
 
-    fn notify(&self, account: AccountId, arrivals: &[Arrival]) {
+    pub(super) fn notify(&self, account: AccountId, arrivals: &[Arrival]) {
         notify::show(self.notices(account, arrivals));
     }
 

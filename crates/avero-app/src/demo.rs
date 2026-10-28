@@ -1,11 +1,13 @@
 //! Demo mode (`AVERO_DEMO=1`): an in-memory database with three made-up
 //! accounts and about forty French messages, a few of them answers that
 //! make conversations, some newsletters and notifications (for the tabs
-//! and "Se désinscrire"), a few starred ones, and no network at all.
+//! and "Se désinscrire"), a few starred ones, a few rules, spam (one of
+//! them caught by the local filter), and no network at all.
 //! `AVERO_DEMO=empty` starts with no account (welcome screen);
 //! `AVERO_DEMO=google-setup` (or `microsoft-setup`) also opens the
 //! connection assistant, as after a click on "Continuer avec Google".
 
+use avero_core::rules::{Condition, RuleDef, RuleField, RuleMove, block_rule};
 use avero_core::store::Store;
 use avero_core::{
     AccountId, AuthKind, FolderRole, MessageHeaders, NewAccount, NewMessage, Security, ServerConfig,
@@ -77,7 +79,7 @@ const D: i64 = 24 * 60;
 
 #[rustfmt::skip]
 fn samples() -> Vec<Sample> {
-    use FolderRole::{Archive, Inbox, Sent};
+    use FolderRole::{Archive, Inbox, Junk, Sent};
     let s = |account, role, from, subject, body, minutes_ago, seen, attachment| Sample {
         account, role, from, subject, body, minutes_ago, seen, attachment,
     };
@@ -217,6 +219,33 @@ fn samples() -> Vec<Sample> {
         s(1, Inbox, ("Behance", "newsletter@behance.net"), "Les projets de la semaine",
           "Découvrez la sélection de la semaine : identités visuelles, typographies et illustrations.",
           D + H, false, None),
+        // More letters, for "Grand nettoyage".
+        s(0, Inbox, ("Le Monde", "newsletter@lemonde.fr"), "La lettre du matin : la COP en questions",
+          "Bonjour,\n\nAu sommaire : les négociations climatiques, le budget de la culture et nos recommandations de lecture.",
+          4 * D + 10 * H, true, None),
+        s(0, Inbox, ("Le Monde", "newsletter@lemonde.fr"), "La lettre du matin : l'essentiel de la semaine",
+          "Bonjour,\n\nCe qu'il faut retenir de la semaine, en cinq minutes de lecture.",
+          6 * D + 10 * H, true, None),
+        s(0, Archive, ("Le Monde", "newsletter@lemonde.fr"), "La lettre du matin : les élections européennes",
+          "Bonjour,\n\nTout ce qu'il faut savoir avant le vote de dimanche.",
+          30 * D, true, None),
+        s(1, Archive, ("Behance", "newsletter@behance.net"), "Les projets de la semaine : typographie",
+          "Une sélection consacrée aux caractères dessinés cette année.",
+          9 * D + 2 * H, true, None),
+        s(2, Inbox, ("Vélo Mag", "lettre@velomag.fr"), "Bien choisir ses pneus d'hiver",
+          "Pression, largeur, crampons : notre guide pour rouler serein jusqu'au printemps.",
+          8 * D + 6 * H, true, None),
+        // The spam folders. The newest one stands for a mail the local
+        // filter caught after a sync.
+        s(0, Junk, ("Gagnant Express", "promo@gagnant-express.biz"), "Félicitations ! Vous avez gagné un iPhone 17",
+          "Cliquez ici pour réclamer votre cadeau avant minuit. Offre exclusive réservée aux gagnants.",
+          20, false, None),
+        s(1, Junk, ("Crypto Boost", "invest@crypto-boost.top"), "Doublez votre capital en 7 jours",
+          "Notre algorithme garantit des gains exceptionnels. Inscrivez-vous gratuitement dès aujourd'hui.",
+          8 * H, false, None),
+        s(0, Junk, ("Pharmacie Discount", "ventes@pharma-discount.top"), "Prix imbattables, livraison discrète",
+          "Profitez de remises exceptionnelles sur toute notre gamme. Offre limitée.",
+          2 * D + 7 * H, true, None),
     ]
 }
 
@@ -377,7 +406,7 @@ pub fn seed(store: &Store) {
             );
         }
     }
-    for account in ids {
+    for &account in &ids {
         for role in [
             FolderRole::Sent,
             FolderRole::Drafts,
@@ -388,6 +417,39 @@ pub fn seed(store: &Store) {
             let _ = store.upsert_folder(account, folder_for(role), role);
         }
     }
+    for rule in demo_rules(&ids) {
+        let _ = store.add_rule(&rule);
+    }
+}
+
+/// A few rules for the settings page.
+fn demo_rules(ids: &[AccountId]) -> Vec<RuleDef> {
+    let condition = |field, value: &str| Condition {
+        field,
+        value: value.to_string(),
+    };
+    vec![
+        RuleDef {
+            name: "Factures aux archives".to_string(),
+            conditions: vec![
+                condition(RuleField::Subject, "facture"),
+                condition(RuleField::From, "facture@"),
+            ],
+            match_all: false,
+            mark_read: true,
+            move_to: Some(RuleMove::Archive),
+            account: None,
+        },
+        RuleDef {
+            name: "Notion sans notification".to_string(),
+            conditions: vec![condition(RuleField::From, "makenotion.com")],
+            match_all: true,
+            mark_read: true,
+            move_to: None,
+            account: ids.get(1).copied(),
+        },
+        block_rule("newsletter@behance.net", "Behance"),
+    ]
 }
 
 /// Server path of each demo folder.

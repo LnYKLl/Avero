@@ -16,6 +16,7 @@ pub enum Icon {
     Check,
     ChevronDown,
     ChevronLeft,
+    ChevronUp,
     Alert,
     Download,
     EyeOff,
@@ -40,6 +41,8 @@ pub enum Icon {
     Send,
     Settings,
     Shield,
+    /// "Grand nettoyage".
+    Sparkles,
     Compose,
     Star,
     /// The star, filled: a starred message.
@@ -60,11 +63,12 @@ pub enum Icon {
 }
 
 /// All icons, in the order of `bytes`; used to build the handle cache.
-const ALL: [Icon; 42] = [
+const ALL: [Icon; 44] = [
     Icon::Archive,
     Icon::Check,
     Icon::ChevronDown,
     Icon::ChevronLeft,
+    Icon::ChevronUp,
     Icon::Alert,
     Icon::Download,
     Icon::EyeOff,
@@ -89,6 +93,7 @@ const ALL: [Icon; 42] = [
     Icon::Send,
     Icon::Settings,
     Icon::Shield,
+    Icon::Sparkles,
     Icon::Compose,
     Icon::Star,
     Icon::StarFilled,
@@ -112,6 +117,7 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Check => include_bytes!("../assets/icons/check.svg"),
         Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
         Icon::ChevronLeft => include_bytes!("../assets/icons/chevron-left.svg"),
+        Icon::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),
         Icon::Alert => include_bytes!("../assets/icons/circle-alert.svg"),
         Icon::Download => include_bytes!("../assets/icons/download.svg"),
         Icon::EyeOff => include_bytes!("../assets/icons/eye-off.svg"),
@@ -136,6 +142,7 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Send => include_bytes!("../assets/icons/send.svg"),
         Icon::Settings => include_bytes!("../assets/icons/settings.svg"),
         Icon::Shield => include_bytes!("../assets/icons/shield-alert.svg"),
+        Icon::Sparkles => include_bytes!("../assets/icons/sparkles.svg"),
         Icon::Compose => include_bytes!("../assets/icons/square-pen.svg"),
         Icon::Star => include_bytes!("../assets/icons/star.svg"),
         Icon::StarFilled => include_bytes!("../assets/icons/star-filled.svg"),

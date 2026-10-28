@@ -105,6 +105,8 @@ pub struct Rule {
 pub struct RuleFacts {
     /// The stored row (`messages.id`).
     pub row: i64,
+    /// Its UID in its folder.
+    pub uid: u32,
     pub account: AccountId,
     pub from_addr: String,
     pub from_name: Option<String>,
@@ -233,6 +235,7 @@ mod tests {
     fn facts(from: &str, subject: &str) -> RuleFacts {
         RuleFacts {
             row: 1,
+            uid: 1,
             account: AccountId(1),
             from_addr: from.to_string(),
             from_name: Some("La Boutique".to_string()),

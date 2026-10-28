@@ -1,5 +1,5 @@
-//! The ink rail on the left: logo, Courrier, Rechercher, Écrire, then
-//! Réglages and "Ajouter un compte" at the bottom.
+//! The ink rail on the left: logo, Courrier, Rechercher, Écrire, Grand
+//! nettoyage, then Réglages and "Ajouter un compte" at the bottom.
 
 use super::tip;
 use crate::app::{AddMsg, App, ComposeMsg, Message, Screen};
@@ -15,6 +15,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let mail = app.screen == Screen::Mail && app.composer.is_none();
     let writing = app.screen == Screen::Mail && app.composer.is_some();
     let settings = app.screen == Screen::Settings;
+    let cleanup = app.screen == Screen::Cleanup;
     let rail = column![
         container(icons::icon(Icon::Logo, 36.0, Tone::Original)).padding([4, 0]),
         space().height(14),
@@ -33,6 +34,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
             "Écrire (Ctrl+N)",
             writing,
             Message::Compose(ComposeMsg::New),
+        ),
+        item(
+            Icon::Sparkles,
+            "Grand nettoyage",
+            cleanup,
+            Message::ShowCleanup
         ),
         space().height(Fill),
         item(Icon::Settings, "Réglages", settings, Message::ShowSettings),

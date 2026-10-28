@@ -100,6 +100,11 @@ fn checked(app: &App) -> Element<'_, Message> {
         ),
         action(Icon::MailOpen, "Marquer lu", Some(Message::MarkRead)),
         action(Icon::Mail, "Marquer non lu", Some(Message::MarkUnread)),
+        spam_action(app, |icon, label, message| action(
+            icon,
+            label,
+            Some(message)
+        )),
         action(
             if all_starred(app) {
                 Icon::StarFilled
@@ -484,6 +489,11 @@ fn action_bar<'a>(
             "Marquer comme non lu (U)",
             Some(Message::MarkUnread)
         ),
+        spam_action(app, |icon, label, message| icon_button(
+            icon,
+            format!("{label} (!)"),
+            Some(message)
+        )),
         star_button(app),
         space().width(Fill),
         accounts,
@@ -492,6 +502,19 @@ fn action_bar<'a>(
     .padding([10, 20])
     .align_y(Alignment::Center)
     .into()
+}
+
+/// "Spam", or "Pas spam" when the selection is in a spam folder, drawn by
+/// `draw` (an icon button or an icon with its label).
+fn spam_action<'a, E>(app: &App, draw: impl Fn(Icon, &'static str, Message) -> E) -> E
+where
+    E: Into<Element<'a, Message>>,
+{
+    if app.selection_in_junk() {
+        draw(Icon::Inbox, "Pas spam", Message::MarkSpam(false))
+    } else {
+        draw(Icon::Shield, "Spam", Message::MarkSpam(true))
+    }
 }
 
 /// The star of the action bar: filled (and coloured) when starred.

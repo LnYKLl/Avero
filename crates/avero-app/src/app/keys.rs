@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 pub const G_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Every shortcut, as the help (`?`) lists them: keys, then what they do.
-pub const SHORTCUTS: [(&str, &str); 17] = [
+pub const SHORTCUTS: [(&str, &str); 18] = [
     ("J  ou  ↓", "Ligne suivante"),
     ("K  ou  ↑", "Ligne précédente"),
     ("Entrée", "Ouvrir"),
@@ -27,6 +27,7 @@ pub const SHORTCUTS: [(&str, &str); 17] = [
     ("E", "Archiver"),
     ("#  ou  Suppr", "Supprimer"),
     ("U", "Marquer comme non lu"),
+    ("!", "Spam, ou « Pas spam » dans le dossier Spam"),
     ("S", "Ajouter aux favoris ou les retirer"),
     ("X", "Sélectionner la ligne"),
     ("Ctrl+clic, Maj+clic", "Sélectionner plusieurs lignes"),
@@ -107,6 +108,10 @@ impl App {
             Character("e") => self.update_mail(Message::Archive),
             Character("#") | Named(N::Delete) => self.update_mail(Message::Delete),
             Character("u") => self.update_mail(Message::MarkUnread),
+            Character("!") => {
+                let spam = !self.selection_in_junk();
+                self.mark_spam(spam)
+            }
             Character("s") => self.update_places(Message::ToggleStar),
             Character("x") => {
                 self.toggle_current();

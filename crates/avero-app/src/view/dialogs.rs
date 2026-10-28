@@ -1,15 +1,21 @@
 //! Small dialogs: password, rename, signature, delete confirmation,
-//! reconnection, unsubscribe confirmation, keyboard shortcuts.
+//! reconnection, unsubscribe confirmation, keyboard shortcuts, the rule
+//! editor and the confirmations of "Appliquer maintenant" and "Tout
+//! mettre à la corbeille".
 
 use super::add_account::{error_line, spinner_line};
 use super::{field_label, icon_button};
 use crate::app::{
-    AccountMsg, App, Message, Overlay, PasswordDialog, ServerField, ServersForm, UnsubscribeOffer,
+    AccountMsg, App, CleanupMsg, Message, Overlay, PasswordDialog, RuleForm, RuleMsg, ServerField,
+    ServersForm, UnsubscribeOffer, field_name, move_name,
 };
 use crate::icons::Icon;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::Security;
-use iced::widget::{Column, button, column, container, row, space, text, text_editor, text_input};
+use avero_core::rules::{RuleField, RuleMove};
+use iced::widget::{
+    Column, button, checkbox, column, container, row, space, text, text_editor, text_input,
+};
 use iced::{Alignment, Element, Fill};
 
 /// Width of a small dialog.
@@ -27,6 +33,9 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::Signature { account, content } => signature(app, *account, content),
         Overlay::Shortcuts => shortcuts(),
         Overlay::ConfirmUnsubscribe(offer) => confirm_unsubscribe(app, offer),
+        Overlay::RuleEditor(form) => rule_editor(app, form),
+        Overlay::ConfirmApplyRule { name, count, .. } => confirm_apply_rule(name, *count),
+        Overlay::ConfirmTrashSender { name, rows, .. } => confirm_trash_sender(name, rows.len()),
     }
 }
 
@@ -262,14 +271,17 @@ fn confirm_unsubscribe<'a>(app: &'a App, offer: &'a UnsubscribeOffer) -> Element
     let (what, detail, confirm, style): (String, String, &str, ButtonStyle) = match &offer.method {
         Method::OneClick(url) => (
             format!("Avero va demander à {} de ne plus vous écrire.", host(url)),
-            "Une seule requête chiffrée (HTTPS) est envoyée à l'adresse de désinscription,              sans rien d'autre de ce message."
+            "Une seule requête chiffrée (HTTPS) est envoyée à l'adresse de désinscription, \
+             sans rien d'autre de ce message."
                 .to_string(),
             "Se désinscrire",
             theme::primary,
         ),
         Method::Mail { to, subject, .. } => (
             format!("Avero va envoyer un mail de désinscription à {to}."),
-            format!("Envoyé depuis {from}, avec l'objet « {subject} » ; rien d'autre de ce message."),
+            format!(
+                "Envoyé depuis {from}, avec l'objet « {subject} » ; rien d'autre de ce message."
+            ),
             "Envoyer",
             theme::primary,
         ),
@@ -281,7 +293,8 @@ fn confirm_unsubscribe<'a>(app: &'a App, offer: &'a UnsubscribeOffer) -> Element
         ),
         Method::InsecureWeb(url) => (
             format!("La désinscription se fait sur le site {}.", host(url)),
-            "Attention : ce lien n'est pas chiffré (http). Ce que vous enverrez sur cette page              pourra être lu en chemin."
+            "Attention : ce lien n'est pas chiffré (http). Ce que vous enverrez sur cette page \
+             pourra être lu en chemin."
                 .to_string(),
             "Ouvrir quand même",
             theme::danger,
@@ -358,6 +371,187 @@ fn signature<'a>(
     ]
     .spacing(14);
     card_width("Signature", body.into(), 480.0)
+}
+
+/// A small pill that is either picked or not.
+fn pill<'a>(label: &'a str, selected: bool, message: RuleMsg) -> Element<'a, Message> {
+    button(text(label).size(12).font(MEDIUM))
+        .padding([5, 10])
+        .on_press(Message::Rule(message))
+        .style(theme::chip(selected))
+        .into()
+}
+
+/// Writing or changing a rule: conditions, actions, accounts.
+fn rule_editor<'a>(app: &'a App, form: &'a RuleForm) -> Element<'a, Message> {
+    let name = text_input("Par exemple : Factures", &form.name)
+        .on_input(|v| Message::Rule(RuleMsg::Name(v)))
+        .padding([8, 10])
+        .size(13)
+        .style(theme::input);
+
+    let mut conditions = Column::new().spacing(8);
+    for (index, condition) in form.conditions.iter().enumerate() {
+        let mut fields = row![].spacing(4).align_y(Alignment::Center);
+        for field in RuleField::ALL {
+            fields = fields.push(pill(
+                field_name(field),
+                condition.field == field,
+                RuleMsg::Field(index, field),
+            ));
+        }
+        let mut line = row![
+            fields,
+            text("contient").size(12).style(theme::muted),
+            text_input("texte", &condition.value)
+                .on_input(move |v| Message::Rule(RuleMsg::Value(index, v)))
+                .padding([6, 8])
+                .size(13)
+                .style(theme::input),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if form.conditions.len() > 1 {
+            line = line.push(icon_button(
+                Icon::Close,
+                "Retirer cette condition",
+                Some(Message::Rule(RuleMsg::RemoveCondition(index))),
+            ));
+        }
+        conditions = conditions.push(line);
+    }
+    conditions = conditions.push(
+        button(text("+ Ajouter une condition").size(12).font(MEDIUM))
+            .padding([4, 0])
+            .on_press(Message::Rule(RuleMsg::AddCondition))
+            .style(theme::link),
+    );
+
+    let how = row![
+        text("Les mails qui remplissent")
+            .size(12)
+            .style(theme::muted),
+        pill(
+            "toutes les conditions",
+            form.match_all,
+            RuleMsg::MatchAll(true)
+        ),
+        pill("au moins une", !form.match_all, RuleMsg::MatchAll(false)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let mut moves = row![].spacing(4).align_y(Alignment::Center);
+    for to in [
+        None,
+        Some(RuleMove::Archive),
+        Some(RuleMove::Trash),
+        Some(RuleMove::Junk),
+    ] {
+        moves = moves.push(pill(move_name(to), form.move_to == to, RuleMsg::MoveTo(to)));
+    }
+    let read = checkbox(form.mark_read)
+        .label("Marquer comme lu")
+        .on_toggle(|on| Message::Rule(RuleMsg::MarkRead(on)))
+        .size(15)
+        .text_size(13)
+        .spacing(8);
+
+    let mut scope = row![pill(
+        "Tous les comptes",
+        form.account.is_none(),
+        RuleMsg::Scope(None)
+    )]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    for account in &app.accounts {
+        scope = scope.push(pill(
+            &account.name,
+            form.account == Some(account.id),
+            RuleMsg::Scope(Some(account.id)),
+        ));
+    }
+
+    let mut body = Column::new()
+        .spacing(14)
+        .push(column![field_label("Nom"), name].spacing(6))
+        .push(column![field_label("Si"), conditions].spacing(6));
+    if form.conditions.len() > 1 {
+        body = body.push(how);
+    }
+    body = body
+        .push(column![field_label("Alors"), moves.wrap(), read].spacing(8))
+        .push(column![field_label("Comptes"), scope.wrap()].spacing(6))
+        .push(
+            text(
+                "Les règles s'appliquent aux nouveaux mails de la Réception, quand Avero est \
+                 ouvert ; les déplacements se font sur le serveur.",
+            )
+            .size(12)
+            .style(theme::muted),
+        );
+    if let Some(error) = &form.error {
+        body = body.push(error_line(error));
+    }
+    body = body.push(buttons(
+        "Enregistrer",
+        Some(Message::Rule(RuleMsg::Save)),
+        theme::primary,
+    ));
+    let title = if form.editing.is_some() {
+        "Modifier la règle"
+    } else {
+        "Nouvelle règle"
+    };
+    card_width(title, body.into(), 620.0)
+}
+
+fn confirm_apply_rule<'a>(name: &'a str, count: usize) -> Element<'a, Message> {
+    let what = if count > 1 {
+        format!("{count} mails de la Réception sont concernés.")
+    } else {
+        "1 mail de la Réception est concerné.".to_string()
+    };
+    let body = column![
+        text(format!("Règle « {name} »"))
+            .size(13)
+            .style(theme::muted),
+        text(what).size(14).font(MEDIUM),
+        text("Les déplacements se font sur le serveur.")
+            .size(13)
+            .style(theme::muted),
+        buttons(
+            "Appliquer",
+            Some(Message::Rule(RuleMsg::ConfirmApply)),
+            theme::primary,
+        ),
+    ]
+    .spacing(14);
+    card("Appliquer maintenant", body.into())
+}
+
+fn confirm_trash_sender<'a>(name: &'a str, count: usize) -> Element<'a, Message> {
+    let what = if count > 1 {
+        format!("Mettre les {count} mails de {name} à la corbeille ?")
+    } else {
+        format!("Mettre le mail de {name} à la corbeille ?")
+    };
+    let body = column![
+        text(what).size(14).font(MEDIUM),
+        text(
+            "Ils sont déplacés dans la corbeille de chaque compte, sur le serveur ; \
+                 vous pourrez les y retrouver."
+        )
+        .size(13)
+        .style(theme::muted),
+        buttons(
+            "Mettre à la corbeille",
+            Some(Message::Cleanup(CleanupMsg::ConfirmTrash)),
+            theme::danger,
+        ),
+    ]
+    .spacing(14);
+    card("Tout mettre à la corbeille", body.into())
 }
 
 fn shortcuts<'a>() -> Element<'a, Message> {

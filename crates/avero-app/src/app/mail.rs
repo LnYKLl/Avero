@@ -153,6 +153,9 @@ impl App {
     pub(super) fn reload_now(&mut self) {
         self.last_reload = Some(Instant::now());
         self.reload();
+        if self.screen == super::Screen::Cleanup {
+            self.refresh_cleanup();
+        }
     }
 
     /// Reload for sync progress: at most once per [`RELOAD_EVERY`]; a
@@ -451,7 +454,7 @@ impl App {
     }
 
     /// Sends the seen flag to the servers, one job per account.
-    fn remote_seen(&self, rows: &[i64], seen: bool) -> Task<Message> {
+    pub(super) fn remote_seen(&self, rows: &[i64], seen: bool) -> Task<Message> {
         let groups = by_account(self.refs(rows));
         Task::batch(groups.into_iter().map(|(account, targets)| {
             self.request(account, |reply| Job::SetSeen {
@@ -547,6 +550,7 @@ impl App {
         let allowed = match to {
             Destination::Archive => self.can_archive(),
             Destination::Trash => self.can_delete(),
+            Destination::Junk | Destination::Inbox => true,
         };
         let rows = self.action_rows();
         if rows.is_empty() || !allowed {
@@ -556,36 +560,52 @@ impl App {
             self.overlay = Some(Overlay::ConfirmDeleteForever(rows));
             return Task::none();
         }
-        let has_destination = |app: &App, account: AccountId| match to {
-            Destination::Archive => app.status.get(&account).and_then(|s| s.archive) == Some(true),
-            Destination::Trash => app.trash_accounts.contains(&account),
+        let Some(moving) = self.move_rows(&rows, to) else {
+            return Task::none();
         };
-        // Copies already in the destination, or on an account without
-        // one, stay where they are.
+        let toast = self.toast(super::destination_label(to), false);
+        Task::batch([moving, toast])
+    }
+
+    /// Whether `account` has a folder for `to`.
+    pub(super) fn has_destination(&self, account: AccountId, to: Destination) -> bool {
+        match to {
+            Destination::Archive => self.status.get(&account).and_then(|s| s.archive) == Some(true),
+            Destination::Trash => self.trash_accounts.contains(&account),
+            Destination::Junk | Destination::Inbox => {
+                matches!(self.store.folder_by_role(account, to.role()), Ok(Some(_)))
+            }
+        }
+    }
+
+    /// Whether this copy is already in the folder of `to`.
+    pub(super) fn is_in(&self, target: &MessageRef, to: Destination) -> bool {
+        matches!(
+            self.store.folder_by_role(target.account_id, to.role()),
+            Ok(Some(folder)) if folder.id == target.folder_id
+        )
+    }
+
+    /// Moves `rows` to `to` on their servers (one job per account): hides
+    /// them at once, removes them when the server confirms. Copies
+    /// already there, or on an account without such a folder, stay where
+    /// they are. `None` when nothing can move.
+    pub(super) fn move_rows(&mut self, rows: &[i64], to: Destination) -> Option<Task<Message>> {
         let targets: Vec<MessageRef> = self
-            .refs(&rows)
+            .refs(rows)
             .into_iter()
-            .filter(|r| has_destination(self, r.account_id))
-            .filter(|r| match to {
-                Destination::Trash => !self.is_trash_folder(r),
-                Destination::Archive => !matches!(
-                    self.store.folder_by_role(r.account_id, FolderRole::Archive),
-                    Ok(Some(folder)) if folder.id == r.folder_id
-                ),
-            })
+            .filter(|r| self.has_destination(r.account_id, to) && !self.is_in(r, to))
             .collect();
         if targets.is_empty() {
-            return Task::none();
+            return None;
         }
-        let toast = self.toast(super::destination_label(to), false);
-        Task::batch([
+        Some(
             self.hide_and_send(targets, move |targets, reply| Job::Move {
                 targets,
                 to,
                 reply,
             }),
-            toast,
-        ])
+        )
     }
 
     /// "Supprimer définitivement" was confirmed.

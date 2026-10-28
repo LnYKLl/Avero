@@ -47,6 +47,9 @@ pub struct Settings {
     /// The inbox is sorted in tabs: Important, Newsletters,
     /// Notifications (off: one list).
     pub inbox_tabs: bool,
+    /// The local spam filter moves new mail it is sure about to the
+    /// spam folder.
+    pub spam_filter: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +59,7 @@ impl Default for Settings {
             notifications: true,
             group_threads: true,
             inbox_tabs: true,
+            spam_filter: true,
         }
     }
 }
@@ -112,6 +116,7 @@ mod tests {
             notifications: false,
             group_threads: false,
             inbox_tabs: false,
+            spam_filter: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -120,6 +125,7 @@ mod tests {
         assert!(text.contains("\"notifications\": false"), "{text}");
         assert!(text.contains("\"group_threads\": false"), "{text}");
         assert!(text.contains("\"inbox_tabs\": false"), "{text}");
+        assert!(text.contains("\"spam_filter\": false"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -134,6 +140,7 @@ mod tests {
         assert!(settings.notifications);
         assert!(settings.group_threads);
         assert!(settings.inbox_tabs);
+        assert!(settings.spam_filter);
         let _ = std::fs::remove_dir_all(dir);
     }
 

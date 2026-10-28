@@ -102,11 +102,27 @@ pub fn refresh_error(
     AccountError::new(kind, oauth_message(provider, error))
 }
 
-/// Where archived or deleted messages go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where moved messages go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Destination {
     Archive,
     Trash,
+    /// The account's spam folder ("Spam").
+    Junk,
+    /// Back to the inbox ("Pas spam").
+    Inbox,
+}
+
+impl Destination {
+    /// The folder role it goes to.
+    pub fn role(self) -> FolderRole {
+        match self {
+            Destination::Archive => FolderRole::Archive,
+            Destination::Trash => FolderRole::Trash,
+            Destination::Junk => FolderRole::Junk,
+            Destination::Inbox => FolderRole::Inbox,
+        }
+    }
 }
 
 /// Something the worker reports back.
@@ -167,8 +183,8 @@ pub enum Job {
         flagged: bool,
         reply: Reply,
     },
-    /// Moves messages (already hidden in the list) to the archive or the
-    /// trash; their rows are deleted once the server confirms, shown
+    /// Moves messages (already hidden in the list) to the archive, the
+    /// trash, the spam folder or the inbox; their rows are deleted once the server confirms, shown
     /// again otherwise.
     Move {
         targets: Vec<MessageRef>,
@@ -1352,9 +1368,9 @@ impl<C: Connector> Worker<C> {
     ) -> Result<(), AccountError> {
         let destination = match to {
             Destination::Archive => self.archive_path().await,
-            Destination::Trash => self
+            Destination::Trash | Destination::Junk | Destination::Inbox => self
                 .store
-                .folder_by_role(self.account.id, FolderRole::Trash)
+                .folder_by_role(self.account.id, to.role())
                 .ok()
                 .flatten()
                 .map(|f| f.path),
@@ -1365,6 +1381,8 @@ impl<C: Connector> Worker<C> {
             let what = match to {
                 Destination::Archive => "Aucun dossier d'archives sur ce compte",
                 Destination::Trash => "Aucune corbeille sur ce compte",
+                Destination::Junk => "Aucun dossier spam sur ce compte",
+                Destination::Inbox => "Aucune réception sur ce compte",
             };
             return Err(AccountError::new(ErrorKind::Other, what));
         };

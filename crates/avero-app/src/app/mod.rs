@@ -5,10 +5,13 @@
 //! picked with Ctrl, Maj or `x`), `places` (tabs, favourites, one
 //! sender's mail, the star), `unsubscribe` ("Se désinscrire"), `keys`
 //! (keyboard shortcuts), `accounts` (adding, fixing and removing
-//! accounts, worker events) and `composer`.
+//! accounts, worker events), `filters` (spam, the spam filter and the
+//! rules), `cleanup` ("Grand nettoyage") and `composer`.
 
 mod accounts;
+mod cleanup;
 mod composer;
+mod filters;
 mod keys;
 mod mail;
 mod places;
@@ -16,7 +19,9 @@ mod selection;
 mod unsubscribe;
 
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
+pub use cleanup::{Cleanup, CleanupMsg};
 pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
+pub use filters::{RuleForm, RuleMsg, field_name, move_name};
 pub use keys::SHORTCUTS;
 pub use places::{SenderView, tab_name};
 pub use unsubscribe::UnsubscribeOffer;
@@ -30,6 +35,7 @@ use crate::theme;
 use crate::view;
 use crate::worker::{self, AccountError, Destination, Event, Job, Reply, WorkerHandle};
 use avero_autoconfig::ProviderConfig;
+use avero_core::rules::Rule;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
@@ -73,6 +79,8 @@ pub enum Backend {
 pub enum Screen {
     Mail,
     Settings,
+    /// "Grand nettoyage".
+    Cleanup,
 }
 
 /// A dialog drawn over the window.
@@ -100,6 +108,20 @@ pub enum Overlay {
     Shortcuts,
     /// "Se désinscrire", waiting for a confirmation.
     ConfirmUnsubscribe(UnsubscribeOffer),
+    /// A rule being written or changed.
+    RuleEditor(RuleForm),
+    /// "Appliquer maintenant": the rule changes `count` mails of the
+    /// inbox.
+    ConfirmApplyRule {
+        rule: i64,
+        name: String,
+        count: usize,
+    },
+    /// "Tout mettre à la corbeille" for a sender of "Grand nettoyage".
+    ConfirmTrashSender {
+        name: String,
+        rows: Vec<i64>,
+    },
 }
 
 /// "Changer le mot de passe".
@@ -304,9 +326,15 @@ pub enum Message {
     ThreadsToggled(bool),
     /// "Trier la réception en onglets" in the settings.
     TabsToggled(bool),
+    /// "Filtre anti-spam" in the settings.
+    SpamFilterToggled(bool),
+    /// The spam filter learned from an account's folders (how many
+    /// messages), or could not.
+    SpamLearned(AccountId, Result<usize, String>),
 
     ShowMail,
     ShowSettings,
+    ShowCleanup,
     FolderSelected(FolderRole),
     /// "Favoris": the starred mail of every folder.
     StarredSelected,
@@ -354,6 +382,8 @@ pub enum Message {
     StarLine(usize),
     /// "Classer dans" for the conversation being read.
     Reclassify(Category),
+    /// "Spam" (`true`) or "Pas spam" for the lines acted on.
+    MarkSpam(bool),
     /// "Se désinscrire" (asks for a confirmation).
     Unsubscribe,
     ConfirmUnsubscribe,
@@ -366,6 +396,8 @@ pub enum Message {
     Compose(ComposeMsg),
     Add(AddMsg),
     Account(AccountMsg),
+    Rule(RuleMsg),
+    Cleanup(CleanupMsg),
 }
 
 /// Messages of the add-account card. `Debug` hides a typed password.
@@ -555,6 +587,13 @@ pub struct App {
     toast_seq: u64,
     /// Angle of the refresh icon while syncing.
     pub(crate) spinner: f32,
+
+    /// The user's rules, in order (read again after each change).
+    pub(crate) rules: Vec<Rule>,
+    /// Accounts whose folders the spam filter is learning from.
+    learning: HashSet<AccountId>,
+    /// "Grand nettoyage".
+    pub(crate) cleanup: Cleanup,
 }
 
 /// Erases the secrets of the accounts the store merged at startup (the
@@ -627,8 +666,12 @@ impl App {
             toast: None,
             toast_seq: 0,
             spinner: 0.0,
+            rules: Vec::new(),
+            learning: HashSet::new(),
+            cleanup: Cleanup::default(),
         };
         app.read_oauth_clients();
+        app.refresh_rules();
         let watching: Vec<Task<Message>> = app
             .accounts
             .clone()
@@ -638,6 +681,11 @@ impl App {
         app.load_first_page();
         let system = iced::system::theme().map(Message::SystemTheme);
         let complete = app.complete_smtp_settings();
+        let ids: Vec<AccountId> = app.accounts.iter().map(|a| a.id).collect();
+        let learning: Vec<Task<Message>> = ids
+            .into_iter()
+            .map(|id| app.learn_from_folders(id))
+            .collect();
         (
             app,
             Task::batch([
@@ -645,6 +693,7 @@ impl App {
                 Task::done(Message::AutoSync),
                 complete,
                 Task::batch(watching),
+                Task::batch(learning),
             ]),
         )
     }
@@ -745,6 +794,18 @@ impl App {
                 self.screen = Screen::Settings;
                 Task::none()
             }
+            Message::ShowCleanup => {
+                self.show_cleanup();
+                Task::none()
+            }
+            Message::SpamFilterToggled(on) => self.spam_filter_toggled(on),
+            Message::SpamLearned(account, result) => {
+                self.spam_learned(account, result);
+                Task::none()
+            }
+            Message::MarkSpam(spam) => self.mark_spam(spam),
+            Message::Rule(message) => self.update_rules(message),
+            Message::Cleanup(message) => self.update_cleanup(message),
             Message::FolderSelected(_)
             | Message::FilterSelected(_)
             | Message::SearchChanged(_)
@@ -972,8 +1033,12 @@ pub fn destination_label(destination: Destination) -> &'static str {
     match destination {
         Destination::Archive => "Archivé",
         Destination::Trash => "Placé dans la corbeille",
+        Destination::Junk => "Placé dans le spam",
+        Destination::Inbox => "Remis dans la réception",
     }
 }
 
+#[cfg(test)]
+mod filter_tests;
 #[cfg(test)]
 mod tests;

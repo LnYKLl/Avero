@@ -1096,10 +1096,17 @@ fn merged_accounts_secrets_are_erased() {
     }
     {
         // Rebuild what an old version could leave: a second "A@x.fr",
-        // in a version 3 database (without what versions 4 to 7 added).
+        // in a version 3 database (without what versions 4 to 8 added).
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE senders;
+            "DROP TABLE spam_learned;
+             DROP TABLE spam_tokens;
+             DROP TABLE rule_conditions;
+             DROP TABLE rules;
+             ALTER TABLE accounts DROP COLUMN spam_bootstrapped;
+             ALTER TABLE senders DROP COLUMN not_spam;
+             ALTER TABLE messages DROP COLUMN size;
+             DROP TABLE senders;
              DROP INDEX messages_sender;
              DROP INDEX messages_flagged;
              ALTER TABLE messages DROP COLUMN flagged;

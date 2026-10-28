@@ -2,6 +2,7 @@
 //! and the toast, plus small pieces shared by every view.
 
 pub mod add_account;
+pub mod cleanup;
 pub mod composer;
 pub mod dialogs;
 pub mod list;
@@ -44,6 +45,7 @@ pub fn app(app: &App) -> Element<'_, Message> {
                 row![list::view(app), right].height(Fill).into()
             }
             Screen::Settings => settings::view(app),
+            Screen::Cleanup => cleanup::view(app),
         };
         row![rail::view(app), main].height(Fill).into()
     };

@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Columns read by `facts_from_row`, on `m` (a message) and `f` (its
 /// folder).
 const FACT_COLUMNS: &str = "m.id, f.account_id, m.from_addr, m.from_name, m.to_addrs,
-     m.delivered_to, m.subject, m.seen";
+     m.delivered_to, m.subject, m.seen, m.uid";
 
 /// What the spam filter reads of a message: its key in `spam_learned`
 /// and its tokens.
@@ -194,6 +194,21 @@ impl Store {
 
     // ------------------------------------------------------- spam filter
 
+    /// The senders of these rows, each once (trimmed, lower case).
+    pub fn senders_of(&self, rows: &[i64]) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT lower(trim(from_addr)) FROM messages WHERE id = ?1")?;
+        let mut senders: Vec<String> = Vec::new();
+        for &row in rows {
+            let found: Option<String> = stmt.query_row(params![row], |r| r.get(0)).optional()?;
+            if let Some(addr) = found.filter(|a| !a.is_empty() && !senders.contains(a)) {
+                senders.push(addr);
+            }
+        }
+        Ok(senders)
+    }
+
     /// Teaches the filter that these messages are spam (or not). Copies
     /// of one message count once; a message already learned the same way
     /// is skipped, and one learned the other way is taken back first.
@@ -350,6 +365,7 @@ fn facts_from_row(row: &rusqlite::Row) -> rusqlite::Result<RuleFacts> {
         to,
         subject: row.get(6)?,
         seen: row.get(7)?,
+        uid: row.get(8)?,
     })
 }
 
