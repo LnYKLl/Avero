@@ -101,6 +101,20 @@ fn filters<'a>(
         ));
     }
 
+    filters = filters.push(tooltip(
+        button(text("+").size(14))
+            .padding([2, 8])
+            .on_press(Message::AddAccountOpened)
+            .style(button::secondary),
+        container(text("Ajouter un compte").size(13))
+            .padding(6)
+            .style(container::rounded_box),
+        tooltip::Position::Bottom,
+    ));
+    if accounts.is_empty() {
+        filters = filters.push(text("← Ajoute un compte").size(12));
+    }
+
     if syncing {
         filters = filters
             .push(space().width(Fill))

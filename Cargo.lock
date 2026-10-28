@@ -337,6 +337,7 @@ dependencies = [
  "directories",
  "futures",
  "iced",
+ "rusqlite",
  "tokio",
 ]
 

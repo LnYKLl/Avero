@@ -1,5 +1,6 @@
 //! The three panes of the main window, and small pieces they share.
 
+pub mod add_account;
 pub mod list;
 pub mod rail;
 pub mod reader;

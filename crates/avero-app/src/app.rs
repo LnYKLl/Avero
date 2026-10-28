@@ -1,6 +1,7 @@
 //! State of the main window and how it reacts to messages.
 
 use crate::view;
+use crate::view::add_account::{AddAccountForm, Field};
 use crate::worker::spawn_sync;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
@@ -24,6 +25,10 @@ pub enum Message {
     SyncAll,
     SyncFinished(AccountId, Result<SyncReport, String>),
     LoadMore,
+    AddAccountOpened,
+    AddAccountField(Field, String),
+    AddAccountSubmitted,
+    AddAccountCancelled,
 }
 
 /// The main window.
@@ -37,6 +42,8 @@ pub struct App {
     selected: Option<usize>,
     errors: HashMap<AccountId, String>,
     syncing: HashSet<AccountId>,
+    /// The add-account form; `None` when closed.
+    form: Option<AddAccountForm>,
 }
 
 impl App {
@@ -61,6 +68,7 @@ impl App {
             selected: None,
             errors: HashMap::new(),
             syncing: HashSet::new(),
+            form: None,
         };
         app.load_first_page();
         (app, Task::done(Message::SyncAll))
@@ -98,6 +106,21 @@ impl App {
                 self.items.extend(next);
                 Task::none()
             }
+            Message::AddAccountOpened => {
+                self.form = Some(AddAccountForm::new());
+                Task::none()
+            }
+            Message::AddAccountField(field, value) => {
+                if let Some(form) = &mut self.form {
+                    form.set(field, value);
+                }
+                Task::none()
+            }
+            Message::AddAccountSubmitted => self.submit_form(),
+            Message::AddAccountCancelled => {
+                self.form = None;
+                Task::none()
+            }
         }
     }
 
@@ -113,7 +136,10 @@ impl App {
                 &self.errors,
                 !self.syncing.is_empty(),
             ),
-            view::reader::view(selected, &self.accounts),
+            match &self.form {
+                Some(form) => view::add_account::view(form),
+                None => view::reader::view(selected, &self.accounts),
+            },
         ]
         .height(Fill)
         .into()
@@ -121,31 +147,63 @@ impl App {
 
     /// Starts one background sync per account that has a password.
     fn sync_all(&mut self) -> Task<Message> {
-        let mut tasks = Vec::new();
-        for account in &self.accounts {
-            if self.syncing.contains(&account.id) {
-                continue;
-            }
-            let password = match self.secrets.get(account.id) {
-                Ok(Some(password)) => password,
-                Ok(None) => {
-                    self.errors
-                        .insert(account.id, "Mot de passe manquant".to_string());
-                    continue;
-                }
-                Err(e) => {
-                    self.errors
-                        .insert(account.id, format!("Coffre-fort inaccessible : {e}"));
-                    continue;
-                }
-            };
-            self.syncing.insert(account.id);
-            let sync = spawn_sync(self.db_path.clone(), account.clone(), password);
-            tasks.push(Task::perform(sync, |(id, result)| {
-                Message::SyncFinished(id, result)
-            }));
+        let accounts = self.accounts.clone();
+        Task::batch(accounts.into_iter().filter_map(|a| self.sync_one(a)))
+    }
+
+    /// Starts the background sync of one account, unless it is already
+    /// running or has no usable password (then the reason goes in `errors`).
+    fn sync_one(&mut self, account: Account) -> Option<Task<Message>> {
+        if self.syncing.contains(&account.id) {
+            return None;
         }
-        Task::batch(tasks)
+        let password = match self.secrets.get(account.id) {
+            Ok(Some(password)) => password,
+            Ok(None) => {
+                self.errors
+                    .insert(account.id, "Mot de passe manquant".to_string());
+                return None;
+            }
+            Err(e) => {
+                self.errors
+                    .insert(account.id, format!("Coffre-fort inaccessible : {e}"));
+                return None;
+            }
+        };
+        self.syncing.insert(account.id);
+        let sync = spawn_sync(self.db_path.clone(), account, password);
+        Some(Task::perform(sync, |(id, result)| {
+            Message::SyncFinished(id, result)
+        }))
+    }
+
+    /// Validates the form; if it is fine, creates the account, puts the
+    /// password in the keyring and starts the first sync.
+    fn submit_form(&mut self) -> Task<Message> {
+        let Some(form) = &mut self.form else {
+            return Task::none();
+        };
+        let Some((new_account, password)) = form.validate() else {
+            return Task::none();
+        };
+        let account = match self.store.add_account(new_account) {
+            Ok(account) => account,
+            Err(e) => {
+                let message = format!("Impossible d'ajouter le compte : {e}");
+                form.errors.insert(Field::Email, message);
+                return Task::none();
+            }
+        };
+        self.form = None;
+        self.accounts.push(account.clone());
+        if let Err(e) = self.secrets.set(account.id, &password) {
+            // The account exists but has no password: it shows a barred
+            // dot with the reason in its tooltip.
+            self.errors
+                .insert(account.id, format!("Coffre-fort inaccessible : {e}"));
+            return Task::none();
+        }
+        self.sync_one(account).unwrap_or_else(Task::none)
     }
 
     /// Shows the first page for the current filter, with nothing selected.
@@ -182,6 +240,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::view::add_account::Field;
     use avero_core::secrets::MemorySecrets;
     use avero_core::{NewAccount, NewMessage, ServerConfig};
 
@@ -340,5 +399,122 @@ mod tests {
             Some("Mot de passe manquant")
         );
         assert!(app.syncing.is_empty());
+    }
+
+    /// Opens the form and fills it like a user would.
+    fn fill_form(app: &mut App, port: &str) {
+        let _ = app.update(Message::AddAccountOpened);
+        for (field, value) in [
+            (Field::Email, "moi@example.com"),
+            (Field::Host, "imap.example.com"),
+            (Field::Port, port),
+            (Field::Password, "s3cret-pass-xyz"),
+        ] {
+            let _ = app.update(Message::AddAccountField(field, value.to_string()));
+        }
+    }
+
+    #[test]
+    fn valid_form_creates_account_and_stores_secret() {
+        let mut app = app_with(|_| {});
+        fill_form(&mut app, "993");
+        let _ = app.update(Message::AddAccountSubmitted);
+        assert_eq!(app.accounts.len(), 1);
+        assert!(app.form.is_none());
+        let account = &app.accounts[0];
+        assert_eq!(account.name, "moi@example.com");
+        assert_eq!(account.imap.username, "moi@example.com");
+        assert_eq!(
+            app.secrets.get(account.id).unwrap(),
+            Some("s3cret-pass-xyz".to_string())
+        );
+        assert!(app.syncing.contains(&account.id));
+    }
+
+    #[test]
+    fn invalid_port_is_rejected() {
+        let mut app = app_with(|_| {});
+        fill_form(&mut app, "99999");
+        let _ = app.update(Message::AddAccountSubmitted);
+        assert!(app.accounts.is_empty());
+        let form = app.form.as_ref().expect("form stays open");
+        assert_eq!(
+            form.errors.get(&Field::Port).map(String::as_str),
+            Some("Port invalide (1 à 65535)")
+        );
+    }
+
+    #[test]
+    fn empty_form_reports_every_error() {
+        let mut app = app_with(|_| {});
+        let _ = app.update(Message::AddAccountOpened);
+        let _ = app.update(Message::AddAccountSubmitted);
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.errors.len(), 3); // email, host, password; port defaults to 993
+        assert!(app.accounts.is_empty());
+        let _ = app.update(Message::AddAccountCancelled);
+        assert!(app.form.is_none());
+    }
+
+    #[test]
+    fn username_follows_email_until_edited() {
+        let mut app = app_with(|_| {});
+        let _ = app.update(Message::AddAccountOpened);
+        let _ = app.update(Message::AddAccountField(Field::Email, "a@x".to_string()));
+        assert_eq!(app.form.as_ref().unwrap().username, "a@x");
+        let _ = app.update(Message::AddAccountField(
+            Field::Username,
+            "login".to_string(),
+        ));
+        let _ = app.update(Message::AddAccountField(Field::Email, "b@x".to_string()));
+        assert_eq!(app.form.as_ref().unwrap().username, "login");
+    }
+
+    #[test]
+    fn password_never_written_to_database() {
+        let path = std::env::temp_dir().join(format!("avero-test-{}.db", std::process::id()));
+        let store = Store::open(&path).unwrap();
+        let (mut app, _task) = App::new(store, Box::new(MemorySecrets::new()), path.clone());
+        fill_form(&mut app, "993");
+        let _ = app.update(Message::AddAccountSubmitted);
+        assert_eq!(app.accounts.len(), 1);
+
+        // Read the file with a second connection, every text column of every table.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut checked = 0;
+        for table in tables {
+            let columns: Vec<String> = conn
+                .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for column in columns {
+                let found: i64 = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM \"{table}\" WHERE CAST(\"{column}\" AS TEXT) LIKE '%' || ?1 || '%'"
+                        ),
+                        ["s3cret-pass-xyz"],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(found, 0, "password found in {table}.{column}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 5);
+        drop(app);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
