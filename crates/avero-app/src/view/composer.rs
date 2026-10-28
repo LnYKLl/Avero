@@ -69,11 +69,14 @@ pub fn view<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
     .style(theme::bare_pick_list)
     .menu_style(theme::menu);
 
-    let mut to_line = Row::new().align_y(Alignment::Center).push(input(
-        "Destinataires, séparés par des virgules",
-        &composer.to,
-        ComposeMsg::To,
-    ));
+    let mut to_line = Row::new().align_y(Alignment::Center).push(
+        text_input("Destinataires, séparés par des virgules", &composer.to)
+            .id(crate::app::TO_ID)
+            .on_input(|v| Message::Compose(ComposeMsg::To(v)))
+            .size(14)
+            .padding([8, 2])
+            .style(theme::bare_input),
+    );
     if !composer.show_copies {
         to_line = to_line.push(
             button(text("Cc / Cci").size(13).font(MEDIUM))
@@ -106,6 +109,7 @@ pub fn view<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
         .push(hr());
 
     let editor = text_editor(&composer.body)
+        .id(crate::app::BODY_ID)
         .placeholder("Écrivez votre message…")
         .on_action(|action| Message::Compose(ComposeMsg::Edit(action)))
         .key_binding(|press| {

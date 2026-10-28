@@ -22,10 +22,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
         section("Apparence", appearance(app)),
         section("À propos", about()),
     ]
-    .spacing(28)
+    .spacing(22)
     .max_width(MAX_WIDTH);
     container(
-        scrollable(container(page).padding([36, 40]).center_x(Fill))
+        scrollable(container(page).padding([28, 40]).center_x(Fill))
             .height(Fill)
             .style(theme::scrollbar),
     )

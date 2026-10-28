@@ -387,7 +387,7 @@ fn message_row<'a>(
     if !item.snippet.is_empty() {
         lines = lines.push(
             container(
-                text(ellipsize(&item.snippet, 46))
+                text(ellipsize(&item.snippet, 42))
                     .size(12)
                     .style(theme::muted)
                     .wrapping(Wrapping::None),

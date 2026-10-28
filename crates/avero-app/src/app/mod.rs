@@ -9,7 +9,7 @@ mod composer;
 mod mail;
 
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
-pub use composer::{ComposeMsg, Composer};
+pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
 
 use crate::account_form::{AccountForm, Field};
 use crate::auth::OAuthGrant;

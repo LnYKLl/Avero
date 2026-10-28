@@ -8,6 +8,11 @@ use iced::Task;
 use iced::widget::text_editor;
 use std::sync::Arc;
 
+/// Id of the "À" field, focused for a new message.
+pub const TO_ID: &str = "compose-to";
+/// Id of the body editor, focused for a reply or a forward.
+pub const BODY_ID: &str = "compose-body";
+
 /// Messages of the composer.
 #[derive(Debug, Clone)]
 pub enum ComposeMsg {
@@ -92,6 +97,7 @@ impl App {
             {
                 self.composer = Some(Composer::new(from));
                 self.screen = super::Screen::Mail;
+                return iced::widget::operation::focus(TO_ID);
             }
             return Task::none();
         }

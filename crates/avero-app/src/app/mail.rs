@@ -322,7 +322,12 @@ impl App {
         };
         self.composer = Some(super::Composer::from_fields(from, fields, attachments));
         self.screen = super::Screen::Mail;
-        Task::none()
+        let target = if mode == Mode::Forward {
+            super::composer::TO_ID
+        } else {
+            super::composer::BODY_ID
+        };
+        iced::widget::operation::focus(target)
     }
 
     /// The account a new message is sent from by default.
