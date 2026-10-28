@@ -655,7 +655,6 @@ impl Store {
     }
 }
 
-/// `None` for all accounts, else the account id (for `?n IS NULL OR ...`).
 /// Deletes the rows an account owns, inside the caller's transaction.
 fn delete_account_rows(conn: &Connection, id: AccountId) -> Result<(), StoreError> {
     // Bodies go by ON DELETE CASCADE, search entries by trigger.
@@ -669,6 +668,7 @@ fn delete_account_rows(conn: &Connection, id: AccountId) -> Result<(), StoreErro
     Ok(())
 }
 
+/// `None` for all accounts, else the account id (for `?n IS NULL OR ...`).
 fn filter_account(filter: AccountFilter) -> Option<i64> {
     match filter {
         AccountFilter::All => None,
