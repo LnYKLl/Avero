@@ -2,8 +2,11 @@
 //!
 //! Each worker owns a thread with a small tokio runtime, its own `Store`
 //! connection (a SQLite connection cannot be shared between threads) and
-//! a cached IMAP session, reconnected when it breaks. Jobs for the same
-//! account run one after the other; different accounts run in parallel.
+//! a cached IMAP session, reconnected when it breaks. The user's jobs for
+//! the same account run one after the other; different accounts run in
+//! parallel. A sync runs beside them on a thread of its own, with its own
+//! IMAP session and `Store` connection, so opening a message never waits
+//! for a long first sync.
 //!
 //! The UI sends a [`Job`] holding a [`Reply`] sender and reads the
 //! [`Event`]s from the matching stream (see [`request`]).
@@ -12,7 +15,9 @@ use crate::auth::{self, AccessToken, OAuthSecret};
 use crate::background::oauth_message;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
-use avero_core::{Account, AccountFilter, Credentials, FolderRole, MessageRef};
+use avero_core::{
+    Account, AccountFilter, AccountId, Credentials, FolderRole, MessageRef, ServerConfig,
+};
 use avero_sync::imap::ImapSource;
 use avero_sync::parse::{guarded, parse_body};
 use avero_sync::smtp::{self, Outgoing, SendError};
@@ -22,8 +27,9 @@ use iced::futures::stream::{self, BoxStream};
 use iced::futures::{Stream, StreamExt};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 /// How many of the newest inbox messages get their body downloaded in
 /// the background after a sync.
@@ -175,11 +181,16 @@ pub struct WorkerSetup {
 impl WorkerHandle {
     /// Starts the worker thread of an account.
     pub fn spawn(setup: WorkerSetup) -> WorkerHandle {
+        WorkerHandle::spawn_with(setup, Imap)
+    }
+
+    /// Starts a worker that opens its IMAP sessions with `connector`.
+    fn spawn_with<C: Connector>(setup: WorkerSetup, connector: C) -> WorkerHandle {
         let (jobs, receiver) = mpsc::unbounded_channel();
         let name = format!("avero-account-{}", setup.account.id.0);
         let _ = std::thread::Builder::new()
             .name(name)
-            .spawn(move || run_thread(setup, receiver));
+            .spawn(move || run_thread(setup, connector, receiver));
         WorkerHandle { jobs }
     }
 
@@ -252,7 +263,7 @@ pub fn drain(events: UnboundedReceiver<Event>) -> impl Stream<Item = Event> {
     })
 }
 
-fn run_thread(setup: WorkerSetup, mut jobs: UnboundedReceiver<Job>) {
+fn run_thread<C: Connector>(setup: WorkerSetup, connector: C, mut jobs: UnboundedReceiver<Job>) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -261,7 +272,7 @@ fn run_thread(setup: WorkerSetup, mut jobs: UnboundedReceiver<Job>) {
     };
     runtime.block_on(async move {
         match Store::open(&setup.db_path) {
-            Ok(store) => Worker::new(setup, store).run(jobs).await,
+            Ok(store) => Worker::new(setup, connector, store).run(jobs).await,
             Err(e) => {
                 let message = format!("Erreur de la base locale : {e}");
                 while let Some(job) = jobs.recv().await {
@@ -306,66 +317,386 @@ enum Flow {
     Stop,
 }
 
-struct Worker {
-    account: Account,
-    store: Store,
+/// Opens logged-in IMAP sessions. The real one is [`Imap`]; tests use a
+/// fake server.
+// Only used with generics, never as `dyn`. The sessions it opens stay on
+// the thread that opened them, so they need not be `Send`.
+#[allow(async_fn_in_trait)]
+pub trait Connector: Send + Sync + 'static {
+    type Source: MailSource;
+    async fn connect(
+        &self,
+        cfg: &ServerConfig,
+        creds: &Credentials,
+    ) -> Result<Self::Source, SyncError>;
+}
+
+/// The real IMAP server.
+pub struct Imap;
+
+impl Connector for Imap {
+    type Source = ImapSource;
+
+    async fn connect(
+        &self,
+        cfg: &ServerConfig,
+        creds: &Credentials,
+    ) -> Result<ImapSource, SyncError> {
+        ImapSource::connect(cfg, creds).await
+    }
+}
+
+/// How an account logs in, shared by its two IMAP connections (the one
+/// for the user's actions and the one for the sync, on another thread).
+struct Login<C> {
+    connector: C,
     secrets: Arc<dyn SecretStore>,
     config_dir: PathBuf,
-    token: Option<AccessToken>,
-    session: Option<ImapSource>,
+    /// The OAuth access token in memory. Both connections use the same
+    /// one: a token refreshed by one serves the other. The lock is held
+    /// during a refresh so they never refresh at the same time.
+    token: tokio::sync::Mutex<Option<AccessToken>>,
+}
+
+impl<C: Connector> Login<C> {
+    fn store_secret(&self, account: AccountId, secret: &str) -> Result<(), AccountError> {
+        self.secrets.set(account, secret).map_err(|e| {
+            AccountError::new(ErrorKind::Other, format!("Coffre-fort inaccessible : {e}"))
+        })
+    }
+
+    async fn set_token(&self, token: Option<AccessToken>) {
+        *self.token.lock().await = token;
+    }
+
+    /// What to log in with: the stored password, or a fresh OAuth access
+    /// token (refreshed when it expires within a minute).
+    async fn credentials(&self, account: &Account) -> Result<Credentials, AccountError> {
+        let user = account.imap.username.clone();
+        let Some(provider) = auth::provider_of(account.auth) else {
+            return match self.secrets.get(account.id) {
+                Ok(Some(password)) => Ok(Credentials::Password(password)),
+                Ok(None) => Err(AccountError::new(ErrorKind::Auth, "Mot de passe manquant")),
+                Err(e) => Err(AccountError::new(
+                    ErrorKind::Other,
+                    format!("Coffre-fort inaccessible : {e}"),
+                )),
+            };
+        };
+        let mut slot = self.token.lock().await;
+        if let Some(token) = slot.as_ref().filter(|t| t.is_fresh(auth::now())) {
+            return Ok(Credentials::OAuth2 {
+                user,
+                access_token: token.token.clone(),
+            });
+        }
+        let token = self.refresh(account, provider).await?;
+        let access_token = token.token.clone();
+        *slot = Some(token);
+        Ok(Credentials::OAuth2 { user, access_token })
+    }
+
+    async fn refresh(
+        &self,
+        account: &Account,
+        provider: avero_oauth::Provider,
+    ) -> Result<AccessToken, AccountError> {
+        let reconnect = || AccountError::new(ErrorKind::Reconnect, "Reconnexion nécessaire");
+        let secret = match self.secrets.get(account.id) {
+            Ok(Some(text)) => OAuthSecret::from_json(&text).ok_or_else(reconnect)?,
+            Ok(None) => return Err(reconnect()),
+            Err(e) => {
+                return Err(AccountError::new(
+                    ErrorKind::Other,
+                    format!("Coffre-fort inaccessible : {e}"),
+                ));
+            }
+        };
+        let Some(client) = avero_oauth::client_config(provider, &self.config_dir) else {
+            return Err(AccountError::new(
+                ErrorKind::Other,
+                format!(
+                    "La connexion {} n'est pas configurée (Réglages → Connexion Google / Microsoft)",
+                    auth::provider_name(provider)
+                ),
+            ));
+        };
+        match avero_oauth::refresh(provider, &client, &secret.refresh_token).await {
+            Ok(tokens) => {
+                if let Some(rotated) = tokens.refresh_token {
+                    self.store_secret(
+                        account.id,
+                        &OAuthSecret {
+                            refresh_token: rotated,
+                        }
+                        .to_json(),
+                    )?;
+                }
+                Ok(AccessToken {
+                    token: tokens.access_token,
+                    expires_at: tokens.expires_at,
+                })
+            }
+            Err(e) => Err(refresh_error(provider, &e)),
+        }
+    }
+
+    async fn connect(&self, account: &Account) -> Result<C::Source, AccountError> {
+        let creds = self.credentials(account).await?;
+        match self.connector.connect(&account.imap, &creds).await {
+            Ok(session) => Ok(session),
+            Err(error) => Err(self.classify(account, error).await),
+        }
+    }
+
+    /// French message for a server or database error.
+    async fn classify(&self, account: &Account, error: SyncError) -> AccountError {
+        if matches!(error, SyncError::Auth(_)) && account.auth != avero_core::AuthKind::Password {
+            // A refused token: forget it so the next try refreshes.
+            self.set_token(None).await;
+        }
+        user_error(&error, account)
+    }
+
+    /// Runs `op` on `session`, connecting first if needed. A lost or
+    /// silent connection is retried once on a new session; a timeout only
+    /// if `retry_timeout` (not for an APPEND, which the server may have
+    /// done anyway).
+    async fn with_session<T>(
+        &self,
+        account: &Account,
+        store: &Store,
+        session: &mut Option<C::Source>,
+        retry_timeout: bool,
+        mut op: impl AsyncFnMut(&mut C::Source, &Store) -> Result<T, SyncError>,
+    ) -> Result<T, AccountError> {
+        for attempt in 0..2 {
+            let mut current = match session.take() {
+                Some(current) => current,
+                None => self.connect(account).await?,
+            };
+            match op(&mut current, store).await {
+                Ok(value) => {
+                    *session = Some(current);
+                    return Ok(value);
+                }
+                Err(SyncError::Connect(_)) if attempt == 0 => continue,
+                Err(SyncError::Timeout(_)) if attempt == 0 && retry_timeout => continue,
+                Err(error @ (SyncError::Connect(_) | SyncError::Timeout(_))) => {
+                    return Err(self.classify(account, error).await);
+                }
+                Err(error) => {
+                    *session = Some(current);
+                    return Err(self.classify(account, error).await);
+                }
+            }
+        }
+        unreachable!("the loop returns on its second attempt")
+    }
+}
+
+/// The replies waiting for a sync: they get its `Progress` events, then
+/// its `Synced`.
+type Listeners = Arc<Mutex<Vec<Reply>>>;
+
+fn lock(listeners: &Listeners) -> std::sync::MutexGuard<'_, Vec<Reply>> {
+    // A panic while holding the lock leaves a usable list.
+    listeners.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A sync running on its own thread, with its own IMAP session and its
+/// own `Store` connection, so the worker keeps serving the user's jobs.
+struct RunningSync {
+    listeners: Listeners,
+    /// Dropping it (or sending) stops the sync at its next pause.
+    cancel: Option<oneshot::Sender<()>>,
+    /// The result; closed without one if the sync was stopped.
+    done: oneshot::Receiver<Result<(), AccountError>>,
+    /// The settings version it started with (see `Worker::version`).
+    version: u64,
+    /// Sync requests that came after the settings changed: they get a
+    /// new sync once this one ends.
+    next: Vec<Reply>,
+}
+
+impl RunningSync {
+    /// Stops the sync and waits until its thread has let go of the
+    /// session and the secrets.
+    async fn stop(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = (&mut self.done).await;
+    }
+}
+
+/// What a sync thread needs.
+struct SyncTask<C> {
+    account: Account,
+    db_path: PathBuf,
+    login: Arc<Login<C>>,
+    listeners: Listeners,
+}
+
+impl<C: Connector> SyncTask<C> {
+    fn run(self, cancel: oneshot::Receiver<()>, done: oneshot::Sender<Result<(), AccountError>>) {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            let _ = done.send(Err(AccountError::new(
+                ErrorKind::Other,
+                "Impossible de lancer la synchronisation",
+            )));
+            return;
+        };
+        runtime.block_on(async move {
+            tokio::select! {
+                result = self.sync() => {
+                    let _ = done.send(result);
+                }
+                // Asked to stop, or the worker is gone.
+                _ = cancel => {}
+            }
+        });
+    }
+
+    async fn sync(&self) -> Result<(), AccountError> {
+        let store = Store::open(&self.db_path).map_err(|e| {
+            AccountError::new(ErrorKind::Other, format!("Erreur de la base locale : {e}"))
+        })?;
+        let id = self.account.id;
+        let listeners = &self.listeners;
+        let mut session = None;
+        self.login
+            .with_session(
+                &self.account,
+                &store,
+                &mut session,
+                true,
+                async |session, store| {
+                    sync_account(store, session, id, |_| {
+                        for reply in lock(listeners).iter() {
+                            let _ = reply.send(Event::Progress);
+                        }
+                    })
+                    .await
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+/// What woke the worker loop up.
+enum Wake {
+    Job(Option<Job>),
+    Synced(Result<(), AccountError>),
+}
+
+/// Waits for the running sync to end; never ends when none runs.
+async fn sync_end(sync: &mut Option<RunningSync>) -> Result<(), AccountError> {
+    match sync {
+        Some(running) => (&mut running.done)
+            .await
+            .unwrap_or_else(|_| Err(sync_stopped())),
+        None => std::future::pending().await,
+    }
+}
+
+fn sync_stopped() -> AccountError {
+    AccountError::new(ErrorKind::Other, "La synchronisation s'est arrêtée")
+}
+
+struct Worker<C: Connector> {
+    account: Account,
+    store: Store,
+    db_path: PathBuf,
+    login: Arc<Login<C>>,
+    /// The session for the user's actions (the sync has its own).
+    session: Option<C::Source>,
+    /// Bumped when the account's settings or secret change, so that a
+    /// sync started before is not taken for an up-to-date one.
+    version: u64,
+    sync: Option<RunningSync>,
     /// Archive folder path, once looked up (`Some(None)`: there is none).
     archive: Option<Option<String>>,
     prefetch: VecDeque<MessageRef>,
-    prefetch_reply: Option<Reply>,
+    prefetch_replies: Vec<Reply>,
     prefetched: usize,
 }
 
-impl Worker {
-    fn new(setup: WorkerSetup, store: Store) -> Worker {
+impl<C: Connector> Worker<C> {
+    fn new(setup: WorkerSetup, connector: C, store: Store) -> Worker<C> {
         Worker {
             account: setup.account,
             store,
-            secrets: setup.secrets,
-            config_dir: setup.config_dir,
-            token: None,
+            db_path: setup.db_path,
+            login: Arc::new(Login {
+                connector,
+                secrets: setup.secrets,
+                config_dir: setup.config_dir,
+                token: tokio::sync::Mutex::new(None),
+            }),
             session: None,
+            version: 0,
+            sync: None,
             archive: None,
             prefetch: VecDeque::new(),
-            prefetch_reply: None,
+            prefetch_replies: Vec::new(),
             prefetched: 0,
         }
     }
 
-    /// Handles jobs as they come; when idle, downloads queued bodies one
-    /// at a time so user actions never wait for the whole prefetch.
+    /// Handles jobs as they come, and the end of the sync running beside
+    /// them; when idle, downloads queued bodies one at a time so user
+    /// actions never wait for the whole prefetch.
     async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
         loop {
-            let job = if self.prefetch.is_empty() {
-                match jobs.recv().await {
-                    Some(job) => job,
-                    None => break,
+            let wake = if self.prefetch.is_empty() {
+                tokio::select! {
+                    job = jobs.recv() => Wake::Job(job),
+                    result = sync_end(&mut self.sync) => Wake::Synced(result),
                 }
+            } else if let Some(result) = self.sync_ended() {
+                Wake::Synced(result)
             } else {
                 match jobs.try_recv() {
-                    Ok(job) => job,
+                    Ok(job) => Wake::Job(Some(job)),
                     Err(mpsc::error::TryRecvError::Empty) => {
                         self.prefetch_one().await;
                         continue;
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => Wake::Job(None),
                 }
             };
-            if self.handle(job).await == Flow::Stop {
-                break;
+            match wake {
+                Wake::Job(Some(job)) => {
+                    if self.handle(job).await == Flow::Stop {
+                        break;
+                    }
+                }
+                Wake::Job(None) => break,
+                Wake::Synced(result) => self.finish_sync(result).await,
             }
+        }
+    }
+
+    /// The result of the running sync if it has ended, without waiting.
+    fn sync_ended(&mut self) -> Option<Result<(), AccountError>> {
+        let running = self.sync.as_mut()?;
+        match running.done.try_recv() {
+            Ok(result) => Some(result),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(sync_stopped())),
         }
     }
 
     async fn handle(&mut self, job: Job) -> Flow {
         match job {
             Job::SetPassword { password, reply } => {
-                let result = self.store_secret(&password);
-                self.session = None;
+                let result = self.login.store_secret(self.account.id, &password);
+                self.settings_changed();
                 let _ = reply.send(Event::Done(result));
             }
             Job::SetOAuth {
@@ -374,7 +705,8 @@ impl Worker {
                 reply,
             } => {
                 let result = match refresh_token {
-                    Some(token) => self.store_secret(
+                    Some(token) => self.login.store_secret(
+                        self.account.id,
                         &OAuthSecret {
                             refresh_token: token,
                         }
@@ -382,15 +714,15 @@ impl Worker {
                     ),
                     None => Ok(()),
                 };
-                self.token = Some(access);
-                self.session = None;
+                self.login.set_token(Some(access)).await;
+                self.settings_changed();
                 let _ = reply.send(Event::Done(result));
             }
             Job::UpdateAccount(account) => {
                 self.account = account;
-                self.session = None;
+                self.settings_changed();
             }
-            Job::Sync { reply } => self.sync(reply).await,
+            Job::Sync { reply } => self.request_sync(reply),
             Job::FetchBody { target, reply } => {
                 let result = self.download_body(&target).await;
                 let _ = reply.send(Event::Body {
@@ -419,8 +751,13 @@ impl Worker {
                 let _ = reply.send(Event::Sent(result));
             }
             Job::Shutdown { delete_secret } => {
+                // The sync thread must be done with the secret before it
+                // is deleted (a refresh could store a new one).
+                if let Some(running) = self.sync.take() {
+                    running.stop().await;
+                }
                 if delete_secret {
-                    let _ = self.secrets.delete(self.account.id);
+                    let _ = self.login.secrets.delete(self.account.id);
                 }
                 return Flow::Stop;
             }
@@ -428,164 +765,108 @@ impl Worker {
         Flow::Continue
     }
 
-    fn store_secret(&self, secret: &str) -> Result<(), AccountError> {
-        self.secrets.set(self.account.id, secret).map_err(|e| {
-            AccountError::new(ErrorKind::Other, format!("Coffre-fort inaccessible : {e}"))
-        })
+    /// Forgets the session; the next sync uses the new settings.
+    fn settings_changed(&mut self) {
+        self.session = None;
+        self.version += 1;
     }
 
-    /// What to log in with: the stored password, or a fresh OAuth access
-    /// token (refreshed when it expires within a minute).
-    async fn credentials(&mut self) -> Result<Credentials, AccountError> {
-        let user = self.account.imap.username.clone();
-        let Some(provider) = auth::provider_of(self.account.auth) else {
-            return match self.secrets.get(self.account.id) {
-                Ok(Some(password)) => Ok(Credentials::Password(password)),
-                Ok(None) => Err(AccountError::new(ErrorKind::Auth, "Mot de passe manquant")),
-                Err(e) => Err(AccountError::new(
-                    ErrorKind::Other,
-                    format!("Coffre-fort inaccessible : {e}"),
-                )),
-            };
-        };
-        if let Some(token) = self.token.as_ref().filter(|t| t.is_fresh(auth::now())) {
-            return Ok(Credentials::OAuth2 {
-                user,
-                access_token: token.token.clone(),
-            });
-        }
-        let token = self.refresh(provider).await?;
-        Ok(Credentials::OAuth2 {
-            user,
-            access_token: token,
-        })
-    }
-
-    async fn refresh(&mut self, provider: avero_oauth::Provider) -> Result<String, AccountError> {
-        let reconnect = || AccountError::new(ErrorKind::Reconnect, "Reconnexion nécessaire");
-        let secret = match self.secrets.get(self.account.id) {
-            Ok(Some(text)) => OAuthSecret::from_json(&text).ok_or_else(reconnect)?,
-            Ok(None) => return Err(reconnect()),
-            Err(e) => {
-                return Err(AccountError::new(
-                    ErrorKind::Other,
-                    format!("Coffre-fort inaccessible : {e}"),
-                ));
-            }
-        };
-        let Some(client) = avero_oauth::client_config(provider, &self.config_dir) else {
-            return Err(AccountError::new(
-                ErrorKind::Other,
-                format!(
-                    "La connexion {} n'est pas configurée (Réglages → Connexion Google / Microsoft)",
-                    auth::provider_name(provider)
-                ),
-            ));
-        };
-        match avero_oauth::refresh(provider, &client, &secret.refresh_token).await {
-            Ok(tokens) => {
-                if let Some(rotated) = tokens.refresh_token {
-                    self.store_secret(
-                        &OAuthSecret {
-                            refresh_token: rotated,
-                        }
-                        .to_json(),
-                    )?;
-                }
-                self.token = Some(AccessToken {
-                    token: tokens.access_token.clone(),
-                    expires_at: tokens.expires_at,
-                });
-                Ok(tokens.access_token)
-            }
-            Err(e) => Err(refresh_error(provider, &e)),
-        }
-    }
-
-    async fn connect(&mut self) -> Result<ImapSource, AccountError> {
-        let creds = self.credentials().await?;
-        ImapSource::connect(&self.account.imap, &creds)
-            .await
-            .map_err(|e| self.classify(e))
-    }
-
-    /// Runs `op` on the IMAP session, connecting first if needed. A lost
-    /// or silent connection is retried once on a new session.
+    /// Runs `op` on the user's IMAP session, connecting first if needed.
     async fn with_session<T>(
         &mut self,
-        op: impl AsyncFnMut(&mut ImapSource, &Store) -> Result<T, SyncError>,
+        op: impl AsyncFnMut(&mut C::Source, &Store) -> Result<T, SyncError>,
     ) -> Result<T, AccountError> {
         self.with_session_retrying(true, op).await
     }
 
-    /// Like `with_session`; a timeout is retried only if `retry_timeout`
-    /// (not for an APPEND, which the server may have done anyway).
+    /// Like `with_session`; a timeout is retried only if `retry_timeout`.
     async fn with_session_retrying<T>(
         &mut self,
         retry_timeout: bool,
-        mut op: impl AsyncFnMut(&mut ImapSource, &Store) -> Result<T, SyncError>,
+        op: impl AsyncFnMut(&mut C::Source, &Store) -> Result<T, SyncError>,
     ) -> Result<T, AccountError> {
-        for attempt in 0..2 {
-            let mut session = match self.session.take() {
-                Some(session) => session,
-                None => self.connect().await?,
-            };
-            match op(&mut session, &self.store).await {
-                Ok(value) => {
-                    self.session = Some(session);
-                    return Ok(value);
-                }
-                Err(SyncError::Connect(_)) if attempt == 0 => continue,
-                Err(SyncError::Timeout(_)) if attempt == 0 && retry_timeout => continue,
-                Err(error @ (SyncError::Connect(_) | SyncError::Timeout(_))) => {
-                    return Err(self.classify(error));
-                }
-                Err(error) => {
-                    self.session = Some(session);
-                    return Err(self.classify(error));
-                }
+        self.login
+            .with_session(
+                &self.account,
+                &self.store,
+                &mut self.session,
+                retry_timeout,
+                op,
+            )
+            .await
+    }
+
+    /// Only one sync runs at a time. A request during a sync joins it
+    /// (it gets the same events): starting another right after would
+    /// download almost nothing more. But if the settings or the secret
+    /// changed since the running sync started, its result may be stale:
+    /// the request then gets a new sync, run as soon as this one ends.
+    fn request_sync(&mut self, reply: Reply) {
+        let version = self.version;
+        if let Some(running) = &mut self.sync {
+            if running.version == version {
+                lock(&running.listeners).push(reply);
+            } else {
+                running.next.push(reply);
             }
+            return;
         }
-        unreachable!("the loop returns on its second attempt")
+        self.start_sync(vec![reply]);
     }
 
-    /// French message for a server or database error.
-    fn classify(&mut self, error: SyncError) -> AccountError {
-        if matches!(error, SyncError::Auth(_))
-            && self.account.auth != avero_core::AuthKind::Password
-        {
-            // A refused token: forget it so the next try refreshes.
-            self.token = None;
-        }
-        user_error(&error, &self.account)
+    fn start_sync(&mut self, replies: Vec<Reply>) {
+        let listeners: Listeners = Arc::new(Mutex::new(replies));
+        let (cancel, cancelled) = oneshot::channel();
+        let (finished, done) = oneshot::channel();
+        let task = SyncTask {
+            account: self.account.clone(),
+            db_path: self.db_path.clone(),
+            login: self.login.clone(),
+            listeners: listeners.clone(),
+        };
+        // If the thread cannot start, `finished` is dropped and the
+        // listeners get `sync_stopped`.
+        let _ = std::thread::Builder::new()
+            .name(format!("avero-sync-{}", self.account.id.0))
+            .spawn(move || task.run(cancelled, finished));
+        self.sync = Some(RunningSync {
+            listeners,
+            cancel: Some(cancel),
+            done,
+            version: self.version,
+            next: Vec::new(),
+        });
     }
 
-    async fn sync(&mut self, reply: Reply) {
-        let id = self.account.id;
-        let progress = reply.clone();
-        let result = self
-            .with_session(async |session, store| {
-                sync_account(store, session, id, |_| {
-                    let _ = progress.send(Event::Progress);
-                })
-                .await
-            })
-            .await;
+    /// Answers the replies of the sync that ended, queues the prefetch,
+    /// and starts the sync that was asked meanwhile, if any.
+    async fn finish_sync(&mut self, result: Result<(), AccountError>) {
+        let Some(running) = self.sync.take() else {
+            return;
+        };
+        let replies = std::mem::take(&mut *lock(&running.listeners));
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 let archive = self.archive_path().await.is_some();
-                self.queue_prefetch(reply.clone());
-                let _ = reply.send(Event::Synced(Ok(archive)));
+                self.queue_prefetch(replies.clone());
+                for reply in &replies {
+                    let _ = reply.send(Event::Synced(Ok(archive)));
+                }
             }
             Err(error) => {
-                let _ = reply.send(Event::Synced(Err(error)));
+                for reply in &replies {
+                    let _ = reply.send(Event::Synced(Err(error.clone())));
+                }
             }
+        }
+        if !running.next.is_empty() {
+            self.start_sync(running.next);
         }
     }
 
     /// Queues the newest inbox messages that have no cached body. The
-    /// reply stays open until they are all downloaded.
-    fn queue_prefetch(&mut self, reply: Reply) {
+    /// replies stay open until they are all downloaded.
+    fn queue_prefetch(&mut self, replies: Vec<Reply>) {
         let filter = AccountFilter::Only(self.account.id);
         let items = self
             .store
@@ -603,7 +884,11 @@ impl Worker {
             .into_iter()
             .collect();
         self.prefetched = 0;
-        self.prefetch_reply = (!self.prefetch.is_empty()).then_some(reply);
+        self.prefetch_replies = if self.prefetch.is_empty() {
+            Vec::new()
+        } else {
+            replies
+        };
     }
 
     async fn prefetch_one(&mut self) {
@@ -615,13 +900,13 @@ impl Worker {
             self.prefetch.clear();
         }
         self.prefetched += 1;
-        if (self.prefetch.is_empty() || self.prefetched.is_multiple_of(5))
-            && let Some(reply) = &self.prefetch_reply
-        {
-            let _ = reply.send(Event::Progress);
+        if self.prefetch.is_empty() || self.prefetched.is_multiple_of(5) {
+            for reply in &self.prefetch_replies {
+                let _ = reply.send(Event::Progress);
+            }
         }
         if self.prefetch.is_empty() {
-            self.prefetch_reply = None;
+            self.prefetch_replies.clear();
         }
     }
 
@@ -688,7 +973,7 @@ impl Worker {
         &mut self,
         targets: &[MessageRef],
         skip: Option<&str>,
-        op: impl AsyncFn(&mut ImapSource, &[u32]) -> Result<(), SyncError>,
+        op: impl AsyncFn(&mut C::Source, &[u32]) -> Result<(), SyncError>,
     ) -> Result<(), AccountError> {
         let mut result = Ok(());
         for (folder, (uids, rows)) in by_folder(targets) {
@@ -787,7 +1072,11 @@ impl Worker {
         if self.account.smtp.host.trim().is_empty() {
             return Err(SMTP_MISSING.to_string());
         }
-        let creds = self.credentials().await.map_err(|e| e.message)?;
+        let creds = self
+            .login
+            .credentials(&self.account)
+            .await
+            .map_err(|e| e.message)?;
         let raw = smtp::send(&self.account.smtp, &creds, outgoing)
             .await
             .map_err(|e| send_message(&e, &self.account))?;
@@ -882,8 +1171,10 @@ mod tests {
     use super::*;
     use avero_core::secrets::MemorySecrets;
     use avero_core::{AccountColor, AccountId, AuthKind, FolderId, NewAccount, ServerConfig};
+    use avero_sync::source::{FetchedHeader, FolderStatus, RemoteFolder};
     use iced::futures::StreamExt;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn refresh_errors_are_classified() {
@@ -1232,5 +1523,286 @@ mod tests {
             .await;
         store.apply_flags(inbox.id, 1, 1, &[(1, false)]).unwrap();
         assert_eq!(store.inbox_uids(inbox.id).unwrap(), vec![(1, false)]);
+    }
+
+    /// A fake IMAP server whose folder list waits until `open` turns
+    /// true: a sync on it lasts as long as the test wants.
+    struct FakeServer {
+        open: tokio::sync::watch::Receiver<bool>,
+        /// Signalled when a folder list starts (the sync is running).
+        listing: tokio::sync::Notify,
+        lists: AtomicUsize,
+        connects: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    struct FakeConnector(Arc<FakeServer>);
+
+    impl Connector for FakeConnector {
+        type Source = FakeSession;
+
+        async fn connect(
+            &self,
+            _cfg: &ServerConfig,
+            _creds: &Credentials,
+        ) -> Result<FakeSession, SyncError> {
+            self.0.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(FakeSession(self.0.clone()))
+        }
+    }
+
+    struct FakeSession(Arc<FakeServer>);
+
+    impl Drop for FakeSession {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl MailSource for FakeSession {
+        async fn list_folders(&mut self) -> Result<Vec<RemoteFolder>, SyncError> {
+            self.0.lists.fetch_add(1, Ordering::SeqCst);
+            self.0.listing.notify_one();
+            let mut open = self.0.open.clone();
+            let _ = open.wait_for(|open| *open).await;
+            Ok(Vec::new())
+        }
+        async fn select(&mut self, _path: &str) -> Result<FolderStatus, SyncError> {
+            Ok(FolderStatus {
+                uid_validity: 1,
+                uid_next: Some(2),
+                exists: 1,
+            })
+        }
+        async fn fetch_headers(
+            &mut self,
+            _from_uid: u32,
+            _to_uid: Option<u32>,
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_headers_by_seq(
+            &mut self,
+            _from_seq: u32,
+            _to_seq: u32,
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_uids(&mut self, _from_uid: u32) -> Result<Vec<u32>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_flags(
+            &mut self,
+            _from_uid: u32,
+            _to_uid: u32,
+        ) -> Result<Vec<(u32, bool)>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_body(&mut self, _uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
+            Ok(Some(b"Subject: s\r\n\r\nBonjour".to_vec()))
+        }
+        async fn set_seen(&mut self, _uids: &[u32], _seen: bool) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn move_to(&mut self, _uids: &[u32], _dest: &str) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn delete_permanently(&mut self, _uids: &[u32]) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn append(
+            &mut self,
+            _folder: &str,
+            _raw: &[u8],
+            _seen: bool,
+        ) -> Result<(), SyncError> {
+            Ok(())
+        }
+    }
+
+    /// A worker on a fake server, with one inbox message (no body yet)
+    /// and an archive folder.
+    struct Fake {
+        worker: WorkerHandle,
+        server: Arc<FakeServer>,
+        open: tokio::sync::watch::Sender<bool>,
+        target: MessageRef,
+        store: Store,
+        secrets: Arc<MemorySecrets>,
+        account: AccountId,
+    }
+
+    fn fake_worker(tag: &str) -> Fake {
+        let db = temp_db(tag);
+        let account = account_at(&db, "imap.fake", 993, AuthKind::Password);
+        let store = Store::open(&db).unwrap();
+        let inbox = store
+            .upsert_folder(account.id, "INBOX", FolderRole::Inbox)
+            .unwrap();
+        store
+            .upsert_folder(account.id, "Archive", FolderRole::Archive)
+            .unwrap();
+        let message = avero_core::NewMessage {
+            uid: 1,
+            message_id: None,
+            subject: "s".into(),
+            from_name: None,
+            from_addr: "x@y.z".into(),
+            date: 1,
+            seen: false,
+            has_attachments: false,
+        };
+        store.insert_messages(inbox.id, &[message]).unwrap();
+        let rows: Vec<i64> = store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap()
+            .into_iter()
+            .flat_map(|i| i.row_ids)
+            .collect();
+        let target = store.message_refs(&rows).unwrap().remove(0);
+        let secrets = Arc::new(MemorySecrets::new());
+        secrets.set(account.id, "pw").unwrap();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let server = Arc::new(FakeServer {
+            open: gate,
+            listing: tokio::sync::Notify::new(),
+            lists: AtomicUsize::new(0),
+            connects: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+        });
+        let worker = WorkerHandle::spawn_with(
+            WorkerSetup {
+                account: account.clone(),
+                db_path: db,
+                secrets: secrets.clone(),
+                config_dir: std::env::temp_dir().join("avero-worker-no-config"),
+            },
+            FakeConnector(server.clone()),
+        );
+        Fake {
+            worker,
+            server,
+            open,
+            target,
+            store,
+            secrets,
+            account: account.id,
+        }
+    }
+
+    /// Starts a sync and collects its events in the background.
+    fn start_sync(worker: &WorkerHandle) -> tokio::task::JoinHandle<Vec<Event>> {
+        tokio::spawn(worker.request(|reply| Job::Sync { reply }).collect())
+    }
+
+    /// Waits until the worker has handled every job sent before.
+    async fn flush(worker: &WorkerHandle) {
+        let events: Vec<Event> = worker
+            .request(|reply| Job::SetSeen {
+                targets: Vec::new(),
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(matches!(events.last(), Some(Event::Done(Ok(())))));
+    }
+
+    /// The sync succeeded (the prefetch may add `Progress` events after).
+    fn synced_ok(events: &[Event]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Synced(Ok(true))))
+    }
+
+    #[tokio::test]
+    async fn body_is_served_during_a_slow_sync() {
+        let fake = fake_worker("readsync");
+        let sync = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        let target = fake.target.clone();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::FetchBody { target, reply })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Body { result: Ok(()), .. })),
+            "{events:?}"
+        );
+        assert!(fake.store.body(fake.target.row_id).unwrap().is_some());
+        assert!(!sync.is_finished(), "the sync is still waiting");
+        fake.open.send(true).unwrap();
+        let events = sync.await.unwrap();
+        assert!(synced_ok(&events), "{events:?}");
+        // Two sessions: the user's and the sync's.
+        assert_eq!(fake.server.connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_asked_during_a_sync_joins_it() {
+        let fake = fake_worker("merge");
+        let first = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        let second = start_sync(&fake.worker);
+        flush(&fake.worker).await;
+        fake.open.send(true).unwrap();
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(synced_ok(&first), "{first:?}");
+        assert!(synced_ok(&second), "{second:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1, "one sync");
+    }
+
+    #[tokio::test]
+    async fn sync_asked_after_new_settings_runs_again() {
+        let fake = fake_worker("resync");
+        let first = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        let _: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetPassword {
+                password: "new".into(),
+                reply,
+            })
+            .collect()
+            .await;
+        let second = start_sync(&fake.worker);
+        flush(&fake.worker).await;
+        fake.open.send(true).unwrap();
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(synced_ok(&first), "{first:?}");
+        assert!(synced_ok(&second), "{second:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 2, "two syncs");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_sync_stops_it() {
+        let fake = fake_worker("stopsync");
+        let sync = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        fake.worker.send(Job::Shutdown {
+            delete_secret: true,
+        });
+        // The gate never opens: only the shutdown can end this sync.
+        let events = sync.await.unwrap();
+        assert!(
+            events.is_empty() || matches!(events.as_slice(), [Event::Gone]),
+            "{events:?}"
+        );
+        let later: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::Sync { reply })
+            .collect()
+            .await;
+        assert!(
+            later.is_empty() || matches!(later.as_slice(), [Event::Gone]),
+            "{later:?}"
+        );
+        assert_eq!(fake.secrets.get(fake.account).unwrap(), None);
+        // The sync's session was dropped, not left running.
+        assert_eq!(
+            fake.server.dropped.load(Ordering::SeqCst),
+            fake.server.connects.load(Ordering::SeqCst)
+        );
     }
 }
