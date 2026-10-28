@@ -4,10 +4,18 @@
 //!
 //! Only the unsubscribe address is contacted, and nothing of the mail is
 //! sent: a one-click request carries exactly `List-Unsubscribe=One-Click`
-//! (no cookie, no referrer, never redirected to plain `http:`); a mail
-//! carries only the subject and body the `mailto:` link asks for.
+//! (no cookie, no referrer, no proxy, never redirected to plain `http:`);
+//! a mail carries only the subject and body the `mailto:` link asks for.
+//!
+//! A one-click request only goes to the public Internet: never to this
+//! computer or the local network (a spam could otherwise make Avero post
+//! to a service of the intranet), whether the address names one, a name
+//! leads to one, or a redirect does.
 
 use reqwest::Url;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The body of a one-click request (RFC 8058 §3.2).
@@ -100,6 +108,7 @@ pub fn choose(list_unsubscribe: &str, post: Option<&str>) -> Option<Method> {
     let https = web("https");
     if offers_one_click(post)
         && let Some(url) = &https
+        && host_allowed(url)
     {
         return Some(Method::OneClick(url.clone()));
     }
@@ -176,19 +185,117 @@ fn percent_decode(text: &str) -> String {
 }
 
 /// Whether a redirect of a one-click request to `next` is followed:
-/// HTTPS only, and at most [`MAX_REDIRECTS`] of them (`followed` so far).
+/// HTTPS only, not to a local address, and at most [`MAX_REDIRECTS`] of
+/// them (`followed` so far).
 pub fn redirect_allowed(next: &Url, followed: usize) -> bool {
-    next.scheme() == "https" && followed < MAX_REDIRECTS
+    next.scheme() == "https" && host_allowed(next) && followed < MAX_REDIRECTS
+}
+
+/// Whether an address is on the public Internet: not this computer
+/// (loopback), nor a private, shared (CGNAT), link-local or unique local
+/// network, nor a special one (unspecified, multicast, broadcast,
+/// documentation, benchmarking, reserved). An IPv4 address written as
+/// IPv6 (mapped, or NAT64) is judged as IPv4.
+pub fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_v4(v4);
+            }
+            let s = v6.segments();
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                let [a, b] = s[6].to_be_bytes();
+                let [c, d] = s[7].to_be_bytes();
+                return is_public_v4(Ipv4Addr::new(a, b, c, d));
+            }
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7: unique local.
+                || (s[0] & 0xfe00) == 0xfc00
+                // fe80::/10: link-local; fec0::/10: old site-local.
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                // 2001:db8::/32: documentation.
+                || (s[0] == 0x2001 && s[1] == 0x0db8)
+                // ::/96 (IPv4-compatible, deprecated).
+                || s[..6] == [0; 6])
+        }
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        // 0.0.0.0/8 ("this network"), 100.64.0.0/10 (shared, CGNAT),
+        // 192.0.0.0/24 (protocol assignments), 198.18.0.0/15
+        // (benchmarking), 240.0.0.0/4 (reserved).
+        || a == 0
+        || (a == 100 && (64..128).contains(&b))
+        || (a == 192 && b == 0 && ip.octets()[2] == 0)
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 240)
+}
+
+/// Whether the host of `url` may be contacted, as far as it can tell
+/// without the DNS: an address must be public, and `localhost` is
+/// refused. A name is checked when it is resolved (see `PublicOnly`).
+fn host_allowed(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // An IPv6 address is written between brackets.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return is_public(ip);
+    }
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    !name.is_empty() && name != "localhost" && !name.ends_with(".localhost")
+}
+
+/// Resolves names like the system, keeping only the public addresses
+/// (see `is_public`); a name that has none is refused. reqwest connects
+/// only to the addresses it gives, at the first request and after each
+/// redirect, so a name cannot lead elsewhere between the check and the
+/// connection.
+struct PublicOnly;
+
+/// The error of a name that only leads to the local network.
+const LOCAL_ADDRESS: &str = "l'adresse mène au réseau local";
+
+impl Resolve for PublicOnly {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let found = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let public: Vec<SocketAddr> = found.filter(|addr| is_public(addr.ip())).collect();
+            if public.is_empty() {
+                return Err(LOCAL_ADDRESS.into());
+            }
+            let addrs: Addrs = Box::new(public.into_iter());
+            Ok(addrs)
+        })
+    }
 }
 
 /// The HTTP client of one-click requests: no cookie store (reqwest keeps
-/// none unless asked), no `Referer`, no proxy, HTTPS-only redirects.
+/// none unless asked), no `Referer`, no proxy (not even the system's),
+/// public addresses only, HTTPS-only redirects.
 fn client() -> Result<reqwest::Client, String> {
     // Same crypto backend as the rest of the app (see avero-oauth).
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .referer(false)
+        .no_proxy()
+        .dns_resolver(Arc::new(PublicOnly))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if redirect_allowed(attempt.url(), attempt.previous().len()) {
                 attempt.follow()
@@ -200,12 +307,29 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.without_url().to_string())
 }
 
-/// Sends the one-click request (RFC 8058) to an HTTPS address.
+/// Sends the one-click request (RFC 8058) to an HTTPS address on the
+/// public Internet.
 pub async fn one_click(url: Url) -> Result<(), String> {
     if url.scheme() != "https" {
         return Err("Adresse de désinscription non chiffrée".to_string());
     }
+    if !host_allowed(&url) {
+        return Err(refused_local());
+    }
+    // Asked here too, for a clear message (the client checks again at
+    // the connection).
+    if let Some(host) = url.host_str()
+        && let Ok(name) = host.parse::<Name>()
+        && PublicOnly.resolve(name).await.is_err()
+    {
+        return Err(refused_local());
+    }
     post(&client()?, url).await
+}
+
+/// Why a one-click request to the local network was not sent.
+fn refused_local() -> String {
+    "Adresse de désinscription refusée : elle mène à cet ordinateur ou au réseau local".to_string()
 }
 
 /// The POST itself, on any client (tests use plain HTTP on 127.0.0.1).
@@ -370,6 +494,84 @@ mod tests {
     async fn one_click_refuses_plain_http() {
         let result = one_click(url("http://127.0.0.1:9/u")).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn only_public_addresses_are_contacted() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        for public in [
+            "93.184.216.34",
+            "1.1.1.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(is_public(ip(public)), "{public}");
+        }
+        for local in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd12:3456::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.0.1",
+            "64:ff9b::a00:1",
+        ] {
+            assert!(!is_public(ip(local)), "{local}");
+        }
+        assert!(host_allowed(&url("https://list.example/u")));
+        for local in [
+            "https://127.0.0.1/u",
+            "https://[::1]/u",
+            "https://10.0.0.8/admin",
+            "https://localhost/u",
+            "https://app.localhost./u",
+        ] {
+            assert!(!host_allowed(&url(local)), "{local}");
+            assert!(!redirect_allowed(&url(local), 0), "{local}");
+        }
+    }
+
+    #[test]
+    fn one_click_is_not_offered_for_a_local_address() {
+        let post = Some("List-Unsubscribe=One-Click");
+        assert_eq!(
+            choose("<https://192.168.1.10/u>, <mailto:u@list.example>", post),
+            Some(Method::Mail {
+                to: "u@list.example".into(),
+                subject: "Unsubscribe".into(),
+                body: "Unsubscribe".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_leads_to_this_computer_is_refused() {
+        // `localhost` resolves without any network.
+        let name: Name = "localhost".parse().unwrap();
+        assert!(PublicOnly.resolve(name).await.is_err());
+        let refused = one_click(url("https://localhost:9/u")).await.unwrap_err();
+        assert!(refused.contains("réseau local"), "{refused}");
+        // The client resolves the same way (also after a redirect): a
+        // server listening on this computer gets nothing.
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let (served, request) = serve_once(ok.into()).await;
+        let mut by_name = served.clone();
+        by_name.set_host(Some("localhost")).unwrap();
+        let error = post(&client().unwrap(), by_name).await.unwrap_err();
+        assert!(error.contains("ne répond pas"), "{error}");
+        // The server is still waiting: reach it directly to end it.
+        post(&reqwest::Client::new(), served).await.unwrap();
+        assert!(request.await.unwrap().starts_with("POST "));
     }
 
     /// A one-request HTTP server on 127.0.0.1: answers `reply` and hands
