@@ -85,7 +85,15 @@ mod tests {
                     host: host.into(),
                     port,
                     username: "a@x".into(),
+                    security: avero_core::model::Security::Tls,
                 },
+                smtp: ServerConfig {
+                    host: host.into(),
+                    port,
+                    username: "a@x".into(),
+                    security: avero_core::model::Security::Tls,
+                },
+                auth: avero_core::model::AuthKind::Password,
             })
             .unwrap();
         account.color = AccountColor::palette(0);
@@ -120,6 +128,7 @@ mod tests {
             host: "imap.ex.com".into(),
             port: 993,
             username: "a@x".into(),
+            security: avero_core::model::Security::Tls,
         };
         let connect = user_message(&SyncError::Connect("timeout".into()), &cfg);
         assert_eq!(connect, "Connexion impossible à imap.ex.com : timeout");

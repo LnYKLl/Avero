@@ -2,7 +2,7 @@
 
 use super::bold;
 use crate::app::Message;
-use avero_core::{NewAccount, ServerConfig};
+use avero_core::{AuthKind, NewAccount, Security, ServerConfig};
 use iced::widget::{Column, button, column, row, text, text_input};
 use iced::{Element, Fill, Theme};
 use std::collections::HashMap;
@@ -108,6 +108,12 @@ impl AddAccountForm {
             "" => email.clone(),
             username => username.to_string(),
         };
+        let smtp = ServerConfig {
+            host: smtp_host_for(&host),
+            port: 465,
+            username: username.clone(),
+            security: Security::Tls,
+        };
         let account = NewAccount {
             name,
             email,
@@ -115,9 +121,21 @@ impl AddAccountForm {
                 host,
                 port,
                 username,
+                security: Security::Tls,
             },
+            smtp,
+            auth: AuthKind::Password,
         };
         Some((account, self.password.clone()))
+    }
+}
+
+/// Guesses the SMTP server from the IMAP one: `imap.x.com` gives
+/// `smtp.x.com`, any other host is used as is.
+fn smtp_host_for(imap_host: &str) -> String {
+    match imap_host.strip_prefix("imap.") {
+        Some(rest) => format!("smtp.{rest}"),
+        None => imap_host.to_string(),
     }
 }
 
@@ -164,4 +182,15 @@ pub fn view(form: &AddAccountForm) -> Element<'_, Message> {
     .max_width(420)
     .width(Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smtp_host_follows_imap_host() {
+        assert_eq!(smtp_host_for("imap.example.com"), "smtp.example.com");
+        assert_eq!(smtp_host_for("mail.example.com"), "mail.example.com");
+    }
 }

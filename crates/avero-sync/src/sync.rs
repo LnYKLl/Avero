@@ -241,7 +241,15 @@ mod tests {
                     host: "imap.example.com".into(),
                     port: 993,
                     username: "t".into(),
+                    security: avero_core::model::Security::Tls,
                 },
+                smtp: ServerConfig {
+                    host: "smtp.example.com".into(),
+                    port: 993,
+                    username: "t".into(),
+                    security: avero_core::model::Security::Tls,
+                },
+                auth: avero_core::model::AuthKind::Password,
             })
             .unwrap();
         (store, account.id)

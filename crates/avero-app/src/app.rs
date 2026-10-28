@@ -254,7 +254,15 @@ mod tests {
                     host: "imap.example.com".to_string(),
                     port: 993,
                     username: email.to_string(),
+                    security: avero_core::model::Security::Tls,
                 },
+                smtp: ServerConfig {
+                    host: "smtp.example.com".to_string(),
+                    port: 993,
+                    username: email.to_string(),
+                    security: avero_core::model::Security::Tls,
+                },
+                auth: avero_core::model::AuthKind::Password,
             })
             .unwrap();
         let inbox = store
@@ -269,6 +277,7 @@ mod tests {
                 from_addr: "x@y.z".to_string(),
                 date: 1_700_000_000 + i64::from(uid),
                 seen: false,
+                has_attachments: false,
             })
             .collect();
         store.insert_messages(inbox.id, &messages).unwrap();
@@ -351,6 +360,7 @@ mod tests {
             from_addr: "x@y.z".to_string(),
             date: 1_800_000_000,
             seen: false,
+            has_attachments: false,
         };
         app.store.insert_messages(inbox, &[new_message]).unwrap();
 

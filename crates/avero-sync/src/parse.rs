@@ -14,6 +14,7 @@ pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
         from_addr: String::new(),
         date: 0,
         seen,
+        has_attachments: false,
     };
 
     let Some(parsed) = MessageParser::new().parse_headers(raw) else {

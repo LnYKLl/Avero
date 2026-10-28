@@ -67,12 +67,92 @@ impl AccountColor {
     }
 }
 
-/// Connection settings of an IMAP server.
+/// How the connection to a server is encrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Security {
+    /// TLS from the first byte (implicit TLS, ports 993 and 465).
+    Tls,
+    /// Plain connection upgraded with STARTTLS, which is required (port 587).
+    StartTls,
+}
+
+impl Security {
+    /// Stable text form, used for storage.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Security::Tls => "tls",
+            Security::StartTls => "starttls",
+        }
+    }
+
+    /// Parses the text form; unknown text gives `Tls` (the safest choice).
+    pub fn parse(s: &str) -> Security {
+        match s {
+            "starttls" => Security::StartTls,
+            _ => Security::Tls,
+        }
+    }
+}
+
+/// Connection settings of an IMAP or SMTP server. Holds no secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub security: Security,
+}
+
+/// How an account proves who it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    /// A password (or an app password) kept in the `SecretStore`.
+    Password,
+    /// OAuth2 with Google; the refresh token is kept in the `SecretStore`.
+    OAuthGoogle,
+    /// OAuth2 with Microsoft; the refresh token is kept in the `SecretStore`.
+    OAuthMicrosoft,
+}
+
+impl AuthKind {
+    /// Stable text form, used for storage.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthKind::Password => "password",
+            AuthKind::OAuthGoogle => "oauth-google",
+            AuthKind::OAuthMicrosoft => "oauth-microsoft",
+        }
+    }
+
+    /// Parses the text form; unknown text gives `Password`.
+    pub fn parse(s: &str) -> AuthKind {
+        match s {
+            "oauth-google" => AuthKind::OAuthGoogle,
+            "oauth-microsoft" => AuthKind::OAuthMicrosoft,
+            _ => AuthKind::Password,
+        }
+    }
+}
+
+/// What is sent to a server to log in. Lives in memory only.
+#[derive(Clone, PartialEq, Eq)]
+pub enum Credentials {
+    Password(String),
+    OAuth2 { user: String, access_token: String },
+}
+
+/// Written by hand so that secrets never show up in logs.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credentials::Password(_) => f.write_str("Password(***)"),
+            Credentials::OAuth2 { user, .. } => f
+                .debug_struct("OAuth2")
+                .field("user", user)
+                .field("access_token", &"***")
+                .finish(),
+        }
+    }
 }
 
 /// An account that has not been saved yet (no id, no colour).
@@ -81,6 +161,8 @@ pub struct NewAccount {
     pub name: String,
     pub email: String,
     pub imap: ServerConfig,
+    pub smtp: ServerConfig,
+    pub auth: AuthKind,
 }
 
 /// A saved account.
@@ -91,6 +173,8 @@ pub struct Account {
     pub email: String,
     pub color: AccountColor,
     pub imap: ServerConfig,
+    pub smtp: ServerConfig,
+    pub auth: AuthKind,
 }
 
 /// What a folder is used for.
@@ -155,6 +239,8 @@ pub struct NewMessage {
     /// Unix time in seconds.
     pub date: i64,
     pub seen: bool,
+    /// Guessed from the header block (see `avero_sync::parse`).
+    pub has_attachments: bool,
 }
 
 /// Which accounts the message list shows.
@@ -171,8 +257,22 @@ pub struct UnifiedItem {
     pub accounts: Vec<AccountId>,
     pub subject: String,
     pub from_display: String,
+    pub from_addr: String,
     pub date: i64,
     pub seen: bool,
+    pub has_attachments: bool,
+    /// Start of the body text when the body is cached, else empty.
+    pub snippet: String,
+}
+
+/// Where one stored message lives on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRef {
+    pub row_id: i64,
+    pub account_id: AccountId,
+    pub folder_id: FolderId,
+    pub folder_path: String,
+    pub uid: u32,
 }
 
 #[cfg(test)]
@@ -193,6 +293,38 @@ mod tests {
             assert_eq!(FolderRole::parse(r.as_str()), r);
         }
         assert_eq!(FolderRole::parse("nimporte"), FolderRole::Other);
+    }
+
+    #[test]
+    fn security_and_auth_roundtrip() {
+        for s in [Security::Tls, Security::StartTls] {
+            assert_eq!(Security::parse(s.as_str()), s);
+        }
+        assert_eq!(Security::parse("plain"), Security::Tls);
+        for a in [
+            AuthKind::Password,
+            AuthKind::OAuthGoogle,
+            AuthKind::OAuthMicrosoft,
+        ] {
+            assert_eq!(AuthKind::parse(a.as_str()), a);
+        }
+        assert_eq!(AuthKind::parse("?"), AuthKind::Password);
+    }
+
+    #[test]
+    fn credentials_debug_hides_secrets() {
+        let password = format!("{:?}", Credentials::Password("hunter2".into()));
+        assert!(!password.contains("hunter2"), "{password}");
+        assert!(password.contains("***"));
+        let oauth = format!(
+            "{:?}",
+            Credentials::OAuth2 {
+                user: "a@x".into(),
+                access_token: "ya29.token".into(),
+            }
+        );
+        assert!(!oauth.contains("ya29"), "{oauth}");
+        assert!(oauth.contains("a@x") && oauth.contains("***"));
     }
 
     #[test]
