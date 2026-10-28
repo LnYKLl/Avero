@@ -286,8 +286,10 @@ pub fn detect_role(path: &str, attributes: &[String]) -> FolderRole {
         return FolderRole::Inbox;
     }
 
-    // Last segment, whatever the delimiter ('/' or '.').
-    let name = path.rsplit(['/', '.']).next().unwrap_or(path);
+    // Last segment, whatever the delimiter ('/' or '.'), as the user
+    // reads it (servers send non-ASCII names in modified UTF-7).
+    let decoded = decode_folder_name(path);
+    let name = decoded.rsplit(['/', '.']).next().unwrap_or(&decoded);
     match name.to_lowercase().as_str() {
         "sent" | "sent items" | "sent messages" | "envoyés" | "éléments envoyés" => {
             FolderRole::Sent
@@ -298,6 +300,66 @@ pub fn detect_role(path: &str, attributes: &[String]) -> FolderRole {
         "junk" | "spam" | "courrier indésirable" => FolderRole::Junk,
         _ => FolderRole::Other,
     }
+}
+
+/// Decodes a folder name as servers send it, in modified UTF-7 (RFC 3501
+/// 5.1.3): `Envoy&AOk-s` is "Envoyés", `&-` is "&". Anything that is not
+/// valid modified UTF-7 comes back unchanged. Only for reading: commands
+/// sent to the server use the name exactly as listed.
+pub fn decode_folder_name(name: &str) -> String {
+    decode_mutf7(name).unwrap_or_else(|| name.to_string())
+}
+
+fn decode_mutf7(name: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(start) = rest.find('&') {
+        decoded.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let end = after.find('-')?;
+        let encoded = &after[..end];
+        if encoded.is_empty() {
+            decoded.push('&');
+        } else {
+            // Base64 of UTF-16BE, with ',' instead of '/' and no padding.
+            let bytes = mutf7_base64(encoded)?;
+            if bytes.len() % 2 != 0 {
+                return None;
+            }
+            let units: Vec<u16> = bytes
+                .chunks(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect();
+            decoded.push_str(&String::from_utf16(&units).ok()?);
+        }
+        rest = &after[end + 1..];
+    }
+    decoded.push_str(rest);
+    Some(decoded)
+}
+
+/// The modified base64 of RFC 3501; `None` on any other character.
+fn mutf7_base64(text: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut bits, mut count) = (0u32, 0u32);
+    for c in text.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b',' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(value);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            bytes.push((bits >> count) as u8);
+            bits &= (1 << count) - 1;
+        }
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -378,6 +440,36 @@ Content-Type: multipart/Mixed; boundary=x
         assert_eq!(detect_role("[Gmail]/Corbeille", &[]), FolderRole::Trash);
         assert_eq!(detect_role("inbox", &[]), FolderRole::Inbox);
         assert_eq!(detect_role("Éléments envoyés", &[]), FolderRole::Sent);
+    }
+
+    /// Servers send non-ASCII folder names in modified UTF-7 (RFC 3501
+    /// 5.1.3): "Envoyés" arrives as `Envoy&AOk-s`. Seen against GreenMail
+    /// (tests/e2e_local.rs).
+    #[test]
+    fn role_from_name_in_modified_utf7() {
+        assert_eq!(detect_role("Envoy&AOk-s", &[]), FolderRole::Sent);
+        assert_eq!(
+            detect_role("&AMk-l&AOk-ments envoy&AOk-s", &[]),
+            FolderRole::Sent
+        );
+        assert_eq!(
+            detect_role("INBOX.Courrier ind&AOk-sirable", &[]),
+            FolderRole::Junk
+        );
+    }
+
+    #[test]
+    fn decodes_modified_utf7_folder_names() {
+        assert_eq!(decode_folder_name("Envoy&AOk-s"), "Envoyés");
+        assert_eq!(decode_folder_name("Tom &- Jerry"), "Tom & Jerry");
+        assert_eq!(decode_folder_name("&ZeVnLIqe-"), "日本語");
+        // A character outside the BMP (surrogate pair).
+        assert_eq!(decode_folder_name("&2D3eAA-"), "😀");
+        assert_eq!(decode_folder_name("Plain/ASCII.name"), "Plain/ASCII.name");
+        // Broken input comes back unchanged.
+        assert_eq!(decode_folder_name("a&AOk"), "a&AOk");
+        assert_eq!(decode_folder_name("a&A*k-"), "a&A*k-");
+        assert_eq!(decode_folder_name("&2D0-"), "&2D0-");
     }
 
     #[test]
