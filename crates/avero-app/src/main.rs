@@ -27,6 +27,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn main() -> iced::Result {
+    // Windows: before any window, so the taskbar and the notifications
+    // know the process as Avero.
+    notify::set_process_app_id();
     // Without a console (release builds), a database that cannot be
     // opened must be explained in a window, not by a silent crash.
     if demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref()).is_none() {
@@ -176,6 +179,19 @@ mod tests {
     #[test]
     fn window_icon_is_rendered() {
         assert!(window_icon().is_some());
+    }
+
+    #[test]
+    fn windows_icon_has_every_size() {
+        // Made by `cargo run -p avero-app --example make_icon`.
+        let ico = include_bytes!("../assets/logo/avero.ico");
+        assert_eq!(&ico[..4], &[0, 0, 1, 0], "an .ico header");
+        let count = usize::from(u16::from_le_bytes([ico[4], ico[5]]));
+        // Each entry starts with the width; 0 means 256.
+        let widths: Vec<u8> = (0..count).map(|i| ico[6 + 16 * i]).collect();
+        for width in [16, 24, 32, 48, 0] {
+            assert!(widths.contains(&width), "size {width} missing: {widths:?}");
+        }
     }
 
     #[test]

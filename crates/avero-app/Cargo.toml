@@ -3,6 +3,7 @@ name = "avero-app"
 version.workspace = true
 edition.workspace = true
 license = "GPL-3.0-or-later"
+description = "Avero, a lightweight desktop email client"
 
 [dependencies]
 avero-autoconfig = { path = "../avero-autoconfig" }
@@ -32,6 +33,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54", features = ["rt", "sync", "net", "time", "macros"] }
 webbrowser = "1.2.5"
+
+# Windows only: gives the process Avero's AppUserModelID (notifications,
+# taskbar). Already in the dependency tree (through iced and others) with
+# the `Win32_UI_Shell` feature, so nothing new is compiled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+
+# Windows only: puts the icon and the version details (name, description,
+# version from Cargo) inside avero.exe. Without its default `toml` feature
+# it has no dependency at all; no declared MSRV, plain std Rust.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
 
 [features]
 # `cargo build --features gpu` adds the GPU renderer (wgpu). iced then
