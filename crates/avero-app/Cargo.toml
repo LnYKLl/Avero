@@ -7,7 +7,9 @@ license = "GPL-3.0-or-later"
 [dependencies]
 avero-core = { path = "../avero-core" }
 avero-sync = { path = "../avero-sync" }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 directories = "6"
+iced = "0.14"
 tokio = { version = "1.54", features = ["rt", "sync", "net", "time"] }
 
 [dev-dependencies]
