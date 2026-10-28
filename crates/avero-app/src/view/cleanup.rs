@@ -113,16 +113,26 @@ fn sender_row<'a>(app: &'a App, sender: &'a SenderStats) -> Element<'a, Message>
     .width(Fill);
 
     let addr = sender.addr.clone();
-    let action = |icon, label: &'static str, tone, message: Option<CleanupMsg>| {
-        tip(
-            button(icons::icon(icon, 17.0, tone))
-                .padding(8)
+    // An icon and its name (the tooltip says more).
+    let action =
+        |icon, name: &'static str, label: &'static str, tone, message: Option<CleanupMsg>| {
+            let mut name = text(name).size(12).font(MEDIUM);
+            if matches!(tone, Tone::Danger) {
+                name = name.style(theme::danger_text);
+            }
+            tip(
+                button(
+                    row![icons::icon(icon, 16.0, tone), name]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                )
+                .padding([6, 8])
                 .on_press_maybe(message.map(Message::Cleanup))
                 .style(theme::ghost),
-            label,
-            tooltip::Position::Bottom,
-        )
-    };
+                label,
+                tooltip::Position::Bottom,
+            )
+        };
     let requested = app.cleanup.requested.contains(&sender.addr);
     let unsubscribe: Element<'_, Message> = if requested {
         container(text("Désinscription demandée").size(11).font(MEDIUM))
@@ -132,6 +142,7 @@ fn sender_row<'a>(app: &'a App, sender: &'a SenderStats) -> Element<'a, Message>
     } else {
         action(
             Icon::MailX,
+            "Se désinscrire",
             if sender.can_unsubscribe {
                 "Se désinscrire"
             } else {
@@ -151,6 +162,7 @@ fn sender_row<'a>(app: &'a App, sender: &'a SenderStats) -> Element<'a, Message>
     } else {
         action(
             Icon::EyeOff,
+            "Bloquer",
             "Bloquer : ses prochains mails iront à la corbeille",
             Tone::Text,
             Some(CleanupMsg::Block(addr.clone())),
@@ -163,12 +175,13 @@ fn sender_row<'a>(app: &'a App, sender: &'a SenderStats) -> Element<'a, Message>
         block,
         action(
             Icon::Trash,
+            "Tout supprimer",
             "Tout mettre à la corbeille",
             Tone::Danger,
             Some(CleanupMsg::TrashAll(addr)),
         ),
     ]
-    .spacing(12)
+    .spacing(8)
     .padding([12, 18])
     .align_y(Alignment::Center)
     .into()
