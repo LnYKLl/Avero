@@ -1,39 +1,82 @@
 # Avero
 
-Avero is a lightweight, open source desktop email client written in Rust. It aims to be fast and frugal with memory, with a native UI (no Electron, no webview), and to handle several IMAP accounts in one unified inbox.
+Avero is a lightweight, open source desktop email client written in Rust. It is fast and frugal with memory, has a native UI (no Electron, no webview, no remote content) and shows several IMAP accounts in one unified inbox.
 
-**Status: pre-alpha.** Nothing is usable yet.
+**Status: V1 (early).** It works day to day for reading, searching, answering and sorting mail, but it is young: see "Known limitations".
 
-Supported platforms: Windows, macOS and Linux.
+Supported platforms: Windows, macOS and Linux. The interface is in French.
+
+![Unified inbox and reading pane](docs/screenshots/inbox.png)
+
+![Dark mode](docs/screenshots/inbox-dark.png)
+
+## Features
+
+- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Gmail and Microsoft accounts can sign in with "Continuer avec Google / Microsoft" in the browser (OAuth2, PKCE). Other providers use a password or an app password. The IMAP login is tested before the account is saved.
+- **Unified inbox** for all accounts, with a filter per account and the usual folders (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille). Messages received by several of your accounts appear once.
+- **Reading**: plain text (HTML is converted to text locally, nothing is downloaded from the web), attachments saved with the system "Save as" dialog, messages marked as read automatically.
+- **Acting**: reply, reply all, forward (with the original attachments), write a new message with attachments (25 MB max), archive, delete (to the trash), mark as unread.
+- **Search** over subjects, senders and downloaded message bodies (SQLite FTS5, works offline).
+- **Staying up to date**: sync at start-up, every 5 minutes and with the refresh button; the list fills in while syncing; the bodies of the 30 newest inbox messages are downloaded in the background so they open instantly.
+- **Account management**: rename, change password, reconnect (OAuth), remove.
+- **Light and dark themes**, following the system or chosen in the settings.
+- Keyboard: `Ctrl+N` new message, `Ctrl+R` reply, `Ctrl+Enter` send, `Ctrl+F` search, `J` / `K` next / previous message, `Suppr` delete, `Échap` close.
+
+Passwords and OAuth refresh tokens are stored only in the operating system's keyring (Windows Credential Manager, macOS Keychain, Secret Service on Linux), never in the database or in logs. IMAP uses implicit TLS only; SMTP uses implicit TLS or mandatory STARTTLS.
 
 ## Build and run
 
-You need the stable Rust toolchain (https://rustup.rs).
+You need the stable Rust toolchain (https://rustup.rs). Then, from this folder:
 
 ```
-cargo run -p avero-app
+cargo run --release -p avero-app
 ```
 
-The default build draws the UI in software (tiny-skia), which keeps memory use low. To use the GPU renderer (wgpu) instead, build with `--features gpu`.
+The first build takes a few minutes. The app draws its UI in software (tiny-skia), which keeps memory low (about 25 MB private memory in demo mode, see `docs/memory.md`). To use the GPU renderer (wgpu) instead, add `--features gpu`.
 
-## Known limitations (pre-alpha)
+### Try it without an account (demo mode)
 
-- Accounts cannot be edited or deleted yet. To remove a broken account, close Avero, delete the `avero.db` file (plus `avero.db-wal` and `avero.db-shm` if present) in the app data folder, and delete the `avero` / `account-N` entries in the OS credential manager (Windows Credential Manager, macOS Keychain, or the Secret Service on Linux). The app data folder is:
-  - Windows: `%APPDATA%\Avero\Avero\data`
-  - macOS: `~/Library/Application Support/org.Avero.Avero`
-  - Linux: `~/.local/share/avero`
-- Flag changes and deletions made in another mail client are not synced yet; only new messages are fetched.
-- Outlook.com / Hotmail consumer accounts need OAuth2, which is not supported yet. Use an IMAP app password (for example with Gmail) or a provider that allows password login.
-- The message list refreshes only when an account's whole sync finishes; there is no periodic refresh yet.
+```
+# PowerShell
+$env:AVERO_DEMO = "1"; cargo run --release -p avero-app
+# bash / zsh
+AVERO_DEMO=1 cargo run --release -p avero-app
+```
+
+Demo mode uses an in-memory database with three made-up accounts and about forty French messages. Nothing touches the network or your real data. `AVERO_DEMO=empty` shows the welcome screen. `AVERO_THEME=dark` (or `light`) forces a theme without saving it.
+
+### Gmail
+
+- **With the Google button**: this needs an OAuth client id compiled in or put in `oauth.json`; see [docs/oauth-setup.md](docs/oauth-setup.md). Without one, the app says so and offers the app-password path instead.
+- **With an app password**: turn on 2-step verification on your Google account, create an app password at https://myaccount.google.com/apppasswords, and paste it in Avero (spaces are removed automatically).
+
+Outlook.com / Hotmail accounts only work with the Microsoft button, which also needs a client id (same document).
+
+## Where files are kept
+
+- Database (`avero.db`): Windows `%APPDATA%\Avero\Avero\data`, macOS `~/Library/Application Support/org.Avero.Avero`, Linux `~/.local/share/avero`.
+- Settings (`settings.json`, optional `oauth.json`): Windows `%APPDATA%\Avero\Avero\config`, macOS `~/Library/Application Support/org.Avero.Avero`, Linux `~/.config/avero`.
+
+Removing an account in the settings deletes its local messages and its keyring entry; nothing is deleted on the server.
+
+## Known limitations
+
+- The V1 interface has mostly been exercised with the demo data and automated tests; testing against real servers is still limited. OAuth (Google, Microsoft) is implemented but needs a registered client id to be tried.
+- Gmail: "Archiver" moves the message to "All Mail", which Avero does not sync (it duplicates every other folder), so archived Gmail messages leave Avero's view.
+- Only the inbox has its read flags and deletions resynchronised from the server; other folders only receive new messages.
+- Messages are shown as plain text; there is no HTML view and inline images are not displayed.
+- No drafts saving, no signatures, no threads (conversation view), no notifications yet.
+- Deleting from the trash is not possible (the button is disabled there).
+- Search covers only bodies already downloaded (the 30 newest inbox messages, plus every message you opened).
 
 ## Tests
 
 ```
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE). The Inter fonts are under the SIL Open Font License and the Lucide icons under the ISC licence (see `crates/avero-app/assets`).

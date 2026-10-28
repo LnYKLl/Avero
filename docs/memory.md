@@ -31,6 +31,23 @@ utilisable.
 | 1 | 9,4 Mo | 24,5 Mo |
 | 2 | 9,4 Mo | 25,3 Mo |
 
+## Mesure du 2026-10-28 (interface V1, mode démo, ~40 messages)
+
+- OS : Windows 11 Pro, build `cargo build --release -p avero-app` (tiny-skia).
+- Lancement avec `AVERO_DEMO=1` : base en mémoire, 3 comptes fictifs, 40 messages dont
+  les corps sont en cache, polices Inter et icônes SVG chargées, aucun réseau.
+- Méthode : 60 s d'inactivité, puis `Process.PrivateMemorySize64` et `Process.WorkingSet64`.
+  Deux exécutions.
+
+| Exécution | Mémoire privée | Working set |
+|---|---|---|
+| 1 | 24,3 Mo | 42,7 Mo |
+| 2 | 23,9 Mo | 42,5 Mo |
+
+La hausse par rapport à la fenêtre vide vient surtout des quatre fichiers Inter, des icônes
+rasterisées et du runtime tokio d'iced. Pas encore mesuré avec de vrais comptes synchronisés
+(chaque compte ajoute un fil avec son propre runtime et sa connexion SQLite).
+
 ## Mesure précédente (même jour, avant le changement)
 
 Avant ce changement, iced était compilé avec wgpu et l'utilisait par défaut :
