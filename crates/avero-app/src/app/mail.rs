@@ -36,6 +36,7 @@ impl App {
             }
             Message::FilterSelected(filter) => {
                 self.filter = filter;
+                self.screen = super::Screen::Mail;
                 self.load_first_page();
                 Task::none()
             }
@@ -241,6 +242,19 @@ impl App {
                 (a.id, count.unwrap_or(0))
             })
             .collect();
+        let space = match self.space {
+            Some(id) => AccountFilter::Space(id),
+            None => AccountFilter::All,
+        };
+        let threads = self.settings.group_threads;
+        self.snoozed_count = self
+            .store
+            .list_count(&Listing::Snoozed, space, threads)
+            .unwrap_or(0);
+        self.drafts_count = self
+            .store
+            .list_count(&Listing::Folder(FolderRole::Drafts), space, threads)
+            .unwrap_or(0);
         self.tab_unread = if self.settings.inbox_tabs {
             Category::ALL
                 .into_iter()

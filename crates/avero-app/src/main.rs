@@ -70,6 +70,13 @@ fn boot() -> (App, Task<Message>) {
     if let Some(choice) = forced {
         settings.theme = choice;
     }
+    // AVERO_COLOR (avero, orange, ocean) picks the colours, for screenshots.
+    let forced_color = std::env::var("AVERO_COLOR")
+        .ok()
+        .and_then(|v| settings::ColorTheme::from_env_value(&v));
+    if let Some(color) = forced_color {
+        settings.color = color;
+    }
 
     match demo {
         Some(kind) => {
@@ -85,6 +92,16 @@ fn boot() -> (App, Task<Message>) {
                 let open = app.update(Message::Add(AddMsg::Open(Some(provider))));
                 return (app, Task::batch([task, open]));
             }
+            // AVERO_DEMO_SCREEN opens another screen, for screenshots.
+            let screen = match std::env::var("AVERO_DEMO_SCREEN").as_deref() {
+                Ok("settings") => Some(Message::ShowSettings),
+                Ok("cleanup") => Some(Message::ShowCleanup),
+                _ => None,
+            };
+            if let Some(screen) = screen {
+                let shown = app.update(screen);
+                return (app, Task::batch([task, shown]));
+            }
             (app, task)
         }
         None => {
@@ -97,8 +114,8 @@ fn boot() -> (App, Task<Message>) {
                 config_dir,
                 workers: HashMap::new(),
             };
-            // An AVERO_THEME override is not saved either.
-            let path = forced.is_none().then_some(settings_path);
+            // An AVERO_THEME or AVERO_COLOR override is not saved either.
+            let path = (forced.is_none() && forced_color.is_none()).then_some(settings_path);
             App::new(store, backend, settings, path)
         }
     }

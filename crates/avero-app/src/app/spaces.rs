@@ -279,6 +279,15 @@ impl App {
         }
     }
 
+    /// Whether the list shows the mail of several accounts (its lines
+    /// then say which account got each one).
+    pub fn scope_has_several_accounts(&self) -> bool {
+        match self.scope() {
+            AccountFilter::Only(_) => false,
+            _ => self.space_accounts().len() > 1,
+        }
+    }
+
     /// Unread conversations (or messages) of the inbox in a space (`None`:
     /// every account), from the per-account counters.
     pub fn space_unread(&self, space: Option<SpaceId>) -> usize {

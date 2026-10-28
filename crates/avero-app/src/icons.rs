@@ -226,7 +226,6 @@ pub enum Tone {
     Muted,
     Accent,
     OnAccent,
-    Rail,
     Danger,
     Fixed(Color),
     /// Keep the colours of the SVG file (logos).
@@ -240,7 +239,6 @@ impl Tone {
             Tone::Muted => Some(t.muted),
             Tone::Accent => Some(t.accent),
             Tone::OnAccent => Some(t.on_accent),
-            Tone::Rail => Some(t.rail_icon),
             Tone::Danger => Some(t.danger),
             Tone::Fixed(color) => Some(color),
             Tone::Original => None,

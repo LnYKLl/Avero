@@ -42,6 +42,18 @@ impl App {
         self.move_cursor(rows);
     }
 
+    /// The checkbox of line `index`: checks or unchecks that line only
+    /// (the line being read does not join it, unlike Ctrl+click).
+    pub(super) fn check_line(&mut self, index: usize) {
+        let Some(item) = self.items.get(index) else {
+            return;
+        };
+        let rows = item.row_ids.clone();
+        self.toggle_rows(rows.clone());
+        self.anchor = Some(rows.clone());
+        self.move_cursor(rows);
+    }
+
     /// `x`: checks or unchecks the keyboard's line.
     pub(super) fn toggle_current(&mut self) {
         let Some(index) = self.selected_index() else {

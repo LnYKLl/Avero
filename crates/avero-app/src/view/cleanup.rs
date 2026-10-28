@@ -157,7 +157,7 @@ fn sender_row<'a>(app: &'a App, sender: &'a SenderStats) -> Element<'a, Message>
         )
     };
     row![
-        avatar(&sender.name, theme::LIGHT.muted, 34.0),
+        avatar(&sender.name, super::avatar_color(&sender.addr), 34.0),
         details,
         unsubscribe,
         block,

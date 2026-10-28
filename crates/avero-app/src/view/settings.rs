@@ -4,7 +4,7 @@
 use super::{dot, hr, tip, to_color};
 use crate::app::{AccountMsg, AddMsg, App, Message, RuleMsg, SpaceMsg, move_name};
 use crate::icons::{self, Icon, Tone};
-use crate::settings::ThemeChoice;
+use crate::settings::{ColorTheme, ThemeChoice};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::rules::Rule;
 use avero_core::{Account, AuthKind, Space};
@@ -599,6 +599,36 @@ fn appearance(app: &App) -> Element<'_, Message> {
         .on_press(Message::ThemeChosen(value))
         .style(theme::choice(selected))
     };
+    let dark = app.tokens().surface == theme::DARK.surface;
+    let colour = |color: ColorTheme| {
+        let selected = app.settings.color == color;
+        let tokens = theme::tokens_for(color, dark);
+        let swatch = container(
+            text("Aa")
+                .size(15)
+                .font(theme::BOLD)
+                .color(iced::Color::WHITE),
+        )
+        .center_x(Fill)
+        .height(44)
+        .center_y(44)
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(theme::frame_background(tokens)),
+            border: iced::border::rounded(theme::CONTROL_RADIUS),
+            ..container::Style::default()
+        });
+        button(
+            column![
+                swatch,
+                container(text(color.label()).size(13).font(MEDIUM)).center_x(Fill),
+            ]
+            .spacing(8),
+        )
+        .width(Fill)
+        .padding(8)
+        .on_press(Message::ColorChosen(color))
+        .style(theme::choice(selected))
+    };
     column![
         text("Thème de l'interface").size(14).font(MEDIUM),
         row![
@@ -607,6 +637,11 @@ fn appearance(app: &App) -> Element<'_, Message> {
             choice(Icon::Moon, "Sombre", ThemeChoice::Dark),
         ]
         .spacing(10),
+        text("Couleurs").size(14).font(MEDIUM),
+        row(ColorTheme::ALL.map(|color| colour(color).into())).spacing(10),
+        text("Le dégradé de la fenêtre et la couleur des boutons, en clair comme en sombre.")
+            .size(12)
+            .style(theme::muted),
     ]
     .spacing(12)
     .padding(18)

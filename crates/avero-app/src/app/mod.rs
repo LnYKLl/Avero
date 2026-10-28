@@ -42,7 +42,7 @@ use crate::account_form::{AccountForm, Field};
 use crate::auth::OAuthGrant;
 use crate::background::{LoginError, OpenedBody};
 use crate::compose::Mode;
-use crate::settings::{Settings, ThemeChoice};
+use crate::settings::{ColorTheme, Settings, ThemeChoice};
 use crate::theme;
 use crate::view;
 use crate::worker::{self, AccountError, Destination, Event, Job, Reply, WorkerHandle};
@@ -343,6 +343,17 @@ pub enum Message {
     /// a provider's console).
     CopyText(String),
     ThemeChosen(ThemeChoice),
+    /// "Avero", "Orange" or "Océan" in the settings.
+    ColorChosen(ColorTheme),
+    /// The window's new width (the side bar folds when it is narrow).
+    WindowResized(f32),
+    /// The mouse entered (`true`) or left line `.0` of the list (its
+    /// checkbox shows).
+    LineHovered(usize, bool),
+    /// The checkbox of line `.0` of the list.
+    LineChecked(usize),
+    /// Opens (`true`) or closes the menu of spaces of the side bar.
+    SpaceMenu(bool),
     NotificationsToggled(bool),
     /// "Regrouper les conversations" in the settings.
     ThreadsToggled(bool),
@@ -563,10 +574,20 @@ pub struct App {
     settings_path: Option<PathBuf>,
     system_dark: bool,
     current_theme: Theme,
+    /// Width of the window, in logical pixels.
+    pub(crate) window_width: f32,
+    /// The line of the list under the mouse.
+    pub(crate) hovered_line: Option<usize>,
+    /// The menu of spaces of the side bar is open.
+    pub(crate) space_menu: bool,
 
     pub(crate) accounts: Vec<Account>,
     pub(crate) status: HashMap<AccountId, AccountStatus>,
     pub(crate) unread: HashMap<AccountId, usize>,
+    /// The counters of the side bar: conversations in "Plus tard" and
+    /// in the drafts folder (of the space shown).
+    pub(crate) snoozed_count: usize,
+    pub(crate) drafts_count: usize,
 
     pub(crate) screen: Screen,
     pub(crate) folder: FolderRole,
@@ -689,13 +710,18 @@ impl App {
         let mut app = App {
             store,
             backend,
-            current_theme: theme::build(settings.theme.is_dark(false)),
+            current_theme: theme::build(settings.color, settings.theme.is_dark(false)),
+            window_width: 1280.0,
+            hovered_line: None,
+            space_menu: false,
             settings,
             settings_path,
             system_dark: false,
             accounts,
             status: HashMap::new(),
             unread: HashMap::new(),
+            snoozed_count: 0,
+            drafts_count: 0,
             screen: Screen::Mail,
             folder: FolderRole::Inbox,
             starred: false,
@@ -799,6 +825,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
             iced::system::theme_changes().map(Message::SystemTheme),
+            iced::window::resize_events().map(|(_, size)| Message::WindowResized(size.width)),
             iced::time::every(AUTO_SYNC).map(|_| Message::AutoSync),
             iced::time::every(later::TICK).map(|_| Message::Later(LaterMsg::Tick)),
             keyboard::listen().filter_map(|event| match event {
@@ -874,6 +901,32 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::ColorChosen(color) => {
+                self.settings.color = color;
+                self.refresh_theme();
+                self.save_settings();
+                Task::none()
+            }
+            Message::WindowResized(width) => {
+                self.window_width = width;
+                Task::none()
+            }
+            Message::LineHovered(index, inside) => {
+                if inside {
+                    self.hovered_line = Some(index);
+                } else if self.hovered_line == Some(index) {
+                    self.hovered_line = None;
+                }
+                Task::none()
+            }
+            Message::LineChecked(index) => {
+                self.check_line(index);
+                Task::none()
+            }
+            Message::SpaceMenu(open) => {
+                self.space_menu = open;
+                Task::none()
+            }
             Message::NotificationsToggled(on) => {
                 self.settings.notifications = on;
                 self.save_settings();
@@ -909,6 +962,9 @@ impl App {
             Message::Space(message) => {
                 if self.overlay.is_some() && matches!(message, SpaceMsg::Number(_)) {
                     return Task::none();
+                }
+                if matches!(message, SpaceMsg::Select(_) | SpaceMsg::Number(_)) {
+                    self.space_menu = false;
                 }
                 self.update_spaces(message)
             }
@@ -970,7 +1026,10 @@ impl App {
     // ------------------------------------------------------------ helpers
 
     fn refresh_theme(&mut self) {
-        self.current_theme = theme::build(self.settings.theme.is_dark(self.system_dark));
+        self.current_theme = theme::build(
+            self.settings.color,
+            self.settings.theme.is_dark(self.system_dark),
+        );
     }
 
     fn save_settings(&self) {
@@ -1180,6 +1239,8 @@ pub fn destination_label(destination: Destination) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod design_tests;
 #[cfg(test)]
 mod filter_tests;
 #[cfg(test)]

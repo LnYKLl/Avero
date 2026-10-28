@@ -1,31 +1,29 @@
-//! The list column: title, search, spaces and account chips, folders,
-//! the tabs of the inbox, account problems, then the messages (or, in
-//! "Programmés", the mail waiting to be sent). Under search results,
-//! "Chercher aussi sur le serveur".
+//! The list column of the card: the title of the place shown and its
+//! unread count, the tabs of the inbox as pills, account problems, then
+//! the lines on three levels (senders, subject, start of the text), or,
+//! in "Programmés", the mail waiting to be sent. Under search results,
+//! "Chercher aussi sur le serveur". Places, spaces and accounts are in
+//! the side bar.
 
-use super::{dot, ellipsize, find_account, format_date, hr, shared_avatar, tip, to_color};
+use super::{dot, ellipsize, find_account, format_date, hr, tip, to_color};
 use crate::app::{
-    AccountMsg, App, LaterMsg, Message, PAGE, SEARCH_ID, ServerSearch, SpaceMsg, scheduled_status,
+    AccountMsg, App, LaterMsg, Message, PAGE, SEARCH_ID, ServerSearch, scheduled_status,
     server_search_result, tab_name,
 };
 use crate::icons::{self, Icon, Tone};
 use crate::later;
-use crate::theme::{self, MEDIUM, SEMIBOLD};
+use crate::theme::{self, BOLD, MEDIUM, SEMIBOLD};
 use crate::worker::ErrorKind;
 use avero_core::{
-    Account, AccountColor, AccountFilter, AuthKind, Category, DraftRecord, FolderRole, Space,
-    UnifiedItem,
+    AccountColor, AccountFilter, AuthKind, Category, DraftRecord, FolderRole, Space, UnifiedItem,
 };
 use chrono::{DateTime, Local};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, checkbox, column, container, row, scrollable, stack, text, text_input,
-    tooltip,
+    Column, Row, Space as Gap, button, checkbox, column, container, mouse_area, row, scrollable,
+    stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Element, Fill, Padding};
-
-/// Width of the list column, in pixels.
-pub const WIDTH: f32 = 380.0;
 
 /// The folders, in the order shown.
 pub const FOLDERS: [(FolderRole, &str, Icon); 6] = [
@@ -45,31 +43,33 @@ pub fn folder_name(role: FolderRole) -> &'static str {
         .map_or("Dossier", |(_, name, _)| name)
 }
 
+/// Width of the list column in this window: 42 % of the card, between
+/// 320 and 460 pixels.
+pub fn width(app: &App) -> f32 {
+    (super::card_width(app) * 0.42).clamp(320.0, 460.0)
+}
+
 pub fn view(app: &App) -> Element<'_, Message> {
-    let mut header = Column::new()
-        .spacing(14)
-        .padding(Padding::new(20.0).bottom(14))
-        .push(title_row(app))
-        .push(search(app));
-    if !app.spaces.is_empty() {
-        header = header.push(space_chips(app));
+    let mut content = column![title_row(app), hr()];
+    // A folded side bar has no room for the search field: it comes here.
+    if super::sidebar::folded(app) {
+        content = content
+            .push(container(search(app)).padding([10, 14]))
+            .push(hr());
     }
-    header = header.push(account_chips(app)).push(folders(app));
     if app.tabs_shown() {
-        header = header.push(tabs(app));
+        content = content.push(tabs(app)).push(hr());
     }
     for banner in banners(app) {
-        header = header.push(banner);
+        content = content.push(container(banner).padding([10, 14]));
     }
-
-    let mut content = column![header, hr()];
-    if !app.items.is_empty() {
+    if !app.checked.is_empty() {
         content = content.push(select_bar(app)).push(hr());
     }
     let content = content.push(messages(app));
     row![
         container(content)
-            .width(WIDTH)
+            .width(width(app))
             .height(Fill)
             .style(theme::list_pane),
         super::vr(),
@@ -77,25 +77,35 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn title_row(app: &App) -> Element<'_, Message> {
-    let title = match (&app.search_query, &app.sender) {
+/// The title of what the list shows.
+fn title(app: &App) -> String {
+    match (&app.search_query, &app.sender) {
         (Some(_), _) => "Recherche".to_string(),
         (None, Some(sender)) => format!("Mails de {}", ellipsize(&sender.name, 24)),
         (None, None) if app.snoozed => "Plus tard".to_string(),
         (None, None) if app.scheduled => "Programmés".to_string(),
         (None, None) if app.starred => "Favoris".to_string(),
         (None, None) => folder_name(app.folder).to_string(),
-    };
-    let scope = match app.scope() {
-        AccountFilter::All => "Tous les comptes".to_string(),
-        AccountFilter::Only(id) => find_account(&app.accounts, id)
-            .map(|a| a.email.clone())
-            .unwrap_or_default(),
-        AccountFilter::Space(_) => app
-            .active_space()
-            .map(|space| format!("Espace {}", space.name))
-            .unwrap_or_default(),
-    };
+    }
+}
+
+/// Unread lines of what is shown: exact for the inbox, the loaded lines
+/// elsewhere.
+fn unread_shown(app: &App) -> usize {
+    if app.in_folder() && app.folder == FolderRole::Inbox {
+        match app.scope() {
+            AccountFilter::Only(id) => app.unread.get(&id).copied().unwrap_or(0),
+            _ => app.space_unread(app.space),
+        }
+    } else if app.scheduled_shown() {
+        0
+    } else {
+        app.items.iter().filter(|item| !item.seen).count()
+    }
+}
+
+/// "Réception", "9 non lus", then refresh and "Tout sélectionner".
+fn title_row(app: &App) -> Element<'_, Message> {
     let syncing = app.is_syncing();
     let refresh_label = if syncing {
         "Synchronisation en cours…"
@@ -105,11 +115,11 @@ fn title_row(app: &App) -> Element<'_, Message> {
     let refresh = tip(
         button(icons::icon_rotated(
             Icon::Refresh,
-            18.0,
+            16.0,
             if syncing { Tone::Accent } else { Tone::Muted },
             if syncing { app.spinner } else { 0.0 },
         ))
-        .padding(8)
+        .padding(7)
         .on_press_maybe((!syncing).then_some(Message::Refresh))
         .style(theme::ghost),
         refresh_label,
@@ -127,26 +137,68 @@ fn title_row(app: &App) -> Element<'_, Message> {
             tooltip::Position::Bottom,
         ));
     }
-    let scope = match &app.sender {
-        Some(sender) if app.search_query.is_none() && sender.addr != sender.name => {
-            format!("{} · {scope}", sender.addr)
-        }
-        _ => scope,
+    let subtitle = match (&app.search_query, &app.sender) {
+        (Some(query), _) => Some(format!("« {} »", ellipsize(query, 30))),
+        (None, Some(sender)) if sender.addr != sender.name => Some(sender.addr.clone()),
+        _ => None,
     };
-    line.push(
-        column![
-            text(title).size(22).font(SEMIBOLD).wrapping(Wrapping::None),
-            text(scope).size(12).style(theme::muted),
-        ]
-        .spacing(2)
-        .width(Fill),
-    )
-    .push(refresh)
-    .into()
+    let mut heading = Column::new().spacing(1).width(Fill).push(
+        container(
+            text(title(app))
+                .size(19)
+                .font(BOLD)
+                .wrapping(Wrapping::None),
+        )
+        .clip(true),
+    );
+    if let Some(subtitle) = subtitle {
+        heading = heading.push(
+            text(subtitle)
+                .size(12)
+                .style(theme::muted)
+                .wrapping(Wrapping::None),
+        );
+    }
+    line = line.push(heading);
+    let unread = unread_shown(app);
+    if unread > 0 {
+        line = line.push(
+            text(if unread > 1 {
+                format!("{unread} non lus")
+            } else {
+                "1 non lu".to_string()
+            })
+            .size(13)
+            .font(SEMIBOLD)
+            .style(theme::muted),
+        );
+    }
+    line = line.push(refresh);
+    if !app.items.is_empty() && !app.scheduled_shown() {
+        line = line.push(tip(
+            button(icons::icon(Icon::Check, 16.0, Tone::Muted))
+                .padding(7)
+                .on_press(Message::SelectAll(true))
+                .style(theme::ghost),
+            "Tout sélectionner",
+            tooltip::Position::Bottom,
+        ));
+    }
+    container(line)
+        .height(60)
+        .padding(Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 20.0,
+        })
+        .center_y(60)
+        .into()
 }
 
+/// The search field, in the list when the side bar is folded.
 fn search(app: &App) -> Element<'_, Message> {
-    let input = text_input("Rechercher dans les messages", &app.search_text)
+    let input = text_input("Rechercher (Ctrl+K)", &app.search_text)
         .id(SEARCH_ID)
         .on_input(Message::SearchChanged)
         .on_submit(Message::SearchSubmitted)
@@ -157,7 +209,7 @@ fn search(app: &App) -> Element<'_, Message> {
             right: 36.0,
         })
         .size(14)
-        .style(theme::search_input);
+        .style(theme::input);
     let icon = container(icons::icon(Icon::Search, 16.0, Tone::Muted))
         .padding(Padding::new(0.0).left(12))
         .height(38)
@@ -186,252 +238,38 @@ pub fn space_color(space: &Space) -> iced::Color {
     to_color(AccountColor::palette(space.color))
 }
 
-/// "Tous" and the spaces, each with its icon and its unread mail (Ctrl+0,
-/// Ctrl+1…).
-fn space_chips(app: &App) -> Element<'_, Message> {
-    let chip =
-        |icon: Element<'static, Message>, label: String, unread: usize, selected: bool, space| {
-            let mut content = Row::new()
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .push(icon)
-                .push(text(label).size(13).font(MEDIUM));
-            if unread > 0 {
-                content = content.push(text(unread.to_string()).size(12).style(theme::muted));
-            }
-            button(content)
-                .padding([5, 10])
-                .on_press(Message::Space(SpaceMsg::Select(space)))
-                .style(theme::chip(selected))
-        };
-    let mut chips = Row::new().spacing(5).push(tip(
-        chip(
-            icons::icon(Icon::Layers, 14.0, Tone::Muted),
-            "Tous".to_string(),
-            app.space_unread(None),
-            app.space.is_none(),
-            None,
-        ),
-        "Tous les comptes (Ctrl+0)",
-        tooltip::Position::Bottom,
-    ));
-    for (index, space) in app.spaces.iter().enumerate() {
-        let icon = icons::icon(
-            icons::space_icon(&space.icon),
-            14.0,
-            Tone::Fixed(space_color(space)),
-        );
-        let chip = chip(
-            icon,
-            space.name.clone(),
-            app.space_unread(Some(space.id)),
-            app.space == Some(space.id),
-            Some(space.id),
-        );
-        chips = if index < 9 {
-            chips.push(tip(
-                chip,
-                format!("Espace {} (Ctrl+{})", space.name, index + 1),
-                tooltip::Position::Bottom,
-            ))
-        } else {
-            chips.push(chip)
-        };
-    }
-    scrollable(chips)
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(0).scroller_width(0),
-        ))
-        .into()
-}
-
-fn account_chips(app: &App) -> Element<'_, Message> {
-    let total = app.space_unread(app.space);
-    let mut chips = Row::new().spacing(5).push(chip(
-        None,
-        "Tous",
-        total,
-        app.filter == AccountFilter::All,
-        AccountFilter::All,
-    ));
-    for account in app.space_accounts() {
-        let only = AccountFilter::Only(account.id);
-        let count = app.unread.get(&account.id).copied().unwrap_or(0);
-        let chip = chip(
-            Some(account),
-            &account.name,
-            count,
-            app.filter == only,
-            only,
-        );
-        chips = chips.push(tip(chip, account.email.clone(), tooltip::Position::Bottom));
-    }
-    scrollable(chips)
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(0).scroller_width(0),
-        ))
-        .into()
-}
-
-fn chip<'a>(
-    account: Option<&Account>,
-    label: &str,
-    unread: usize,
-    selected: bool,
-    filter: AccountFilter,
-) -> Element<'a, Message> {
-    let mut content = Row::new().spacing(6).align_y(Alignment::Center);
-    if let Some(account) = account {
-        content = content.push(dot(to_color(account.color), 8.0));
-    }
-    content = content.push(text(label.to_string()).size(13).font(MEDIUM));
-    if unread > 0 {
-        content = content.push(text(unread.to_string()).size(12).style(theme::muted));
-    }
-    button(content)
-        .padding([5, 10])
-        .on_press(Message::FilterSelected(filter))
-        .style(theme::chip(selected))
-        .into()
-}
-
-fn folders(app: &App) -> Element<'_, Message> {
-    let mut tabs = Row::new().spacing(2).align_y(Alignment::Center);
-    for (role, name, icon) in FOLDERS {
-        // Gmail's archive is "All Mail", which is not synced: no view.
-        if role == FolderRole::Archive && !app.archive_view && app.folder != role {
-            continue;
-        }
-        let selected = app.in_folder() && app.folder == role;
-        let tone = if selected { Tone::Accent } else { Tone::Muted };
-        let mut content = Row::new()
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .push(icons::icon(icon, 16.0, tone));
-        if selected {
-            content = content.push(text(name).size(13).font(MEDIUM));
-            let unread = app.space_unread(app.space);
-            if role == FolderRole::Inbox && unread > 0 {
-                content = content.push(
-                    container(text(unread.to_string()).size(11).font(SEMIBOLD))
-                        .padding([1, 6])
-                        .style(theme::badge),
-                );
-            }
-        }
-        let tab = button(content)
-            .padding(if selected { [6, 9] } else { [6, 7] })
-            .on_press(Message::FolderSelected(role))
-            .style(theme::chip(selected));
-        if selected {
-            tabs = tabs.push(tab);
-        } else {
-            tabs = tabs.push(tip(tab, name, tooltip::Position::Bottom));
-        }
-        // "Favoris" and "Plus tard" right after the inbox, "Programmés"
-        // after the drafts.
-        if role == FolderRole::Inbox {
-            tabs = tabs.push(starred_button(app));
-            tabs = tabs.push(place_button(
-                Icon::AlarmClock,
-                "Plus tard",
-                app.snoozed && app.sender.is_none() && app.search_query.is_none(),
-                Message::Later(LaterMsg::ShowSnoozed),
-            ));
-        }
-        if role == FolderRole::Drafts {
-            tabs = tabs.push(place_button(
-                Icon::CalendarClock,
-                "Programmés",
-                app.scheduled_shown(),
-                Message::Later(LaterMsg::ShowScheduled),
-            ));
-        }
-    }
-    tabs.into()
-}
-
-/// A place of the list that is not a folder ("Plus tard", "Programmés"):
-/// its icon, and its name once selected.
-fn place_button<'a>(
-    icon: Icon,
-    name: &'a str,
-    selected: bool,
-    on_press: Message,
-) -> Element<'a, Message> {
-    let tone = if selected { Tone::Accent } else { Tone::Muted };
-    let mut content = Row::new()
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .push(icons::icon(icon, 16.0, tone));
-    if selected {
-        content = content.push(text(name).size(13).font(MEDIUM));
-    }
-    let tab = button(content)
-        .padding(if selected { [6, 9] } else { [6, 7] })
-        .on_press(on_press)
-        .style(theme::chip(selected));
-    if selected {
-        tab.into()
-    } else {
-        tip(tab, name, tooltip::Position::Bottom)
-    }
-}
-
-/// "Favoris": the starred mail of every folder.
-fn starred_button(app: &App) -> Element<'_, Message> {
-    let selected = app.starred && app.sender.is_none() && app.search_query.is_none();
-    let mut content = Row::new()
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .push(icons::icon(
-            if selected {
-                Icon::StarFilled
-            } else {
-                Icon::Star
-            },
-            16.0,
-            if selected {
-                Tone::Fixed(theme::STAR)
-            } else {
-                Tone::Muted
-            },
-        ));
-    if selected {
-        content = content.push(text("Favoris").size(13).font(MEDIUM));
-    }
-    let tab = button(content)
-        .padding(if selected { [6, 9] } else { [6, 7] })
-        .on_press(Message::StarredSelected)
-        .style(theme::chip(selected));
-    if selected {
-        tab.into()
-    } else {
-        tip(tab, "Favoris", tooltip::Position::Bottom)
-    }
-}
-
-/// The tabs of the inbox, each with its unread lines.
+/// The tabs of the inbox as pills: "Important", "Newsletters · 4"…
 fn tabs(app: &App) -> Element<'_, Message> {
-    let mut row = Row::new().spacing(5).align_y(Alignment::Center);
+    let mut row = Row::new().spacing(6).align_y(Alignment::Center);
     for category in Category::ALL {
         let selected = app.tab == category;
-        let mut content = Row::new()
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .push(text(tab_name(category)).size(13).font(MEDIUM));
         let unread = app.tab_unread.get(&category).copied().unwrap_or(0);
-        if unread > 0 {
-            content = content.push(text(unread.to_string()).size(12).style(theme::muted));
-        }
+        let label = if unread > 0 {
+            format!("{} · {unread}", tab_name(category))
+        } else {
+            tab_name(category).to_string()
+        };
         row = row.push(
-            button(content)
-                .padding([5, 10])
-                .on_press(Message::TabSelected(category))
-                .style(theme::chip(selected)),
+            button(
+                text(label)
+                    .size(13)
+                    .font(if selected { BOLD } else { SEMIBOLD })
+                    .wrapping(Wrapping::None),
+            )
+            .height(30)
+            .padding([6, 12])
+            .on_press(Message::TabSelected(category))
+            .style(theme::chip(selected)),
         );
     }
-    row.into()
+    // A narrow column scrolls the pills sideways rather than wrapping them.
+    container(scrollable(row).direction(scrollable::Direction::Horizontal(
+        scrollable::Scrollbar::new().width(0).scroller_width(0),
+    )))
+    .height(44)
+    .padding([0, 14])
+    .center_y(44)
+    .into()
 }
 
 /// One banner per account in trouble, with the action that fixes it.
@@ -493,9 +331,9 @@ fn select_bar(app: &App) -> Element<'_, Message> {
         checkbox(app.all_checked())
             .label(label)
             .on_toggle(Message::SelectAll)
-            .size(15)
+            .size(14)
             .text_size(12)
-            .spacing(10),
+            .spacing(12),
     )
     .padding([8, 20])
     .into()
@@ -520,7 +358,7 @@ fn messages(app: &App) -> Element<'_, Message> {
     }
     let now = Local::now();
     let selected = app.selected_index();
-    let mut lines = Column::new().spacing(2).padding([8, 8]);
+    let mut lines = Column::new();
     for (index, item) in app.items.iter().enumerate() {
         let checked = app.is_checked(item);
         lines = lines.push(message_row(
@@ -680,6 +518,9 @@ fn first_name(name: &str) -> &str {
     }
 }
 
+/// Room on the left of a line: its unread dot, or its checkbox.
+const LEAD: f32 = 18.0;
+
 fn message_row<'a>(
     app: &'a App,
     index: usize,
@@ -689,28 +530,43 @@ fn message_row<'a>(
     now: DateTime<Local>,
 ) -> Element<'a, Message> {
     let unread = !item.seen;
-    let colors: Vec<_> = item
-        .accounts
-        .iter()
-        .filter_map(|id| find_account(&app.accounts, *id))
-        .map(|a| to_color(a.color))
-        .collect();
+    // Characters that fit on a line of the column (Inter at 14 px).
+    let fits = ((width(app) - 2.0 * 20.0 - LEAD) / 7.4).max(12.0) as usize;
 
-    let sender = text(ellipsize(&sender_line(item), 30))
+    // The checkbox shows under the mouse and while lines are checked.
+    let lead: Element<'a, Message> =
+        if checked || !app.checked.is_empty() || app.hovered_line == Some(index) {
+            checkbox(checked)
+                .on_toggle(move |_| Message::LineChecked(index))
+                .size(14)
+                .into()
+        } else if unread {
+            dot(app.tokens().unread, 7.0)
+        } else {
+            Gap::new().width(7).height(7).into()
+        };
+    let lead = container(lead).width(LEAD).align_y(Alignment::Center);
+
+    let sender = text(ellipsize(&sender_line(item), fits.saturating_sub(14)))
         .size(14)
-        .font(if unread { SEMIBOLD } else { MEDIUM })
+        .font(if unread { BOLD } else { SEMIBOLD })
         .wrapping(Wrapping::None);
-    let mut who = Row::new()
-        .spacing(6)
+    let mut first = Row::new()
+        .spacing(8)
         .align_y(Alignment::Center)
+        .push(lead)
         .push(container(sender).clip(true));
     if item.count > 1 {
-        who = who.push(text(item.count.to_string()).size(12).style(theme::muted));
+        first = first.push(
+            container(text(item.count.to_string()).size(11).font(MEDIUM))
+                .padding([0, 7])
+                .style(theme::count_pill),
+        );
     }
-    let mut meta = Row::new().spacing(6).align_y(Alignment::Center);
+    first = first.push(Gap::new().width(Fill).height(1));
     if item.flagged {
         // A click on the star takes it off.
-        meta = meta.push(tip(
+        first = first.push(tip(
             button(icons::icon(
                 Icon::StarFilled,
                 13.0,
@@ -724,81 +580,75 @@ fn message_row<'a>(
         ));
     }
     if item.has_attachments {
-        meta = meta.push(icons::icon(Icon::Paperclip, 13.0, Tone::Muted));
+        first = first.push(icons::icon(Icon::Paperclip, 13.0, Tone::Muted));
     }
-
-    let date_style = if unread { theme::accent } else { theme::muted };
+    // With several accounts shown, a small dot says which one got it.
+    if app.scope_has_several_accounts() {
+        for id in &item.accounts {
+            if let Some(account) = find_account(&app.accounts, *id) {
+                first = first.push(dot(to_color(account.color), 6.0));
+            }
+        }
+    }
     // In "Plus tard": when it comes back, instead of its date.
     if let Some(until) = item.snoozed_until {
-        meta = meta.push(icons::icon(Icon::AlarmClock, 13.0, Tone::Accent));
-        meta = meta.push(
+        first = first.push(icons::icon(Icon::AlarmClock, 13.0, Tone::Accent));
+        first = first.push(
             text(later::short_local(until, now.timestamp()))
                 .size(12)
                 .font(MEDIUM)
                 .style(theme::accent),
         );
     } else {
-        meta = meta.push(
+        first = first.push(
             text(format_date(item.date, now))
                 .size(12)
                 .font(if unread { SEMIBOLD } else { theme::INTER })
-                .style(date_style),
+                .style(theme::muted),
         );
     }
-    let first = row![container(who).width(Fill).clip(true), meta]
-        .spacing(8)
-        .align_y(Alignment::Center);
 
-    let subject = text(ellipsize(&item.subject, 40))
-        .size(13)
-        .font(if unread { MEDIUM } else { theme::INTER })
-        .wrapping(Wrapping::None);
-    let mut second = Row::new()
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .push(container(subject).width(Fill).clip(true));
-    if unread {
-        second = second.push(super::dot(app.tokens().accent, 8.0));
-    }
-
-    let mut lines = Column::new()
-        .spacing(3)
-        .width(Fill)
-        .push(first)
-        .push(second);
+    let indent = Padding::new(0.0).left(LEAD + 8.0);
+    let mut lines = Column::new().spacing(3).width(Fill).push(first).push(
+        container(
+            text(ellipsize(&item.subject, fits))
+                .size(14)
+                .font(if unread { SEMIBOLD } else { theme::INTER })
+                .wrapping(Wrapping::None),
+        )
+        .padding(indent)
+        .clip(true),
+    );
     if !item.snippet.is_empty() {
         lines = lines.push(
             container(
-                text(ellipsize(&item.snippet, 42))
-                    .size(12)
+                text(ellipsize(&item.snippet, fits))
+                    .size(13)
                     .style(theme::muted)
                     .wrapping(Wrapping::None),
             )
+            .padding(indent)
             .clip(true),
         );
     }
 
-    // A checked line shows a tick instead of the avatar.
-    let picture = if checked {
-        container(icons::icon(
-            Icon::Check,
-            18.0,
-            Tone::Fixed(iced::Color::WHITE),
-        ))
-        .center(36)
-        .style(theme::disc(app.tokens().accent))
-        .into()
-    } else {
-        shared_avatar(&item.from_display, &colors, 36.0)
-    };
-    let content = row![picture, lines].spacing(12).align_y(Alignment::Start);
-
-    button(content)
+    let line = button(lines)
         .width(Fill)
-        .padding([10, 12])
+        .padding(Padding {
+            top: 12.0,
+            right: 20.0,
+            bottom: 13.0,
+            left: 20.0,
+        })
         .on_press(Message::MessageSelected(index))
-        .style(theme::list_row(is_selected))
-        .into()
+        .style(theme::list_row(is_selected));
+    column![
+        mouse_area(line)
+            .on_enter(Message::LineHovered(index, true))
+            .on_exit(Message::LineHovered(index, false)),
+        hr(),
+    ]
+    .into()
 }
 
 /// "Programmés": the mail waiting for its time, the next to leave

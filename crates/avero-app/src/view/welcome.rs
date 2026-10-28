@@ -4,7 +4,7 @@ use crate::app::{AddMsg, App, Message};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, BOLD, MEDIUM};
 use avero_oauth::Provider;
-use iced::widget::{button, center, column, container, row, space, text};
+use iced::widget::{button, column, container, row, space, text};
 use iced::{Alignment, Element, Fill};
 
 /// Width of the sign-in buttons.
@@ -64,7 +64,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
             .style(theme::note),
         );
     }
-    center(content).style(theme::paper).into()
+    // Drawn in the window's card (see `view::app`).
+    container(content).padding([40, 56]).into()
 }
 
 fn divider<'a>() -> Element<'a, Message> {

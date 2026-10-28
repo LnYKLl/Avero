@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 pub const G_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Every shortcut, as the help (`?`) lists them: keys, then what they do.
-pub const SHORTCUTS: [(&str, &str); 20] = [
+pub const SHORTCUTS: [(&str, &str); 21] = [
     ("J  ou  ↓", "Ligne suivante"),
     ("K  ou  ↑", "Ligne précédente"),
     ("Entrée", "Ouvrir"),
@@ -34,7 +34,7 @@ pub const SHORTCUTS: [(&str, &str); 20] = [
     ("H", "Plus tard (rappel), ou l'annuler dans « Plus tard »"),
     ("X", "Sélectionner la ligne"),
     ("Ctrl+clic, Maj+clic", "Sélectionner plusieurs lignes"),
-    ("/  ou  Ctrl+F", "Rechercher"),
+    ("Ctrl+K,  /  ou  Ctrl+F", "Rechercher"),
     (
         "Ctrl+1 … Ctrl+9, Ctrl+0",
         "Changer d'espace, ou tous les comptes",
@@ -43,6 +43,7 @@ pub const SHORTCUTS: [(&str, &str); 20] = [
         "G puis I, S, D, A, T",
         "Réception, Envoyés, Brouillons, Archives, Corbeille",
     ),
+    ("Ctrl+,", "Réglages"),
     ("?", "Cette aide"),
     ("Échap", "Fermer, vider la sélection, revenir"),
 ];
@@ -79,7 +80,11 @@ impl App {
             keyboard::Key::Character("r") if ctrl && self.composer.is_none() => {
                 self.update_mail(Message::Answer(Mode::Reply))
             }
-            keyboard::Key::Character("f") if ctrl => self.focus_search(),
+            keyboard::Key::Character("f" | "k") if ctrl => self.focus_search(),
+            keyboard::Key::Character(",") if ctrl => {
+                self.screen = Screen::Settings;
+                Task::none()
+            }
             _ if self.composer.is_some() || ctrl || modifiers.logo() => Task::none(),
             key if after_g => match go_to(key) {
                 Some(folder) => self.update_mail(Message::FolderSelected(folder)),

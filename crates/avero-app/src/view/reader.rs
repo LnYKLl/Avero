@@ -1,7 +1,9 @@
-//! The reading pane: actions, the sorting bar (tab, unsubscribe),
-//! headers, attachments and the text. A conversation shows its messages
-//! one under the other, oldest first; the folded ones take one line each.
-//! Under it, the quick reply ("Répondre à tous…").
+//! The reading pane: actions ("Répondre", "Transférer", "Plus tard" as
+//! text, the others as icons), the sorting bar (tab, unsubscribe), then
+//! the subject and the messages in rounded cards: headers, attachments
+//! and text. A conversation shows its messages one under the other,
+//! oldest first; the folded ones take one line each. Under it, the quick
+//! reply ("Répondre à tous…") in a card.
 
 use super::{
     avatar, find_account, format_full_date, hr, icon_button, icon_label_button, tip, to_color,
@@ -11,7 +13,7 @@ use crate::app::{
 };
 use crate::compose::{Mode, human_size};
 use crate::icons::{self, Icon, Tone};
-use crate::theme::{self, MEDIUM, SEMIBOLD};
+use crate::theme::{self, BOLD, MEDIUM, SEMIBOLD};
 use avero_core::{Category, UnifiedItem};
 use avero_sync::parse::{Address, ParsedBody};
 use chrono::Local;
@@ -23,7 +25,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Fill, Padding, keyboard};
 
 /// Comfortable reading width.
-const MAX_WIDTH: f32 = 720.0;
+const MAX_WIDTH: f32 = 760.0;
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = match (app.selected_item(), &app.reading) {
@@ -195,23 +197,37 @@ fn body_text<'a>(entry: &'a Entry, index: usize, fill: bool) -> Element<'a, Mess
     }
 }
 
-/// A single message, as before conversations: its text fills the pane.
+/// A single message, as before conversations: one card whose text fills
+/// the pane.
 fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Element<'a, Message> {
     let index = reading.focus;
     let entry = reading.focused();
     let parsed = parsed_of(entry);
 
-    let mut page = Column::new()
-        .spacing(18)
-        .max_width(MAX_WIDTH)
-        .push(text(item.subject.clone()).size(22).font(SEMIBOLD))
-        .push(headers(app, &entry.item, parsed, 40.0));
+    let mut card = Column::new()
+        .spacing(14)
+        .push(headers(app, &entry.item, parsed));
     if let Some(parsed) = parsed
         && !parsed.attachments.is_empty()
     {
-        page = page.push(attachments(index, parsed));
+        card = card.push(indented(attachments(index, parsed)));
     }
-    page = page.push(hr()).push(body_text(entry, index, true));
+    card = card.push(indented(body_text(entry, index, true)));
+    let page = column![
+        title(item, None),
+        container(card)
+            .width(Fill)
+            .height(Fill)
+            .padding(Padding {
+                top: 16.0,
+                right: 18.0,
+                bottom: 18.0,
+                left: 18.0,
+            })
+            .style(theme::panel),
+    ]
+    .spacing(12)
+    .max_width(MAX_WIDTH);
 
     let mut pane = column![action_bar(app, item, reading), hr()];
     if let Some(bar) = sorting_bar(app, reading) {
@@ -220,10 +236,10 @@ fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Ele
     pane.push(
         container(page)
             .padding(Padding {
-                top: 24.0,
-                bottom: 8.0,
-                left: 32.0,
-                right: 32.0,
+                top: 22.0,
+                bottom: 0.0,
+                left: 24.0,
+                right: 24.0,
             })
             .height(Fill)
             .center_x(Fill),
@@ -232,22 +248,42 @@ fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Ele
     .into()
 }
 
+/// The subject of what is read, with "3 messages" for a conversation.
+fn title<'a>(item: &'a UnifiedItem, count: Option<usize>) -> Element<'a, Message> {
+    // A long subject wraps beside the pill; a short one keeps it close.
+    let subject = text(item.subject.clone())
+        .size(21)
+        .font(BOLD)
+        .wrapping(Wrapping::WordOrGlyph);
+    let subject = if item.subject.chars().count() > 34 {
+        subject.width(Fill)
+    } else {
+        subject
+    };
+    let mut line = Row::new()
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .push(subject);
+    if let Some(count) = count {
+        line = line.push(
+            container(text(format!("{count} messages")).size(12))
+                .padding([2, 10])
+                .style(theme::count_pill),
+        );
+    }
+    container(line).padding(Padding::new(0.0).bottom(4)).into()
+}
+
 /// A conversation: its messages one under the other, in a scrolling page.
 fn conversation<'a>(
     app: &'a App,
     item: &'a UnifiedItem,
     reading: &'a Reading,
 ) -> Element<'a, Message> {
-    let mut page = Column::new().spacing(10).max_width(MAX_WIDTH).push(
-        column![
-            text(item.subject.clone()).size(22).font(SEMIBOLD),
-            text(format!("{} messages", reading.entries.len()))
-                .size(12)
-                .style(theme::muted),
-        ]
-        .spacing(4)
-        .padding(Padding::new(0.0).bottom(8)),
-    );
+    let mut page = Column::new()
+        .spacing(12)
+        .max_width(MAX_WIDTH)
+        .push(title(item, Some(reading.entries.len())));
     for (index, entry) in reading.entries.iter().enumerate() {
         page = page.push(if entry.expanded {
             unfolded(
@@ -269,10 +305,10 @@ fn conversation<'a>(
         scrollable(
             container(page)
                 .padding(Padding {
-                    top: 24.0,
-                    bottom: 24.0,
-                    left: 32.0,
-                    right: 32.0,
+                    top: 22.0,
+                    bottom: 12.0,
+                    left: 24.0,
+                    right: 24.0,
                 })
                 .center_x(Fill),
         )
@@ -283,9 +319,9 @@ fn conversation<'a>(
     .into()
 }
 
-/// Under the conversation: "Répondre à tous…", a field that grows with
-/// its text (Ctrl+Entrée sends), "Envoyer", and the full composer one
-/// click away with the text typed.
+/// Under the conversation, in a card: "Répondre à tous…", a field that
+/// grows with its text (Ctrl+Entrée sends), "Envoyer", and the full
+/// composer one click away with the text typed.
 fn quick_reply<'a>(app: &'a App, reading: &'a Reading) -> Element<'a, Message> {
     let reply = &app.quick_reply;
     let ready = reading
@@ -298,11 +334,11 @@ fn quick_reply<'a>(app: &'a App, reading: &'a Reading) -> Element<'a, Message> {
         .key_binding(quick_reply_binding)
         .size(14)
         .line_height(1.45)
-        .padding([9, 12])
-        .min_height(40)
+        .padding([8, 0])
+        .min_height(36)
         .max_height(180)
         .wrapping(Wrapping::WordOrGlyph)
-        .style(theme::editor);
+        .style(theme::bare_editor);
     // Without `on_action` the field is disabled: nothing changes while
     // the reply leaves.
     if !reply.sending {
@@ -310,41 +346,57 @@ fn quick_reply<'a>(app: &'a App, reading: &'a Reading) -> Element<'a, Message> {
     }
     let can_send = ready && !reply.sending && reply.has_text();
     let send_label = if reply.sending { "Envoi…" } else { "Envoyer" };
-    let send = super::icon_label_button(
-        Icon::Send,
-        send_label,
-        Tone::OnAccent,
-        can_send.then_some(Message::QuickReply(QuickMsg::Send)),
-        theme::primary,
+    let send = tip(
+        button(text(send_label).size(14).font(BOLD))
+            .height(38)
+            .padding([9, 18])
+            .on_press_maybe(can_send.then_some(Message::QuickReply(QuickMsg::Send)))
+            .style(theme::primary),
+        "Envoyer à tous (Ctrl+Entrée), sans citer la conversation",
+        tooltip::Position::Top,
     );
     let expand = icon_button(
         Icon::Compose,
         "Ouvrir dans l'éditeur complet",
         (ready && !reply.sending).then_some(Message::QuickReply(QuickMsg::Expand)),
     );
-    let note: Element<'a, Message> = match &reply.error {
-        Some(error) => row![
-            icons::icon(Icon::Alert, 14.0, Tone::Danger),
-            text(error.clone()).size(12).style(theme::danger_text),
+    let card = container(
+        row![
+            icons::icon(Icon::ReplyAll, 16.0, Tone::Muted),
+            container(field).width(Fill),
+            expand,
+            send,
         ]
-        .spacing(6)
-        .align_y(Alignment::Center)
-        .into(),
-        None => text("Ctrl+Entrée pour envoyer à tous, sans citer la conversation")
-            .size(12)
-            .style(theme::muted)
-            .into(),
-    };
-    let bar = row![container(note).width(Fill), expand, send]
-        .spacing(8)
-        .align_y(Alignment::Center);
-    column![
-        hr(),
-        container(column![field, bar].spacing(8).max_width(MAX_WIDTH))
-            .padding([12, 32])
-            .center_x(Fill),
-    ]
-    .into()
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding {
+        top: 7.0,
+        right: 8.0,
+        bottom: 7.0,
+        left: 16.0,
+    })
+    .style(theme::panel);
+    let mut bottom = Column::new().spacing(6).max_width(MAX_WIDTH).push(card);
+    if let Some(error) = &reply.error {
+        bottom = bottom.push(
+            row![
+                icons::icon(Icon::Alert, 14.0, Tone::Danger),
+                text(error.clone()).size(12).style(theme::danger_text),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    container(bottom)
+        .padding(Padding {
+            top: 12.0,
+            right: 24.0,
+            bottom: 20.0,
+            left: 24.0,
+        })
+        .center_x(Fill)
+        .into()
 }
 
 /// The keys of the quick reply: Ctrl+Entrée sends, the others type
@@ -423,33 +475,49 @@ fn sorting_bar<'a>(app: &'a App, reading: &'a Reading) -> Option<Element<'a, Mes
     Some(container(bar).padding([6, 20]).into())
 }
 
-/// Colour of the first account that holds the message.
-fn entry_color(app: &App, item: &UnifiedItem) -> Color {
-    item.accounts
-        .first()
-        .and_then(|id| find_account(&app.accounts, *id))
-        .map(|a| to_color(a.color))
-        .unwrap_or(app.tokens().accent)
+/// Who wrote a message: its sender's name ("Moi" for the user), the
+/// address, and the avatar's colour (stable per sender; the brand colour
+/// for the user).
+fn author(app: &App, item: &UnifiedItem, parsed: Option<&ParsedBody>) -> (String, String, Color) {
+    let (name, address) = match parsed.and_then(|p| p.from.as_ref()) {
+        Some(Address {
+            name: Some(name),
+            addr,
+        }) => (name.clone(), addr.clone()),
+        Some(Address { addr, .. }) => (addr.clone(), addr.clone()),
+        None => (item.from_display.clone(), item.from_addr.clone()),
+    };
+    let own = app
+        .accounts
+        .iter()
+        .any(|a| a.email.eq_ignore_ascii_case(address.trim()));
+    if own {
+        return (name, address, app.tokens().brand);
+    }
+    let color = super::avatar_color(if address.is_empty() { &name } else { &address });
+    (name, address, color)
 }
 
-/// A folded message: sender, start of the text and date on one line.
+/// A folded message: avatar, sender, start of the text and time on one
+/// line, in a bordered card.
 fn folded<'a>(app: &'a App, index: usize, entry: &'a Entry) -> Element<'a, Message> {
     let item = &entry.item;
     let unread = !item.seen;
+    let (name, _, color) = author(app, item, parsed_of(entry));
     let preview = if item.snippet.is_empty() {
         String::new()
     } else {
-        super::ellipsize(&item.snippet, 60)
+        super::ellipsize(&item.snippet, 90)
     };
     let line = row![
-        avatar(&item.from_display, entry_color(app, item), 28.0),
-        text(super::ellipsize(&item.from_display, 24))
-            .size(13)
-            .font(if unread { SEMIBOLD } else { MEDIUM })
+        avatar(&name, color, 30.0),
+        text(super::ellipsize(&name, 28))
+            .size(14)
+            .font(if unread { BOLD } else { SEMIBOLD })
             .wrapping(Wrapping::None),
         container(
             text(preview)
-                .size(12)
+                .size(14)
                 .style(theme::muted)
                 .wrapping(Wrapping::None)
         )
@@ -459,21 +527,29 @@ fn folded<'a>(app: &'a App, index: usize, entry: &'a Entry) -> Element<'a, Messa
             .size(12)
             .style(theme::muted),
     ]
-    .spacing(10)
+    .spacing(12)
     .align_y(Alignment::Center);
     tip(
         button(line)
             .width(Fill)
-            .padding([10, 14])
+            .padding([12, 16])
             .on_press(Message::EntryToggled(index))
-            .style(theme::list_row(false)),
+            .style(theme::folded_card),
         "Afficher ce message",
         tooltip::Position::Top,
     )
 }
 
-/// An unfolded message of a conversation: its headers (a click folds it),
-/// attachments and text. `focused` marks the one Reply answers.
+/// Under the headers, the text and attachments start at the name.
+fn indented<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+    container(content)
+        .padding(Padding::new(0.0).left(AVATAR + 12.0))
+        .into()
+}
+
+/// An unfolded message of a conversation, in a card: its headers (a
+/// click folds it), attachments and text. `focused` marks the one Reply
+/// answers.
 fn unfolded<'a>(
     app: &'a App,
     index: usize,
@@ -481,7 +557,7 @@ fn unfolded<'a>(
     focused: bool,
 ) -> Element<'a, Message> {
     let parsed = parsed_of(entry);
-    let header = button(headers(app, &entry.item, parsed, 32.0))
+    let header = button(headers(app, &entry.item, parsed))
         .width(Fill)
         .padding(0)
         .on_press(Message::EntryToggled(index))
@@ -490,26 +566,79 @@ fn unfolded<'a>(
     if let Some(parsed) = parsed
         && !parsed.attachments.is_empty()
     {
-        card = card.push(attachments(index, parsed));
+        card = card.push(indented(attachments(index, parsed)));
     }
-    card = card.push(body_text(entry, index, false));
+    card = card.push(indented(body_text(entry, index, false)));
     if focused {
-        card = card.push(
+        card = card.push(indented(
             text("Répondre et Transférer partent de ce message.")
                 .size(11)
-                .style(theme::muted),
-        );
+                .style(theme::muted)
+                .into(),
+        ));
     }
     container(card)
         .width(Fill)
-        .padding([16, 18])
+        .padding(Padding {
+            top: 16.0,
+            right: 18.0,
+            bottom: 18.0,
+            left: 18.0,
+        })
         .style(theme::panel)
         .into()
 }
 
+/// A text button of the action bar ("Répondre", "Transférer", "Plus
+/// tard"): its icon and label in the muted colour.
+fn text_action<'a>(
+    icon: Icon,
+    label: &'a str,
+    hint: String,
+    on_press: Option<Message>,
+    compact: bool,
+) -> Element<'a, Message> {
+    if compact {
+        return icon_button(icon, hint, on_press);
+    }
+    let tone = if on_press.is_some() {
+        Tone::Muted
+    } else {
+        Tone::Fixed(theme::alpha(theme::LIGHT.muted, 0.5))
+    };
+    tip(
+        button(
+            row![
+                icons::icon(icon, 16.0, tone),
+                text(label).size(14).font(MEDIUM).style(theme::muted),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        )
+        .height(36)
+        .padding([8, 12])
+        .on_press_maybe(on_press)
+        .style(theme::ghost),
+        hint,
+        tooltip::Position::Bottom,
+    )
+}
+
+/// Below these widths of the pane, the action bar shows "Plus tard",
+/// then all its actions, as icons only.
+const LABELS_BELOW: f32 = 700.0;
+const ICONS_BELOW: f32 = 560.0;
+
+/// The width of the reading pane in this window.
+fn pane_width(app: &App) -> f32 {
+    super::card_width(app) - super::list::width(app)
+}
+
+/// "Répondre", "Transférer", "Plus tard" as text, then the other actions
+/// as icons.
 fn action_bar<'a>(
     app: &'a App,
-    item: &'a UnifiedItem,
+    _item: &'a UnifiedItem,
     reading: &'a Reading,
 ) -> Element<'a, Message> {
     let ready = matches!(reading.body(), Body::Ready { .. });
@@ -530,75 +659,65 @@ fn action_bar<'a>(
         None => format!("Supprimer{whole} (Suppr)"),
         Some(why) => format!("Supprimer ({})", why.to_lowercase()),
     };
-    let mut accounts = Row::new().spacing(6).align_y(Alignment::Center);
-    for id in &item.accounts {
-        if let Some(account) = find_account(&app.accounts, *id) {
-            accounts = accounts.push(tip(
-                container(
-                    row![
-                        super::dot(to_color(account.color), 8.0),
-                        text(account.name.clone()).size(12).font(MEDIUM),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .padding([4, 10])
-                .style(theme::note),
-                format!("Reçu sur {}", account.email),
-                tooltip::Position::Bottom,
-            ));
-        }
-    }
-    row![
-        icon_button(
+    // A narrower pane keeps only the icons: of "Plus tard" first, then
+    // of all three.
+    let width = pane_width(app);
+    let compact = width < ICONS_BELOW;
+    let later = later_action(app, |icon, label, message| {
+        let compact = width < LABELS_BELOW;
+        text_action(icon, label, format!("{label} (H)"), Some(message), compact)
+    });
+    let bar = row![
+        text_action(
             Icon::Reply,
-            "Répondre (R)",
-            when_ready(Message::Answer(Mode::Reply))
+            "Répondre",
+            "Répondre (R)".to_string(),
+            when_ready(Message::Answer(Mode::Reply)),
+            compact
         ),
+        text_action(
+            Icon::Forward,
+            "Transférer",
+            "Transférer (F)".to_string(),
+            when_ready(Message::Answer(Mode::Forward)),
+            compact
+        ),
+        later,
+        space().width(Fill),
         icon_button(
             Icon::ReplyAll,
             "Répondre à tous (A)",
             when_ready(Message::Answer(Mode::ReplyAll))
         ),
-        icon_button(
-            Icon::Forward,
-            "Transférer (F)",
-            when_ready(Message::Answer(Mode::Forward))
-        ),
-        separator(),
+        star_button(app),
         icon_button(
             Icon::Archive,
             archive_label,
             app.can_archive().then_some(Message::Archive)
-        ),
-        icon_button(
-            Icon::Trash,
-            delete_label,
-            app.can_delete().then_some(Message::Delete)
-        ),
-        icon_button(
-            Icon::Mail,
-            "Marquer comme non lu (U)",
-            Some(Message::MarkUnread)
         ),
         spam_action(app, |icon, label, message| icon_button(
             icon,
             format!("{label} (!)"),
             Some(message)
         )),
-        star_button(app),
-        later_action(app, |icon, label, message| icon_button(
-            icon,
-            format!("{label} (H)"),
-            Some(message)
-        )),
-        space().width(Fill),
-        accounts,
+        icon_button(
+            Icon::Mail,
+            "Marquer comme non lu (U)",
+            Some(Message::MarkUnread)
+        ),
+        icon_button(
+            Icon::Trash,
+            delete_label,
+            app.can_delete().then_some(Message::Delete)
+        ),
     ]
-    .spacing(2)
-    .padding([10, 20])
-    .align_y(Alignment::Center)
-    .into()
+    .spacing(4)
+    .align_y(Alignment::Center);
+    container(bar)
+        .height(60)
+        .padding([0, 16])
+        .center_y(60)
+        .into()
 }
 
 /// "Spam", or "Pas spam" when the selection is in a spam folder, drawn by
@@ -657,30 +776,17 @@ fn star_button(app: &App) -> Element<'_, Message> {
     )
 }
 
-fn separator<'a>() -> Element<'a, Message> {
-    container(super::vr()).height(20).padding([0, 6]).into()
-}
+/// Size of the avatar of an unfolded message.
+const AVATAR: f32 = 40.0;
 
-/// Sender (avatar, name, address), recipients and date of a message.
+/// Avatar, sender (a click shows all their mail), "à …" and time of a
+/// message.
 fn headers<'a>(
     app: &'a App,
     item: &'a UnifiedItem,
     parsed: Option<&'a ParsedBody>,
-    avatar_size: f32,
 ) -> Element<'a, Message> {
-    let (name, address) = match parsed.and_then(|p| p.from.as_ref()) {
-        Some(Address {
-            name: Some(name),
-            addr,
-        }) => (name.clone(), addr.clone()),
-        Some(Address { addr, .. }) => (addr.clone(), String::new()),
-        None => (item.from_display.clone(), item.from_addr.clone()),
-    };
-    let address = if address == name {
-        String::new()
-    } else {
-        address
-    };
+    let (name, address, color) = author(app, item, parsed);
     let mut recipients = Vec::new();
     if let Some(parsed) = parsed {
         if !parsed.to.is_empty() {
@@ -690,29 +796,27 @@ fn headers<'a>(
             recipients.push(format!("cc {}", names(&parsed.cc)));
         }
     }
-    // A click on the sender shows all their mail.
-    let sender_addr = if address.is_empty() {
-        item.from_addr.clone()
+    let shown_address = if address == name {
+        String::new()
     } else {
         address.clone()
     };
     let sender = tip(
         button(
             row![
-                text(name.clone()).size(14).font(SEMIBOLD),
-                text(address).size(12).style(theme::muted),
+                text(name.clone()).size(14).font(BOLD),
+                text(shown_address).size(12).style(theme::muted),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         )
         .padding(0)
-        .on_press(Message::ShowSender(sender_addr, name.clone()))
+        .on_press(Message::ShowSender(address, name.clone()))
         .style(theme::link_plain),
         format!("Tous les mails de {name}"),
         tooltip::Position::Bottom,
     );
-    let mut who = Column::new().spacing(3).width(Fill).push(sender);
-
+    let mut who = Column::new().spacing(2).width(Fill).push(sender);
     if !recipients.is_empty() {
         who = who.push(text(recipients.join(" · ")).size(12).style(theme::muted));
     }
@@ -721,9 +825,15 @@ fn headers<'a>(
         .filter(|&d| d > 0)
         .unwrap_or(item.date);
     row![
-        avatar(&name, entry_color(app, item), avatar_size),
+        avatar(&name, color, AVATAR),
         who,
-        text(format_full_date(date)).size(12).style(theme::muted),
+        tip(
+            text(super::format_when(date, Local::now()))
+                .size(12)
+                .style(theme::muted),
+            format_full_date(date),
+            tooltip::Position::Bottom,
+        ),
     ]
     .spacing(12)
     .align_y(Alignment::Center)
