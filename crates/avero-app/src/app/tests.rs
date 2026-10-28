@@ -915,6 +915,41 @@ fn reconnection_with_another_account_is_refused() {
 }
 
 #[test]
+fn signing_in_to_an_existing_address_moves_it_to_oauth() {
+    use crate::account_form::Stage;
+    let mut app = app_with(|s| {
+        add_account_with_mail(s, "Jean@gmail.com", 1);
+    });
+    let id = app.accounts[0].id;
+    let _ = app.update(Message::Add(AddMsg::Open(None)));
+    let generation = match &mut app.overlay {
+        Some(Overlay::AddAccount(form)) => {
+            form.stage = Stage::Authorizing(Provider::Google);
+            form.generation
+        }
+        other => panic!("no form: {other:?}"),
+    };
+    let grant = crate::auth::OAuthGrant {
+        provider: Provider::Google,
+        email: Some("jean@gmail.com".into()),
+        refresh_token: Some("1//rt".into()),
+        access: crate::auth::AccessToken {
+            token: "ya29".into(),
+            expires_at: 0,
+        },
+    };
+    let _ = app.update(Message::Add(AddMsg::SignedIn(generation, Ok(grant))));
+    assert!(app.overlay.is_none(), "the dialog closes");
+    let accounts = app.store.accounts().unwrap();
+    assert_eq!(accounts.len(), 1, "no duplicate");
+    assert_eq!(accounts[0].id, id);
+    assert_eq!(accounts[0].auth, avero_core::AuthKind::OAuthGoogle);
+    assert_eq!(accounts[0].imap.host, "imap.gmail.com");
+    assert_eq!(app.accounts[0].auth, avero_core::AuthKind::OAuthGoogle);
+    assert!(!app.toast.as_ref().unwrap().error);
+}
+
+#[test]
 fn debug_output_never_contains_secrets() {
     let secret = "Tr3s-Secret-Pw";
     let dialog = PasswordDialog {

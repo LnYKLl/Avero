@@ -436,13 +436,70 @@ impl App {
                 return Task::none();
             }
         };
+        // Out of "Authorizing", so that a refusal below is shown.
+        form.stage = Stage::Credentials;
         let email = grant
             .email
             .clone()
             .or_else(|| form.valid_email())
             .unwrap_or_default();
         let account = account_form::oauth_account(provider, &email);
+        let existing: Vec<AccountId> = self
+            .accounts
+            .iter()
+            .filter(|a| a.email.eq_ignore_ascii_case(&email))
+            .map(|a| a.id)
+            .collect();
+        if !existing.is_empty() {
+            return self.switch_to_oauth(&existing, account, grant);
+        }
         self.finish_account(account, NewSecret::OAuth(grant))
+    }
+
+    /// Signing in to an address already in Avero (typically a password
+    /// account whose password is refused) moves that account to OAuth
+    /// instead of refusing a duplicate.
+    fn switch_to_oauth(
+        &mut self,
+        ids: &[AccountId],
+        new: NewAccount,
+        grant: OAuthGrant,
+    ) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for &id in ids {
+            let Some(mut account) = self.account(id).cloned() else {
+                continue;
+            };
+            if let Err(e) =
+                self.store
+                    .update_account(id, &account.name, &new.imap, &new.smtp, new.auth)
+            {
+                if let Some(form) = self.form() {
+                    form.error = Some(format!("Erreur de la base locale : {e}"));
+                }
+                return Task::batch(tasks);
+            }
+            account.imap = new.imap.clone();
+            account.smtp = new.smtp.clone();
+            account.auth = new.auth;
+            self.send_job(id, Job::UpdateAccount(account.clone()));
+            if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
+                *slot = account;
+            }
+            self.status.insert(id, AccountStatus::default());
+            let (refresh_token, access) = (grant.refresh_token.clone(), grant.access.clone());
+            let store = self.request(id, |reply| Job::SetOAuth {
+                refresh_token,
+                access,
+                reply,
+            });
+            tasks.push(store.chain(self.sync_account(id)));
+        }
+        self.overlay = None;
+        self.screen = super::Screen::Mail;
+        self.reload();
+        tasks.push(self.toast(format!("Compte connecté : {}", new.email), false));
+        Task::batch(tasks)
     }
 
     /// Saves a checked account, hands its secret to the new worker and
