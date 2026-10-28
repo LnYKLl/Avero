@@ -12,13 +12,13 @@ Supported platforms: Windows, macOS and Linux. The interface is in French.
 
 ## Features
 
-- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Gmail and Microsoft accounts can sign in with "Continuer avec Google / Microsoft" in the browser (OAuth2, PKCE). Other providers use a password or an app password. The IMAP login is tested before the account is saved.
+- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Gmail and Microsoft accounts can sign in with "Continuer avec Google / Microsoft" in the browser (OAuth2, PKCE). Other providers use a password or an app password. The IMAP and SMTP logins are tested before the account is saved.
 - **Unified inbox** for all accounts, with a filter per account and the usual folders (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille). Messages received by several of your accounts appear once.
 - **Reading**: plain text (HTML is converted to text locally, nothing is downloaded from the web), attachments saved with the system "Save as" dialog, messages marked as read automatically.
-- **Acting**: reply, reply all, forward (with the original attachments), write a new message with attachments (25 MB max), archive, delete (to the trash), mark as unread.
+- **Acting**: reply, reply all, forward (with the original attachments), write a new message with attachments (25 MB max), archive, delete (to the trash; from the trash, deleted for good after a confirmation), mark as unread. An archive or delete only leaves the local copy once the server has confirmed it; if it fails, the message comes back with the reason.
 - **Search** over subjects, senders and downloaded message bodies (SQLite FTS5, works offline).
 - **Staying up to date**: sync at start-up, every 5 minutes and with the refresh button; the list fills in while syncing; the bodies of the 30 newest inbox messages are downloaded in the background so they open instantly.
-- **Account management**: rename, change password, reconnect (OAuth), remove.
+- **Account management**: rename, change password, reconnect (OAuth), edit the IMAP and SMTP servers ("Serveurs"), remove.
 - **Light and dark themes**, following the system or chosen in the settings.
 - Keyboard: `Ctrl+N` new message, `Ctrl+R` reply, `Ctrl+Enter` send, `Ctrl+F` search, `J` / `K` next / previous message, `Suppr` delete, `Échap` close.
 
@@ -62,11 +62,12 @@ Removing an account in the settings deletes its local messages and its keyring e
 ## Known limitations
 
 - The V1 interface has mostly been exercised with the demo data and automated tests; testing against real servers is still limited. OAuth (Google, Microsoft) is implemented but needs a registered client id to be tried.
-- Gmail: "Archiver" moves the message to "All Mail", which Avero does not sync (it duplicates every other folder), so archived Gmail messages leave Avero's view.
+- Gmail: "Archiver" moves the message to "All Mail", which Avero does not sync (it duplicates every other folder), so archived Gmail messages leave Avero's view. The "Archives" tab is hidden when no account has a real archive folder.
+- Only the special folders are synced (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille); your own folders and Gmail labels are not shown yet.
+- The first sync of a folder fetches its 2000 most recent messages; older ones are not downloaded.
 - Only the inbox has its read flags and deletions resynchronised from the server; other folders only receive new messages.
 - Messages are shown as plain text; there is no HTML view and inline images are not displayed.
 - No drafts saving, no signatures, no threads (conversation view), no notifications yet.
-- Deleting from the trash is not possible (the button is disabled there).
 - Search covers only bodies already downloaded (the 30 newest inbox messages, plus every message you opened).
 
 ## Tests
