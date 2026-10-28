@@ -23,6 +23,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn main() -> iced::Result {
+    // Without a console (release builds), a database that cannot be
+    // opened must be explained in a window, not by a silent crash.
+    if demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref()).is_none() {
+        let db_path = paths::database_path();
+        if let Err(e) = Store::open(&db_path) {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Avero")
+                .set_description(database_error_text(&db_path, &e))
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+            std::process::exit(1);
+        }
+    }
     let mut application = iced::application(boot, App::update, App::view)
         .title("Avero")
         .theme(App::theme)
@@ -64,6 +78,7 @@ fn boot() -> (App, Task<Message>) {
         }
         None => {
             let db_path = paths::database_path();
+            // Checked in `main` before the window opened.
             let store = Store::open(&db_path).expect("open database");
             let backend = Backend::Live {
                 db_path,
@@ -76,6 +91,16 @@ fn boot() -> (App, Task<Message>) {
             App::new(store, backend, settings, path)
         }
     }
+}
+
+/// What the user reads when the database cannot be opened.
+fn database_error_text(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "Avero n'a pas pu ouvrir sa base de données :\n{}\n\n{error}\n\n\
+         Vérifiez que le dossier existe et n'est pas en lecture seule, et qu'Avero \
+         n'est pas déjà ouvert.",
+        path.display()
+    )
 }
 
 /// The window icon: `avero-icon.svg` rasterised at startup.
@@ -110,6 +135,15 @@ fn unpremultiply(mut data: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_error_names_the_file_and_the_cause() {
+        let path = std::path::Path::new("C:/Users/x/AppData/Avero/avero.db");
+        let text = database_error_text(path, &"disk I/O error");
+        assert!(text.contains("avero.db"), "{text}");
+        assert!(text.contains("disk I/O error"), "{text}");
+        assert!(text.starts_with("Avero n'a pas pu ouvrir"));
+    }
 
     #[test]
     fn window_icon_is_rendered() {
