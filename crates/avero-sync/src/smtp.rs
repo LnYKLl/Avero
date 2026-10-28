@@ -109,6 +109,15 @@ fn transport(
         Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host),
     }
     .map_err(|e| SendError::Connect(e.to_string()))?;
+    // Local end-to-end tests only: see `test_ca`.
+    #[cfg(feature = "test-ca")]
+    let builder = match crate::test_ca::smtp_parameters(&cfg.host) {
+        Some(parameters) => builder.tls(match cfg.security {
+            Security::Tls => lettre::transport::smtp::client::Tls::Wrapper(parameters),
+            Security::StartTls => lettre::transport::smtp::client::Tls::Required(parameters),
+        }),
+        None => builder,
+    };
 
     let (credentials, mechanisms) = match creds {
         Credentials::Password(password) => (

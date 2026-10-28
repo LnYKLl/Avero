@@ -6,3 +6,5 @@ pub mod parse;
 pub mod smtp;
 pub mod source;
 pub mod sync;
+#[cfg(feature = "test-ca")]
+mod test_ca;
