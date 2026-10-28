@@ -264,6 +264,66 @@ pub fn answer(parsed: &ParsedBody, mode: Mode, own: &[String]) -> Fields {
     }
 }
 
+/// The signature as a draft shows it: the `-- ` line, then the text
+/// (empty when the account has none).
+pub fn signature_block(signature: &str) -> String {
+    let text = signature.trim_end();
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("-- \n{text}")
+    }
+}
+
+/// A draft body with the signature: a blank line to write in, the
+/// signature, then what the body already held (the quote of a reply, the
+/// forwarded message).
+pub fn with_signature(body: &str, signature: &str) -> String {
+    let block = signature_block(signature);
+    if block.is_empty() {
+        return body.to_string();
+    }
+    match body.trim_start_matches('\n') {
+        "" => format!("\n\n{block}"),
+        rest => format!("\n\n{block}\n\n{rest}"),
+    }
+}
+
+/// The body once the sending account changed from one with signature
+/// `old` to one with `new`; `base` is the body the draft started from,
+/// without signature. `None` when the signature cannot be swapped: the
+/// user changed it (or wrote around a missing one), so the body stays.
+pub fn swap_signature(body: &str, base: &str, old: &str, new: &str) -> Option<String> {
+    // Nothing touched: the draft is built again.
+    if body == with_signature(base, old) {
+        return Some(with_signature(base, new));
+    }
+    let old_block = signature_block(old);
+    if old_block.is_empty() {
+        return None;
+    }
+    // The old signature as it was inserted, followed by nothing or by
+    // the blank line before the quote.
+    let at = body
+        .match_indices(&old_block)
+        .map(|(at, _)| at)
+        .find(|&at| {
+            let after = &body[at + old_block.len()..];
+            after.is_empty() || after.starts_with("\n\n")
+        })?;
+    let before = &body[..at];
+    let after = &body[at + old_block.len()..];
+    let new_block = signature_block(new);
+    if !new_block.is_empty() {
+        return Some(format!("{before}{new_block}{after}"));
+    }
+    // No signature any more: its blank line goes with it.
+    Some(match after.strip_prefix("\n\n") {
+        Some(rest) => format!("{before}{rest}"),
+        None => before.strip_suffix("\n\n").unwrap_or(before).to_string(),
+    })
+}
+
 /// Addresses joined with ", ", without duplicates or those in `skip`.
 fn join_unique(list: &[&Address], skip: &[&Address]) -> String {
     let mut seen: Vec<String> = skip.iter().map(|a| a.addr.to_lowercase()).collect();
@@ -409,6 +469,60 @@ pub fn build(draft: Draft<'_>) -> Result<Outgoing, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_goes_before_the_quote() {
+        assert_eq!(with_signature("", "Marie\n"), "\n\n-- \nMarie");
+        assert_eq!(
+            with_signature("\n\nPaul a écrit :\n> Salut", "Marie"),
+            "\n\n-- \nMarie\n\nPaul a écrit :\n> Salut"
+        );
+        // No signature: the body stays as it is.
+        assert_eq!(with_signature("\n\n> Salut", "  \n"), "\n\n> Salut");
+    }
+
+    #[test]
+    fn untouched_signature_is_swapped() {
+        let base = "\n\n> Salut";
+        let body = with_signature(base, "Marie");
+        assert_eq!(
+            swap_signature(&body, base, "Marie", "M. Durand\nPro").as_deref(),
+            Some("\n\n-- \nM. Durand\nPro\n\n> Salut")
+        );
+        // From an account without signature to one with.
+        assert_eq!(
+            swap_signature(base, base, "", "Marie").as_deref(),
+            Some(body.as_str())
+        );
+    }
+
+    #[test]
+    fn signature_is_swapped_under_text_typed_above() {
+        let typed = "Bonjour,\n\n-- \nMarie\n\n> Salut";
+        assert_eq!(
+            swap_signature(typed, "\n\n> Salut", "Marie", "Paul").as_deref(),
+            Some("Bonjour,\n\n-- \nPaul\n\n> Salut")
+        );
+        // The new account has none: the signature and its blank line go.
+        assert_eq!(
+            swap_signature(typed, "\n\n> Salut", "Marie", "").as_deref(),
+            Some("Bonjour,\n\n> Salut")
+        );
+        assert_eq!(
+            swap_signature("Bonjour,\n\n-- \nMarie", "", "Marie", "").as_deref(),
+            Some("Bonjour,")
+        );
+    }
+
+    #[test]
+    fn edited_signature_is_kept() {
+        let edited = "\n\n-- \nMarie\nà bientôt\n\n> Salut";
+        assert_eq!(swap_signature(edited, "\n\n> Salut", "Marie", "Paul"), None);
+        let gone = "Bonjour\n\n> Salut";
+        assert_eq!(swap_signature(gone, "\n\n> Salut", "Marie", "Paul"), None);
+        // Text written in a draft that had no signature stays as it is.
+        assert_eq!(swap_signature("Bonjour", "", "", "Paul"), None);
+    }
 
     fn addr(name: Option<&str>, addr: &str) -> Address {
         Address {

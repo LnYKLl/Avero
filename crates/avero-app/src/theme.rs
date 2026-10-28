@@ -532,6 +532,23 @@ pub fn bare_input(theme: &Theme, _status: text_input::Status) -> text_input::Sty
     }
 }
 
+/// A multi-line field with a border, like [`input`] (signature).
+pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let t = tokens(theme);
+    let border_color = match status {
+        text_editor::Status::Focused { .. } => t.accent,
+        text_editor::Status::Hovered => mix(t.border, t.muted, 0.35),
+        _ => t.border,
+    };
+    text_editor::Style {
+        background: t.surface.into(),
+        border: outline(border_color, CONTROL_RADIUS),
+        placeholder: alpha(t.muted, 0.85),
+        value: t.text,
+        selection: alpha(t.accent, 0.3),
+    }
+}
+
 /// A borderless multi-line editor (composer body, message body).
 pub fn bare_editor(theme: &Theme, _status: text_editor::Status) -> text_editor::Style {
     let t = tokens(theme);

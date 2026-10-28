@@ -55,7 +55,11 @@ impl App {
                 self.apply_search();
                 Task::none()
             }
-            Message::MessageSelected(index) => self.open(index),
+            Message::MessageSelected(index) => self.click_line(index),
+            Message::SelectAll(on) => {
+                self.select_all(on);
+                Task::none()
+            }
             Message::LoadMore => {
                 self.items = self.fetch(self.items.len() + PAGE);
                 Task::none()
@@ -77,7 +81,8 @@ impl App {
             Message::Answer(mode) => self.answer(mode),
             Message::Archive => self.move_selected(Destination::Archive),
             Message::Delete => self.move_selected(Destination::Trash),
-            Message::MarkUnread => self.mark_unread(),
+            Message::MarkRead => self.mark_seen(true),
+            Message::MarkUnread => self.mark_seen(false),
             Message::SaveAttachment(entry, index) => self.save_attachment(entry, index),
             Message::AttachmentSaved(result) => match result {
                 Ok(Some(name)) => self.toast(format!("Enregistré : {name}"), false),
@@ -98,6 +103,7 @@ impl App {
     /// with nothing selected.
     pub(super) fn load_first_page(&mut self) {
         self.selected = None;
+        self.clear_checked();
         self.reading = None;
         self.items = self.fetch(PAGE);
         self.refresh_unread();
@@ -109,6 +115,7 @@ impl App {
         let pages = self.items.len().div_ceil(PAGE).max(1);
         self.items = self.fetch(pages * PAGE);
         self.follow_thread();
+        self.prune_checked();
         self.refresh_unread();
     }
 
@@ -221,7 +228,8 @@ impl App {
         self.selected_index().map(|i| &self.items[i])
     }
 
-    /// J/K: moves the selection down (`1`) or up (`-1`).
+    /// J/K: moves the selection down (`1`) or up (`-1`). While lines are
+    /// checked, only the keyboard's line moves (for `x`).
     pub(super) fn step_selection(&mut self, step: isize) -> Task<Message> {
         if self.items.is_empty() {
             return Task::none();
@@ -230,14 +238,25 @@ impl App {
             Some(i) => i.saturating_add_signed(step).min(self.items.len() - 1),
             None => 0,
         };
+        if !self.checked.is_empty() {
+            self.move_cursor(self.items[next].row_ids.clone());
+            return Task::none();
+        }
         self.open(next)
+    }
+
+    /// Entrée: opens the keyboard's line (the first one if none), and
+    /// forgets the checked lines.
+    pub(super) fn open_current(&mut self) -> Task<Message> {
+        self.clear_checked();
+        self.open(self.selected_index().unwrap_or(0))
     }
 
     /// Selects an item: shows its body (cached, or downloaded in the
     /// background) and marks it read, locally first. A conversation shows
     /// all its messages, the newest unfolded; the others are loaded when
     /// unfolded.
-    fn open(&mut self, index: usize) -> Task<Message> {
+    pub(super) fn open(&mut self, index: usize) -> Task<Message> {
         let Some(item) = self.items.get(index).cloned() else {
             return Task::none();
         };
@@ -397,29 +416,34 @@ impl App {
         }))
     }
 
-    fn mark_unread(&mut self) -> Task<Message> {
-        let Some(rows) = self.selected.clone() else {
+    /// Marks the selection read or unread, locally first, then on each
+    /// account's server (one job per account).
+    fn mark_seen(&mut self, seen: bool) -> Task<Message> {
+        let rows = self.action_rows();
+        if rows.is_empty() {
             return Task::none();
-        };
-        let _ = self.store.set_seen(&rows, false);
+        }
+        let _ = self.store.set_seen(&rows, seen);
         self.reload();
-        self.remote_seen(&rows, false)
+        self.remote_seen(&rows, seen)
     }
 
     /// Whether "Archiver" can be used on the selection: some account of
-    /// the message has a known archive folder.
+    /// its messages has a known archive folder.
     pub fn can_archive(&self) -> bool {
-        self.selected_item().is_some() && self.archive_problem().is_none()
+        !self.action_rows().is_empty() && self.archive_problem().is_none()
     }
 
     /// Why "Archiver" cannot be used, for its tooltip.
     pub fn archive_problem(&self) -> Option<&'static str> {
-        let item = self.selected_item()?;
+        let accounts = self.action_accounts();
+        if accounts.is_empty() {
+            return None;
+        }
         if self.folder == FolderRole::Archive && self.search_query.is_none() {
             return Some("Déjà dans les archives");
         }
-        let known: Vec<Option<bool>> = item
-            .accounts
+        let known: Vec<Option<bool>> = accounts
             .iter()
             .map(|id| self.status.get(id).and_then(|s| s.archive))
             .collect();
@@ -434,20 +458,18 @@ impl App {
 
     /// Whether "Supprimer" can be used on the selection.
     pub fn can_delete(&self) -> bool {
-        self.selected_item().is_some() && self.delete_problem().is_none()
+        !self.action_rows().is_empty() && self.delete_problem().is_none()
     }
 
     /// Why "Supprimer" cannot be used, for its tooltip.
     pub fn delete_problem(&self) -> Option<&'static str> {
-        let item = self.selected_item()?;
-        if item
-            .accounts
-            .iter()
-            .any(|id| self.trash_accounts.contains(id))
-        {
+        let accounts = self.action_accounts();
+        if accounts.is_empty() {
+            return None;
+        }
+        if accounts.iter().any(|id| self.trash_accounts.contains(id)) {
             None
-        } else if item
-            .accounts
+        } else if accounts
             .iter()
             .any(|id| self.status.get(id).and_then(|s| s.archive).is_none())
         {
@@ -460,10 +482,7 @@ impl App {
     /// Whether every copy of the selection is already in a trash folder
     /// (deleting it then means deleting it for good).
     pub fn selection_in_trash(&self) -> bool {
-        let Some(rows) = &self.selected else {
-            return false;
-        };
-        let refs = self.refs(rows);
+        let refs = self.refs(&self.action_rows());
         !refs.is_empty() && refs.iter().all(|r| self.is_trash_folder(r))
     }
 
@@ -474,8 +493,8 @@ impl App {
         )
     }
 
-    /// Archive or delete: hides the rows at once and selects the next
-    /// message; the rows are only removed when the server confirms (shown
+    /// Archive or delete (the checked lines, else the one read): hides
+    /// the rows at once and selects the next message; the rows are only removed when the server confirms (shown
     /// again otherwise). Messages already in the trash are deleted for
     /// good, after a confirmation.
     fn move_selected(&mut self, to: Destination) -> Task<Message> {
@@ -483,10 +502,8 @@ impl App {
             Destination::Archive => self.can_archive(),
             Destination::Trash => self.can_delete(),
         };
-        let Some(rows) = self.selected.clone() else {
-            return Task::none();
-        };
-        if !allowed {
+        let rows = self.action_rows();
+        if rows.is_empty() || !allowed {
             return Task::none();
         }
         if to == Destination::Trash && self.selection_in_trash() {
@@ -649,7 +666,13 @@ impl App {
         } else {
             Vec::new()
         };
-        self.composer = Some(super::Composer::from_fields(from, fields, attachments));
+        let signature = self.signature_of(from);
+        self.composer = Some(super::Composer::from_fields(
+            from,
+            fields,
+            attachments,
+            &signature,
+        ));
         self.screen = super::Screen::Mail;
         let target = if mode == Mode::Forward {
             super::composer::TO_ID

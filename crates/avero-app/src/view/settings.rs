@@ -142,6 +142,12 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
             Tone::Text
         ),
         action(
+            Icon::FileText,
+            "Signature",
+            AccountMsg::EditSignature(id),
+            Tone::Text
+        ),
+        action(
             Icon::Globe,
             "Serveurs (réception et envoi)",
             AccountMsg::OpenServers(id),

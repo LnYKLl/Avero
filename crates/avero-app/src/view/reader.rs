@@ -2,7 +2,9 @@
 //! conversation shows its messages one under the other, oldest first; the
 //! folded ones take one line each.
 
-use super::{avatar, find_account, format_full_date, hr, icon_button, tip, to_color};
+use super::{
+    avatar, find_account, format_full_date, hr, icon_button, icon_label_button, tip, to_color,
+};
 use crate::app::{App, Body, Entry, Message, Reading};
 use crate::compose::{Mode, human_size};
 use crate::icons::{self, Icon, Tone};
@@ -22,6 +24,7 @@ const MAX_WIDTH: f32 = 720.0;
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = match (app.selected_item(), &app.reading) {
+        _ if !app.checked.is_empty() => checked(app),
         (Some(item), Some(reading)) if reading.is_thread() => conversation(app, item, reading),
         (Some(item), Some(reading)) => message(app, item, reading),
         _ => empty(),
@@ -45,7 +48,7 @@ fn empty<'a>() -> Element<'a, Message> {
                 .size(15)
                 .font(MEDIUM)
                 .style(theme::muted),
-            text("J et K pour passer d'un message à l'autre")
+            text("J et K pour passer d'un message à l'autre, ? pour tous les raccourcis")
                 .size(12)
                 .style(theme::muted),
         ]
@@ -53,6 +56,76 @@ fn empty<'a>() -> Element<'a, Message> {
         .align_x(Alignment::Center),
     )
     .into()
+}
+
+/// Several lines checked: how many, and what can be done to all of them
+/// (one job per account).
+fn checked(app: &App) -> Element<'_, Message> {
+    let count = app.checked.len();
+    let mut accounts = Row::new().spacing(6).align_y(Alignment::Center);
+    for id in app.action_accounts() {
+        if let Some(account) = find_account(&app.accounts, id) {
+            accounts = accounts.push(
+                container(
+                    row![
+                        super::dot(to_color(account.color), 8.0),
+                        text(account.name.clone()).size(12).font(MEDIUM),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([4, 10])
+                .style(theme::note),
+            );
+        }
+    }
+    let delete_label = if app.selection_in_trash() {
+        "Supprimer définitivement"
+    } else {
+        "Supprimer"
+    };
+    let action = |icon, label, message: Option<Message>| {
+        icon_label_button(icon, label, Tone::Text, message, theme::secondary)
+    };
+    let actions = row![
+        action(
+            Icon::Archive,
+            "Archiver",
+            app.can_archive().then_some(Message::Archive)
+        ),
+        action(
+            Icon::Trash,
+            delete_label,
+            app.can_delete().then_some(Message::Delete)
+        ),
+        action(Icon::MailOpen, "Marquer lu", Some(Message::MarkRead)),
+        action(Icon::Mail, "Marquer non lu", Some(Message::MarkUnread)),
+    ]
+    .spacing(8);
+    let mut page = column![
+        icons::icon(Icon::Check, 40.0, Tone::Accent),
+        text(super::list::selection_label(count, app.lines_are_threads()))
+            .size(20)
+            .font(SEMIBOLD),
+        accounts,
+        actions,
+    ]
+    .spacing(16)
+    .align_x(Alignment::Center);
+    if let Some(why) = app.archive_problem() {
+        page = page.push(
+            text(format!("Archiver : {}", why.to_lowercase()))
+                .size(12)
+                .style(theme::muted),
+        );
+    }
+    page = page.push(
+        button(text("Tout désélectionner (Échap)").size(13).font(MEDIUM))
+            .padding([6, 10])
+            .on_press(Message::SelectAll(false))
+            .style(theme::link),
+    );
+    center(page).padding(24).into()
 }
 
 /// The parsed message of an entry, once its body is ready.
@@ -72,6 +145,15 @@ fn body_text<'a>(entry: &'a Entry, index: usize, fill: bool) -> Element<'a, Mess
         Body::Ready { content, .. } => {
             let editor = text_editor(content)
                 .on_action(move |action| Message::ReaderAction(index, action))
+                // Read-only: only the Ctrl keys (copy, select all) stay
+                // here, the others go to the shortcuts (J, K, E…).
+                .key_binding(|press| {
+                    if press.modifiers.command() {
+                        text_editor::Binding::from_key_press(press)
+                    } else {
+                        None
+                    }
+                })
                 .size(14)
                 .line_height(1.55)
                 .padding(0)
@@ -265,7 +347,7 @@ fn action_bar<'a>(
         ""
     };
     let archive_label = match app.archive_problem() {
-        None => format!("Archiver{whole}"),
+        None => format!("Archiver{whole} (E)"),
         Some(why) => format!("Archiver ({})", why.to_lowercase()),
     };
     let delete_label = match app.delete_problem() {
@@ -297,17 +379,17 @@ fn action_bar<'a>(
     row![
         icon_button(
             Icon::Reply,
-            "Répondre (Ctrl+R)",
+            "Répondre (R)",
             when_ready(Message::Answer(Mode::Reply))
         ),
         icon_button(
             Icon::ReplyAll,
-            "Répondre à tous",
+            "Répondre à tous (A)",
             when_ready(Message::Answer(Mode::ReplyAll))
         ),
         icon_button(
             Icon::Forward,
-            "Transférer",
+            "Transférer (F)",
             when_ready(Message::Answer(Mode::Forward))
         ),
         separator(),
@@ -323,7 +405,7 @@ fn action_bar<'a>(
         ),
         icon_button(
             Icon::Mail,
-            "Marquer comme non lu",
+            "Marquer comme non lu (U)",
             Some(Message::MarkUnread)
         ),
         space().width(Fill),

@@ -68,6 +68,9 @@ const ACCOUNTS: [(&str, &str, &str, AuthKind); 3] = [
     ),
 ];
 
+/// Signature of the "Travail" demo account (the others have none).
+const WORK_SIGNATURE: &str = "Camille Martin\nAtelier Lumen · 04 78 00 00 00";
+
 const H: i64 = 60;
 const D: i64 = 24 * 60;
 
@@ -271,6 +274,9 @@ pub fn seed(store: &Store) {
                 auth,
             })
             .expect("demo account");
+        if name == "Travail" {
+            let _ = store.set_signature(account.id, WORK_SIGNATURE);
+        }
         ids.push(account.id);
     }
 

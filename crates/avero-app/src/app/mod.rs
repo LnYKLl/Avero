@@ -1,15 +1,19 @@
 //! State of the window and how it reacts to messages.
 //!
 //! `mod.rs` holds the state, the message list and the dispatch; the
-//! details live in `mail` (list, reader, actions), `accounts` (adding,
-//! fixing and removing accounts, worker events) and `composer`.
+//! details live in `mail` (list, reader, actions), `selection` (lines
+//! picked with Ctrl, Maj or `x`), `keys` (keyboard shortcuts), `accounts`
+//! (adding, fixing and removing accounts, worker events) and `composer`.
 
 mod accounts;
 mod composer;
+mod keys;
 mod mail;
+mod selection;
 
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
 pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
+pub use keys::SHORTCUTS;
 
 use crate::account_form::{AccountForm, Field};
 use crate::auth::OAuthGrant;
@@ -81,6 +85,13 @@ pub enum Overlay {
     Servers(ServersForm),
     /// Deleting messages that are already in the trash, for good.
     ConfirmDeleteForever(Vec<i64>),
+    /// The signature of an account, being edited.
+    Signature {
+        account: AccountId,
+        content: text_editor::Content,
+    },
+    /// The list of keyboard shortcuts (`?`).
+    Shortcuts,
 }
 
 /// "Changer le mot de passe".
@@ -265,6 +276,8 @@ pub enum Message {
     Tick,
     AutoSync,
     Key(keyboard::Key, keyboard::Modifiers),
+    /// Ctrl, Maj… pressed or released (a click on a line reads them).
+    ModifiersChanged(keyboard::Modifiers),
     ToastExpired(u64),
     OpenUrl(String),
     /// Puts a value on the clipboard (a scope or redirect URI to paste in
@@ -283,7 +296,10 @@ pub enum Message {
     SearchDebounced(u64),
     SearchSubmitted,
     SearchCleared,
+    /// A click on a line of the list (Ctrl and Maj change what it does).
     MessageSelected(usize),
+    /// "Tout sélectionner": every loaded line, or none.
+    SelectAll(bool),
     LoadMore,
     Refresh,
     Worker(AccountId, Event),
@@ -305,6 +321,7 @@ pub enum Message {
     Answer(Mode),
     Archive,
     Delete,
+    MarkRead,
     MarkUnread,
     /// Attachment `.1` of reader entry `.0`.
     SaveAttachment(usize, usize),
@@ -395,6 +412,10 @@ pub enum AccountMsg {
     SaveServers,
     /// The SMTP server found for an account that had none.
     SmtpFound(AccountId, Option<ServerConfig>),
+    /// Opens the signature of an account.
+    EditSignature(AccountId),
+    SignatureEdit(text_editor::Action),
+    SaveSignature,
     CloseDialog,
 }
 
@@ -419,6 +440,9 @@ impl fmt::Debug for AccountMsg {
             AccountMsg::ServerSecurity(security) => write!(f, "ServerSecurity({security:?})"),
             AccountMsg::SaveServers => f.write_str("SaveServers"),
             AccountMsg::SmtpFound(id, found) => write!(f, "SmtpFound({id:?}, {found:?})"),
+            AccountMsg::EditSignature(id) => write!(f, "EditSignature({id:?})"),
+            AccountMsg::SignatureEdit(action) => write!(f, "SignatureEdit({action:?})"),
+            AccountMsg::SaveSignature => f.write_str("SaveSignature"),
             AccountMsg::CloseDialog => f.write_str("CloseDialog"),
         }
     }
@@ -462,8 +486,18 @@ pub struct App {
     /// waiting for its turn.
     last_reload: Option<Instant>,
     reload_scheduled: bool,
-    /// Row ids of the selected item (stable across reloads).
+    /// Row ids of the selected item (stable across reloads): the line
+    /// read, or the keyboard's line while lines are checked.
     pub(crate) selected: Option<Vec<i64>>,
+    /// Lines picked with Ctrl+click, Maj+click, `x` or "Tout
+    /// sélectionner" (row ids of each); the actions apply to them.
+    pub(crate) checked: Vec<Vec<i64>>,
+    /// Where a Maj+click range starts.
+    pub(crate) anchor: Option<Vec<i64>>,
+    /// The modifier keys held (read by a click on a line).
+    pub(crate) modifiers: keyboard::Modifiers,
+    /// When `g` was pressed, waiting for the folder letter.
+    pub(crate) pending_g: Option<Instant>,
     pub(crate) reading: Option<Reading>,
 
     pub(crate) composer: Option<Composer>,
@@ -533,6 +567,10 @@ impl App {
             last_reload: None,
             reload_scheduled: false,
             selected: None,
+            checked: Vec::new(),
+            anchor: None,
+            modifiers: keyboard::Modifiers::default(),
+            pending_g: None,
             reading: None,
             composer: None,
             overlay: None,
@@ -582,6 +620,13 @@ impl App {
                 }
                 _ => None,
             }),
+            // Every modifier change, even while a field has the focus.
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                    Some(Message::ModifiersChanged(modifiers))
+                }
+                _ => None,
+            }),
         ];
         if self.is_syncing() || self.is_waiting() {
             subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::Tick));
@@ -602,6 +647,10 @@ impl App {
             }
             Message::AutoSync | Message::Refresh => self.sync_all(),
             Message::Key(key, modifiers) => self.on_key(key, modifiers),
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                Task::none()
+            }
             Message::ToastExpired(id) => {
                 if self.toast.as_ref().is_some_and(|t| t.id == id) {
                     self.toast = None;
@@ -655,12 +704,14 @@ impl App {
             | Message::SearchSubmitted
             | Message::SearchCleared
             | Message::MessageSelected(_)
+            | Message::SelectAll(_)
             | Message::LoadMore
             | Message::ReaderAction(..)
             | Message::EntryToggled(_)
             | Message::Answer(_)
             | Message::Archive
             | Message::Delete
+            | Message::MarkRead
             | Message::MarkUnread
             | Message::SaveAttachment(..)
             | Message::AttachmentSaved(_) => self.update_mail(message),
@@ -817,45 +868,6 @@ impl App {
         }
         status.syncing = true;
         self.request(id, |reply| Job::Sync { reply })
-    }
-
-    fn on_key(&mut self, key: keyboard::Key, modifiers: keyboard::Modifiers) -> Task<Message> {
-        use keyboard::key::Named;
-        let ctrl = modifiers.command();
-        match key.as_ref() {
-            keyboard::Key::Named(Named::Escape) => self.escape(),
-            _ if self.overlay.is_some() => Task::none(),
-            keyboard::Key::Character("n") if ctrl => self.update_composer(ComposeMsg::New),
-            keyboard::Key::Character("r") if ctrl && self.composer.is_none() => {
-                self.update_mail(Message::Answer(Mode::Reply))
-            }
-            keyboard::Key::Character("f") if ctrl => {
-                self.screen = Screen::Mail;
-                iced::widget::operation::focus(SEARCH_ID)
-            }
-            _ if self.composer.is_some() || ctrl => Task::none(),
-            keyboard::Key::Named(Named::Delete) => self.update_mail(Message::Delete),
-            keyboard::Key::Character("j") => self.step_selection(1),
-            keyboard::Key::Character("k") => self.step_selection(-1),
-            _ => Task::none(),
-        }
-    }
-
-    /// Échap closes the top-most thing: dialog, composer, search.
-    fn escape(&mut self) -> Task<Message> {
-        if self.overlay.is_some() {
-            return match self.overlay {
-                Some(Overlay::AddAccount(_)) => self.update_add(AddMsg::Close),
-                _ => self.update_account(AccountMsg::CloseDialog),
-            };
-        }
-        if self.composer.is_some() {
-            return self.update_composer(ComposeMsg::Cancel);
-        }
-        if self.search_query.is_some() || !self.search_text.is_empty() {
-            return self.update_mail(Message::SearchCleared);
-        }
-        Task::none()
     }
 }
 

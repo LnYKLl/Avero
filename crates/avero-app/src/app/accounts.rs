@@ -698,6 +698,22 @@ impl App {
             }
             AccountMsg::SaveServers => self.save_servers(),
             AccountMsg::SmtpFound(id, found) => self.smtp_found(id, found),
+            AccountMsg::EditSignature(id) => {
+                if let Some(account) = self.account(id) {
+                    self.overlay = Some(Overlay::Signature {
+                        account: id,
+                        content: iced::widget::text_editor::Content::with_text(&account.signature),
+                    });
+                }
+                Task::none()
+            }
+            AccountMsg::SignatureEdit(action) => {
+                if let Some(Overlay::Signature { content, .. }) = &mut self.overlay {
+                    content.perform(action);
+                }
+                Task::none()
+            }
+            AccountMsg::SaveSignature => self.save_signature(),
             AccountMsg::CloseDialog => {
                 self.oauth_cancel = None;
                 self.overlay = None;
@@ -730,6 +746,24 @@ impl App {
         }
         self.overlay = None;
         Task::none()
+    }
+
+    /// Saves the signature being edited (trailing blank lines dropped).
+    fn save_signature(&mut self) -> Task<Message> {
+        let Some(Overlay::Signature { account, content }) = &self.overlay else {
+            return Task::none();
+        };
+        let (id, signature) = (*account, content.text().trim_end().to_string());
+        if let Err(e) = self.store.set_signature(id, &signature) {
+            return self.toast(format!("Erreur de la base locale : {e}"), true);
+        }
+        // The worker is not told: the signature is added here, in the
+        // composer, and a new copy of the account would reconnect it.
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            account.signature = signature;
+        }
+        self.overlay = None;
+        self.toast("Signature enregistrée", false)
     }
 
     /// Saves the "Serveurs" dialog and resyncs with the new settings.

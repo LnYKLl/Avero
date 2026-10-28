@@ -44,16 +44,29 @@ pub struct Composer {
     pub attachments: Vec<Attached>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,
+    /// The body the draft started from, without signature.
+    base: String,
+    /// The signature put in the body (swapped when the sending account
+    /// changes, unless the user edited it).
+    signature: String,
     pub sending: bool,
     pub error: Option<String>,
 }
 
 impl Composer {
-    pub fn new(from: AccountId) -> Composer {
-        Composer::from_fields(from, Fields::default(), Vec::new())
+    /// An empty message from `from`, signed with `signature`.
+    pub fn new(from: AccountId, signature: &str) -> Composer {
+        Composer::from_fields(from, Fields::default(), Vec::new(), signature)
     }
 
-    pub fn from_fields(from: AccountId, fields: Fields, attachments: Vec<Attached>) -> Composer {
+    /// A draft filled with `fields` (a reply or a forward); the signature
+    /// goes above the quote.
+    pub fn from_fields(
+        from: AccountId,
+        fields: Fields,
+        attachments: Vec<Attached>,
+        signature: &str,
+    ) -> Composer {
         Composer {
             from,
             show_copies: !fields.cc.is_empty(),
@@ -61,12 +74,29 @@ impl Composer {
             cc: fields.cc,
             bcc: String::new(),
             subject: fields.subject,
-            body: text_editor::Content::with_text(&fields.body),
+            body: text_editor::Content::with_text(&compose::with_signature(
+                &fields.body,
+                signature,
+            )),
             attachments,
             in_reply_to: fields.in_reply_to,
             references: fields.references,
+            base: fields.body,
+            signature: signature.to_string(),
             sending: false,
             error: None,
+        }
+    }
+
+    /// Sends the draft from another account: its signature replaces the
+    /// current one, unless the user edited the signature.
+    pub fn change_sender(&mut self, from: AccountId, signature: &str) {
+        self.from = from;
+        if let Some(body) =
+            compose::swap_signature(&self.body.text(), &self.base, &self.signature, signature)
+        {
+            self.body = text_editor::Content::with_text(&body);
+            self.signature = signature.to_string();
         }
     }
 
@@ -95,12 +125,17 @@ impl App {
             if self.composer.is_none()
                 && let Some(from) = self.default_sender()
             {
-                self.composer = Some(Composer::new(from));
+                let signature = self.signature_of(from);
+                self.composer = Some(Composer::new(from, &signature));
                 self.screen = super::Screen::Mail;
                 return iced::widget::operation::focus(TO_ID);
             }
             return Task::none();
         }
+        let new_signature = match &message {
+            ComposeMsg::From(id) => self.signature_of(*id),
+            _ => String::new(),
+        };
         let Some(composer) = &mut self.composer else {
             return Task::none();
         };
@@ -110,7 +145,7 @@ impl App {
         composer.error = None;
         match message {
             ComposeMsg::New => {}
-            ComposeMsg::From(id) => composer.from = id,
+            ComposeMsg::From(id) => composer.change_sender(id, &new_signature),
             ComposeMsg::To(text) => composer.to = text,
             ComposeMsg::Cc(text) => composer.cc = text,
             ComposeMsg::Bcc(text) => composer.bcc = text,
@@ -142,6 +177,13 @@ impl App {
             ComposeMsg::Cancel => self.composer = None,
         }
         Task::none()
+    }
+
+    /// The signature of an account (empty when it has none).
+    pub(super) fn signature_of(&self, account: AccountId) -> String {
+        self.account(account)
+            .map(|a| a.signature.clone())
+            .unwrap_or_default()
     }
 
     fn send_draft(&mut self) -> Task<Message> {
@@ -232,7 +274,7 @@ mod tests {
 
     #[test]
     fn files_over_the_limit_are_refused() {
-        let mut composer = Composer::new(AccountId(1));
+        let mut composer = Composer::new(AccountId(1), "");
         let small = Arc::new(vec![0u8; 10]);
         let big = Arc::new(vec![0u8; MAX_ATTACHMENTS]);
         let refused = composer.add_files(vec![
@@ -255,9 +297,27 @@ mod tests {
             in_reply_to: Some("<1@x>".into()),
             references: Some("<1@x>".into()),
         };
-        let composer = Composer::from_fields(AccountId(2), fields, Vec::new());
+        let composer = Composer::from_fields(AccountId(2), fields, Vec::new(), "");
         assert!(composer.show_copies);
         assert_eq!(composer.body.text(), "\n\n> y");
         assert_eq!(composer.in_reply_to.as_deref(), Some("<1@x>"));
+    }
+
+    #[test]
+    fn signature_follows_the_sender_until_edited() {
+        let fields = Fields {
+            body: "\n\n> y".into(),
+            ..Fields::default()
+        };
+        let mut composer = Composer::from_fields(AccountId(1), fields, Vec::new(), "Marie");
+        assert_eq!(composer.body.text(), "\n\n-- \nMarie\n\n> y");
+        composer.change_sender(AccountId(2), "Paul\nPro");
+        assert_eq!(composer.from, AccountId(2));
+        assert_eq!(composer.body.text(), "\n\n-- \nPaul\nPro\n\n> y");
+        // The user edits the signature: it stays from now on.
+        composer.body = text_editor::Content::with_text("\n\n-- \nPaul (perso)\n\n> y");
+        composer.change_sender(AccountId(1), "Marie");
+        assert_eq!(composer.from, AccountId(1));
+        assert_eq!(composer.body.text(), "\n\n-- \nPaul (perso)\n\n> y");
     }
 }

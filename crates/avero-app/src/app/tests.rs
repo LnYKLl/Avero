@@ -1440,3 +1440,297 @@ fn demo_conversation_can_be_drawn_unfolded() {
     open_parsed(&mut app, 0);
     let _ = app.view();
 }
+
+// ------------------------------------------------------------ signatures
+
+#[test]
+fn signature_is_edited_in_the_settings() {
+    let mut app = two_accounts();
+    let (a, _) = ids(&app);
+    let _ = app.update(Message::Account(AccountMsg::EditSignature(a)));
+    let Some(Overlay::Signature { content, .. }) = &mut app.overlay else {
+        panic!("signature dialog expected");
+    };
+    *content = text_editor::Content::with_text("Marie\nPâtisserie Durand\n\n");
+    let _ = app.view();
+    let _ = app.update(Message::Account(AccountMsg::SaveSignature));
+    assert!(app.overlay.is_none());
+    assert_eq!(app.accounts[0].signature, "Marie\nPâtisserie Durand");
+    assert_eq!(
+        app.store.accounts().unwrap()[0].signature,
+        "Marie\nPâtisserie Durand"
+    );
+}
+
+#[test]
+fn new_message_is_signed_and_follows_the_sender() {
+    let mut app = app_with(|s| {
+        let a = add_account_with_mail(s, "a@x.fr", 1);
+        let b = add_account_with_mail(s, "b@x.fr", 1);
+        s.set_signature(a, "Signé A").unwrap();
+        s.set_signature(b, "Signé B").unwrap();
+    });
+    let (a, b) = ids(&app);
+    let _ = app.update(Message::Compose(ComposeMsg::New));
+    let body = |app: &App| app.composer.as_ref().unwrap().body.text();
+    assert_eq!(app.composer.as_ref().unwrap().from, a);
+    assert_eq!(body(&app), "\n\n-- \nSigné A");
+    let _ = app.update(Message::Compose(ComposeMsg::From(b)));
+    assert_eq!(body(&app), "\n\n-- \nSigné B");
+}
+
+#[test]
+fn reply_and_forward_are_signed_above_the_quote() {
+    let mut app = app_with(|s| {
+        crate::demo::seed(s);
+        for account in s.accounts().unwrap() {
+            s.set_signature(account.id, "Camille").unwrap();
+        }
+    });
+    open_parsed(&mut app, 0);
+    for mode in [Mode::Reply, Mode::Forward] {
+        let _ = app.update(Message::Answer(mode));
+        let body = app.composer.as_ref().unwrap().body.text();
+        assert!(body.starts_with("\n\n-- \nCamille\n\n"), "{body:?}");
+        assert!(body.len() > "\n\n-- \nCamille\n\n".len(), "{body:?}");
+        let _ = app.update(Message::Compose(ComposeMsg::Cancel));
+    }
+}
+
+// ------------------------------------------------------------- shortcuts
+
+fn press(app: &mut App, key: &str, at: Instant) {
+    let _ = app.on_key_at(
+        keyboard::Key::Character(key.into()),
+        keyboard::Modifiers::default(),
+        at,
+    );
+}
+
+fn press_named(app: &mut App, key: keyboard::key::Named) {
+    let _ = app.update(Message::Key(
+        keyboard::Key::Named(key),
+        keyboard::Modifiers::default(),
+    ));
+}
+
+#[test]
+fn g_then_a_letter_goes_to_a_folder() {
+    let mut app = two_accounts();
+    let start = Instant::now();
+    for (letter, folder) in [
+        ("s", FolderRole::Sent),
+        ("d", FolderRole::Drafts),
+        ("a", FolderRole::Archive),
+        ("t", FolderRole::Trash),
+        ("i", FolderRole::Inbox),
+    ] {
+        press(&mut app, "g", start);
+        press(&mut app, letter, start + Duration::from_millis(800));
+        assert_eq!(app.folder, folder, "g {letter}");
+    }
+    // The letter alone, or `g` then another key, does nothing.
+    press(&mut app, "s", start);
+    assert_eq!(app.folder, FolderRole::Inbox);
+    press(&mut app, "g", start);
+    press(&mut app, "z", start);
+    press(&mut app, "s", start);
+    assert_eq!(app.folder, FolderRole::Inbox);
+}
+
+#[test]
+fn g_waits_one_and_a_half_seconds() {
+    let mut app = two_accounts();
+    let start = Instant::now();
+    press(&mut app, "g", start);
+    press(&mut app, "s", start + Duration::from_millis(1600));
+    assert_eq!(app.folder, FolderRole::Inbox, "too late");
+    assert!(app.pending_g.is_none());
+    press(&mut app, "g", start);
+    press(&mut app, "t", start + Duration::from_millis(1400));
+    assert_eq!(app.folder, FolderRole::Trash);
+}
+
+#[test]
+fn question_mark_shows_the_shortcuts_until_escape() {
+    let mut app = two_accounts();
+    press(&mut app, "?", Instant::now());
+    assert!(matches!(app.overlay, Some(Overlay::Shortcuts)));
+    let _ = app.view();
+    // Shortcuts are off under a dialog.
+    press(&mut app, "j", Instant::now());
+    assert_eq!(app.selected, None);
+    press_named(&mut app, keyboard::key::Named::Escape);
+    assert!(app.overlay.is_none());
+}
+
+#[test]
+fn action_keys_act_on_the_line_read() {
+    let mut app = two_accounts();
+    synced(&mut app, true);
+    let (a, b) = ids(&app);
+    let now = Instant::now();
+    press_named(&mut app, keyboard::key::Named::ArrowDown);
+    assert_eq!(app.selected_index(), Some(0));
+    assert_eq!(app.unread[&a] + app.unread[&b], 4);
+    press(&mut app, "u", now);
+    assert_eq!(app.unread[&a] + app.unread[&b], 5);
+    // Archive (e), then delete (#, as AltGr+3 types it).
+    press(&mut app, "e", now);
+    assert_eq!(app.items.len(), 4);
+    let _ = app.on_key_at(
+        keyboard::Key::Character("#".into()),
+        keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+        now,
+    );
+    assert_eq!(app.items.len(), 3);
+    press_named(&mut app, keyboard::key::Named::Delete);
+    assert_eq!(app.items.len(), 2);
+    // c writes a new message; then the one-key shortcuts are off.
+    press(&mut app, "c", now);
+    assert!(app.composer.is_some());
+    press(&mut app, "e", now);
+    press(&mut app, "j", now);
+    assert_eq!(app.items.len(), 2);
+    assert!(app.composer.is_some());
+}
+
+#[test]
+fn enter_opens_and_reply_keys_answer() {
+    let mut app = app_with(|s| {
+        crate::demo::seed(s);
+    });
+    open_parsed(&mut app, 0);
+    press(&mut app, "x", Instant::now());
+    assert!(app.reading.is_none());
+    press_named(&mut app, keyboard::key::Named::Enter);
+    assert!(app.checked.is_empty());
+    assert!(app.reading.is_some());
+    // Enter loads the body again: deliver it.
+    let row = app.reading.as_ref().unwrap().focused().item.row_ids[0];
+    let (raw, _) = app.store.body(row).unwrap().unwrap();
+    let opened = crate::background::OpenedBody::parse(&raw);
+    let _ = app.update(Message::BodyParsed(row, Ok(Arc::new(opened))));
+    press(&mut app, "f", Instant::now());
+    assert!(app.composer.as_ref().unwrap().subject.starts_with("Fwd: "));
+}
+
+// ------------------------------------------------------------- selection
+
+fn click(app: &mut App, index: usize, modifiers: keyboard::Modifiers) {
+    let _ = app.update(Message::ModifiersChanged(modifiers));
+    let _ = app.update(Message::MessageSelected(index));
+    let _ = app.update(Message::ModifiersChanged(keyboard::Modifiers::default()));
+}
+
+fn checked_indexes(app: &App) -> Vec<usize> {
+    (0..app.items.len())
+        .filter(|&i| app.is_checked(&app.items[i]))
+        .collect()
+}
+
+#[test]
+fn ctrl_click_adds_and_removes_lines() {
+    let mut app = two_accounts();
+    click(&mut app, 0, keyboard::Modifiers::COMMAND);
+    click(&mut app, 2, keyboard::Modifiers::COMMAND);
+    assert_eq!(checked_indexes(&app), vec![0, 2]);
+    assert!(app.reading.is_none());
+    let _ = app.view();
+    click(&mut app, 0, keyboard::Modifiers::COMMAND);
+    assert_eq!(checked_indexes(&app), vec![2]);
+    // A plain click opens a line and forgets the others.
+    click(&mut app, 1, keyboard::Modifiers::default());
+    assert!(app.checked.is_empty());
+    assert!(app.reading.is_some());
+    // The line being read joins the first Ctrl+click.
+    click(&mut app, 3, keyboard::Modifiers::COMMAND);
+    assert_eq!(checked_indexes(&app), vec![1, 3]);
+}
+
+#[test]
+fn shift_click_takes_a_range() {
+    let mut app = two_accounts();
+    click(&mut app, 1, keyboard::Modifiers::default());
+    click(&mut app, 3, keyboard::Modifiers::SHIFT);
+    assert_eq!(checked_indexes(&app), vec![1, 2, 3]);
+    // From the same anchor, the other way.
+    click(&mut app, 0, keyboard::Modifiers::SHIFT);
+    assert_eq!(checked_indexes(&app), vec![0, 1]);
+}
+
+#[test]
+fn x_toggles_the_keyboard_line() {
+    let mut app = two_accounts();
+    let now = Instant::now();
+    press(&mut app, "j", now);
+    press(&mut app, "x", now);
+    assert_eq!(checked_indexes(&app), vec![0]);
+    // J moves without opening, X takes the next line too.
+    press(&mut app, "j", now);
+    assert!(app.reading.is_none());
+    assert_eq!(app.selected_index(), Some(1));
+    press(&mut app, "x", now);
+    assert_eq!(checked_indexes(&app), vec![0, 1]);
+    press(&mut app, "x", now);
+    assert_eq!(checked_indexes(&app), vec![0]);
+    press_named(&mut app, keyboard::key::Named::Escape);
+    assert!(app.checked.is_empty());
+}
+
+#[test]
+fn select_all_takes_the_loaded_lines() {
+    let mut app = two_accounts();
+    let _ = app.update(Message::SelectAll(true));
+    assert_eq!(checked_indexes(&app), vec![0, 1, 2, 3, 4]);
+    assert!(app.all_checked());
+    let _ = app.update(Message::SelectAll(false));
+    assert!(app.checked.is_empty());
+    // Changing folder forgets the selection.
+    let _ = app.update(Message::SelectAll(true));
+    let _ = app.update(Message::FolderSelected(FolderRole::Sent));
+    assert!(app.checked.is_empty());
+}
+
+#[test]
+fn grouped_actions_span_accounts() {
+    let mut app = two_accounts();
+    synced(&mut app, true);
+    let (a, b) = ids(&app);
+    let _ = app.update(Message::SelectAll(true));
+    assert_eq!(app.action_accounts(), vec![a, b]);
+    // One job per account.
+    let refs = app.store.message_refs(&app.action_rows()).unwrap();
+    let groups = super::mail::by_account(refs);
+    assert_eq!(groups.len(), 2);
+    assert_eq!((groups[&a].len(), groups[&b].len()), (3, 2));
+
+    let _ = app.update(Message::MarkRead);
+    assert_eq!((app.unread[&a], app.unread[&b]), (0, 0));
+    assert_eq!(app.checked.len(), 5, "still selected");
+    let _ = app.update(Message::MarkUnread);
+    assert_eq!((app.unread[&a], app.unread[&b]), (3, 2));
+
+    // Archive: everything hidden at once; b's server refuses.
+    let rows_a: Vec<i64> = groups[&a].iter().map(|r| r.row_id).collect();
+    let rows_b: Vec<i64> = groups[&b].iter().map(|r| r.row_id).collect();
+    let _ = app.update(Message::Archive);
+    assert!(app.items.is_empty());
+    assert!(app.checked.is_empty());
+    let _ = app.update(Message::Moved(rows_a, Event::Done(Ok(()))));
+    let error = AccountError::new(ErrorKind::Network, "Connexion impossible");
+    let _ = app.update(Message::Moved(rows_b, Event::Done(Err(error))));
+    assert_eq!(app.items.len(), 2);
+    assert!(app.items.iter().all(|i| i.accounts == vec![b]));
+}
+
+#[test]
+fn grouped_delete_with_the_delete_key() {
+    let mut app = two_accounts();
+    synced(&mut app, true);
+    click(&mut app, 0, keyboard::Modifiers::COMMAND);
+    click(&mut app, 4, keyboard::Modifiers::COMMAND);
+    press_named(&mut app, keyboard::key::Named::Delete);
+    assert_eq!(app.items.len(), 3);
+    assert!(app.checked.is_empty());
+}

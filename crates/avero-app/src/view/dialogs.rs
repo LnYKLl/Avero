@@ -1,4 +1,5 @@
-//! Small dialogs: password, rename, delete confirmation, reconnection.
+//! Small dialogs: password, rename, signature, delete confirmation,
+//! reconnection, keyboard shortcuts.
 
 use super::add_account::{error_line, spinner_line};
 use super::{field_label, icon_button};
@@ -6,7 +7,7 @@ use crate::app::{AccountMsg, App, Message, Overlay, PasswordDialog, ServerField,
 use crate::icons::Icon;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::Security;
-use iced::widget::{Column, button, column, container, row, space, text, text_input};
+use iced::widget::{Column, button, column, container, row, space, text, text_editor, text_input};
 use iced::{Alignment, Element, Fill};
 
 /// Width of a small dialog.
@@ -21,10 +22,16 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::Reconnect(account) => reconnect(app, *account),
         Overlay::Servers(form) => servers(app, form),
         Overlay::ConfirmDeleteForever(rows) => confirm_delete_forever(rows.len()),
+        Overlay::Signature { account, content } => signature(app, *account, content),
+        Overlay::Shortcuts => shortcuts(),
     }
 }
 
 fn card<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
+    card_width(title, body, WIDTH)
+}
+
+fn card_width<'a>(title: &'a str, body: Element<'a, Message>, width: f32) -> Element<'a, Message> {
     container(
         column![
             row![
@@ -40,7 +47,7 @@ fn card<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> 
         ]
         .spacing(16),
     )
-    .width(WIDTH)
+    .width(width)
     .padding(24)
     .style(theme::card)
     .into()
@@ -263,4 +270,63 @@ fn reconnect(app: &App, account: avero_core::AccountId) -> Element<'_, Message> 
     ]
     .spacing(14);
     card("Reconnecter le compte", body.into())
+}
+
+fn signature<'a>(
+    app: &'a App,
+    account: avero_core::AccountId,
+    content: &'a text_editor::Content,
+) -> Element<'a, Message> {
+    let email = app
+        .account(account)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let editor = text_editor(content)
+        .placeholder("Marie Durand\nPâtisserie Durand · 01 23 45 67 89")
+        .on_action(|action| Message::Account(AccountMsg::SignatureEdit(action)))
+        .size(14)
+        .padding([10, 12])
+        .height(140)
+        .style(theme::editor);
+    let body = column![
+        text(format!(
+            "Ajoutée sous les messages, réponses et transferts envoyés depuis {email}, \
+             après une ligne « -- ». Laissez vide pour ne pas en mettre."
+        ))
+        .size(13)
+        .style(theme::muted),
+        column![field_label("Signature"), editor].spacing(6),
+        buttons(
+            "Enregistrer",
+            Some(Message::Account(AccountMsg::SaveSignature)),
+            theme::primary,
+        ),
+    ]
+    .spacing(14);
+    card_width("Signature", body.into(), 480.0)
+}
+
+fn shortcuts<'a>() -> Element<'a, Message> {
+    let mut list = Column::new().spacing(8);
+    for (keys, action) in crate::app::SHORTCUTS {
+        list = list.push(
+            row![
+                container(text(keys).size(12).font(SEMIBOLD))
+                    .padding([2, 8])
+                    .width(170)
+                    .style(theme::note),
+                text(action).size(13).width(Fill),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        );
+    }
+    let body = column![
+        list,
+        text("Les raccourcis à une touche sont inactifs pendant la saisie de texte.")
+            .size(12)
+            .style(theme::muted),
+    ]
+    .spacing(16);
+    card_width("Raccourcis clavier", body.into(), 540.0)
 }

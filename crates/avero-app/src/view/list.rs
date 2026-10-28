@@ -10,7 +10,8 @@ use avero_core::{Account, AccountFilter, AuthKind, FolderRole, UnifiedItem};
 use chrono::{DateTime, Local};
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, column, container, row, scrollable, stack, text, text_input, tooltip,
+    Column, Row, button, checkbox, column, container, row, scrollable, stack, text, text_input,
+    tooltip,
 };
 use iced::{Alignment, Element, Fill, Padding};
 
@@ -47,7 +48,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
         header = header.push(banner);
     }
 
-    let content = column![header, hr(), messages(app)];
+    let mut content = column![header, hr()];
+    if !app.items.is_empty() {
+        content = content.push(select_bar(app)).push(hr());
+    }
+    let content = content.push(messages(app));
     row![
         container(content)
             .width(WIDTH)
@@ -272,6 +277,35 @@ fn banners(app: &App) -> Vec<Element<'_, Message>> {
     banners
 }
 
+/// "Tout sélectionner" (the loaded lines), with the count once some are
+/// checked.
+fn select_bar(app: &App) -> Element<'_, Message> {
+    let label = match app.checked.len() {
+        0 => "Tout sélectionner".to_string(),
+        count => selection_label(count, app.lines_are_threads()),
+    };
+    container(
+        checkbox(app.all_checked())
+            .label(label)
+            .on_toggle(Message::SelectAll)
+            .size(15)
+            .text_size(12)
+            .spacing(10),
+    )
+    .padding([8, 20])
+    .into()
+}
+
+/// "3 conversations sélectionnées", "1 message sélectionné"…
+pub fn selection_label(count: usize, threads: bool) -> String {
+    match (count > 1, threads) {
+        (true, true) => format!("{count} conversations sélectionnées"),
+        (false, true) => format!("{count} conversation sélectionnée"),
+        (true, false) => format!("{count} messages sélectionnés"),
+        (false, false) => format!("{count} message sélectionné"),
+    }
+}
+
 fn messages(app: &App) -> Element<'_, Message> {
     if app.items.is_empty() {
         return empty(app);
@@ -280,7 +314,15 @@ fn messages(app: &App) -> Element<'_, Message> {
     let selected = app.selected_index();
     let mut lines = Column::new().spacing(2).padding([8, 8]);
     for (index, item) in app.items.iter().enumerate() {
-        lines = lines.push(message_row(app, index, item, selected == Some(index), now));
+        let checked = app.is_checked(item);
+        lines = lines.push(message_row(
+            app,
+            index,
+            item,
+            selected == Some(index) || checked,
+            checked,
+            now,
+        ));
     }
     // A full last page means there may be more.
     if app.items.len().is_multiple_of(PAGE) {
@@ -371,6 +413,7 @@ fn message_row<'a>(
     index: usize,
     item: &'a UnifiedItem,
     is_selected: bool,
+    checked: bool,
     now: DateTime<Local>,
 ) -> Element<'a, Message> {
     let unread = !item.seen;
@@ -436,9 +479,20 @@ fn message_row<'a>(
         );
     }
 
-    let content = row![shared_avatar(&item.from_display, &colors, 36.0), lines,]
-        .spacing(12)
-        .align_y(Alignment::Start);
+    // A checked line shows a tick instead of the avatar.
+    let picture = if checked {
+        container(icons::icon(
+            Icon::Check,
+            18.0,
+            Tone::Fixed(iced::Color::WHITE),
+        ))
+        .center(36)
+        .style(theme::disc(app.tokens().accent))
+        .into()
+    } else {
+        shared_avatar(&item.from_display, &colors, 36.0)
+    };
+    let content = row![picture, lines].spacing(12).align_y(Alignment::Start);
 
     button(content)
         .width(Fill)
