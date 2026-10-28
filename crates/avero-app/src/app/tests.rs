@@ -38,6 +38,7 @@ fn add_account_with_mail(store: &Store, email: &str, count: u32) -> AccountId {
             date: 1_700_000_000 + i64::from(uid),
             seen: false,
             has_attachments: false,
+            ..Default::default()
         })
         .collect();
     store.insert_messages(inbox.id, &messages).unwrap();
@@ -197,6 +198,7 @@ fn delete_needs_a_selection_and_a_trash() {
             date: 1_900_000_000,
             seen: false,
             has_attachments: false,
+            ..Default::default()
         };
         s.insert_messages(folder.id, &[message]).unwrap();
         let _ = inbox;
@@ -258,6 +260,7 @@ fn deleting_from_the_trash_asks_then_deletes_for_good() {
             date: 1,
             seen: true,
             has_attachments: false,
+            ..Default::default()
         };
         s.insert_messages(trash.id, &[message]).unwrap();
     });
@@ -337,6 +340,7 @@ fn progress_reloads_are_throttled() {
             date: 1_800_000_000 + i64::from(uid),
             seen: false,
             has_attachments: false,
+            ..Default::default()
         };
         app.store.insert_messages(inbox.id, &[message]).unwrap();
     };
@@ -417,6 +421,7 @@ fn progress_reloads_the_list() {
         date: 1_800_000_000,
         seen: false,
         has_attachments: false,
+        ..Default::default()
     };
     app.store.insert_messages(inbox.id, &[new_message]).unwrap();
     let _ = app.update(Message::Worker(a, Event::Progress));

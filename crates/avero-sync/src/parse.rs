@@ -21,6 +21,7 @@ pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
         date: 0,
         seen,
         has_attachments: false,
+        ..Default::default()
     };
 
     let Some(parsed) = MessageParser::new().parse_headers(raw) else {

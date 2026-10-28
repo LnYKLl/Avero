@@ -246,6 +246,7 @@ pub fn seed(store: &Store) {
             date,
             seen: sample.seen,
             has_attachments: sample.attachment.is_some(),
+            ..Default::default()
         };
         store
             .insert_messages(folder.id, &[message])

@@ -229,7 +229,7 @@ pub struct Folder {
 }
 
 /// A message header fetched from the server, not yet stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewMessage {
     pub uid: u32,
     pub message_id: Option<String>,
@@ -241,6 +241,35 @@ pub struct NewMessage {
     pub seen: bool,
     /// Guessed from the header block (see `avero_sync::parse`).
     pub has_attachments: bool,
+    /// Threading, mailing-list and recipient headers.
+    pub headers: MessageHeaders,
+}
+
+/// The headers kept besides those shown in the list: they link a message
+/// to its conversation, tell newsletters and notifications apart, and
+/// say how to unsubscribe. Raw values have their line folding removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MessageHeaders {
+    /// The parent's Message-ID, with angle brackets.
+    pub in_reply_to: Option<String>,
+    /// The ids of the References header, with angle brackets, oldest
+    /// (the conversation's first message) first.
+    pub references: Vec<String>,
+    /// Addresses of the To header.
+    pub to: Vec<String>,
+    /// The first (top-most) Delivered-To header: the mailbox that
+    /// really received the message.
+    pub delivered_to: Option<String>,
+    /// For example `<mailto:u@list.example>, <https://list.example/u>`.
+    pub list_unsubscribe: Option<String>,
+    /// `List-Unsubscribe=One-Click` when one-click unsubscribe (RFC 8058)
+    /// is offered.
+    pub list_unsubscribe_post: Option<String>,
+    pub list_id: Option<String>,
+    /// For example `bulk` or `list`.
+    pub precedence: Option<String>,
+    /// For example `auto-generated` (RFC 3834).
+    pub auto_submitted: Option<String>,
 }
 
 /// Which accounts the message list shows.
@@ -263,6 +292,15 @@ pub struct UnifiedItem {
     pub has_attachments: bool,
     /// Start of the body text when the body is cached, else empty.
     pub snippet: String,
+    /// The conversation this item stands for, when the list groups
+    /// conversations (see `Store::threads`); `None` for a single message.
+    pub thread_id: Option<i64>,
+    /// Number of messages in the conversation (1 for a single message).
+    pub count: usize,
+    /// Who wrote in the conversation, oldest first, each person once;
+    /// the user's own addresses are `moi`. Just the sender for a single
+    /// message.
+    pub senders: Vec<String>,
 }
 
 /// Where one stored message lives on the server.

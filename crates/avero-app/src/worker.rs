@@ -1777,6 +1777,7 @@ mod tests {
             date: 1,
             seen: false,
             has_attachments: false,
+            ..Default::default()
         };
         store.insert_messages(inbox.id, &[message]).unwrap();
         let rows: Vec<i64> = store
@@ -2002,6 +2003,7 @@ mod tests {
             date: 1,
             seen: false,
             has_attachments: false,
+            ..Default::default()
         };
         store.insert_messages(inbox.id, &[message]).unwrap();
         let rows: Vec<i64> = store
