@@ -146,8 +146,9 @@ pub enum Job {
         access: AccessToken,
         reply: Reply,
     },
-    /// The account was renamed or its servers changed.
-    UpdateAccount(Account),
+    /// The account was renamed or its servers changed (boxed: an account
+    /// is much bigger than the other jobs).
+    UpdateAccount(Box<Account>),
     Sync {
         reply: Reply,
     },
@@ -935,7 +936,7 @@ impl<C: Connector> Worker<C> {
                 let _ = reply.send(Event::Done(result));
             }
             Job::UpdateAccount(account) => {
-                self.account = account;
+                self.account = *account;
                 self.settings_changed().await;
             }
             Job::Sync { reply } => self.request_sync(reply),
@@ -2298,7 +2299,7 @@ mod tests {
             .into_iter()
             .find(|a| a.id == fake.account)
             .unwrap();
-        fake.worker.send(Job::UpdateAccount(account));
+        fake.worker.send(Job::UpdateAccount(Box::new(account)));
         fake.server.watching.notified().await;
         assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 2);
         assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);

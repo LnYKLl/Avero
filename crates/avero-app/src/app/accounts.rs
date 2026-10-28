@@ -537,7 +537,7 @@ impl App {
             account.imap = new.imap.clone();
             account.smtp = new.smtp.clone();
             account.auth = new.auth;
-            self.send_job(id, Job::UpdateAccount(account.clone()));
+            self.send_job(id, Job::UpdateAccount(Box::new(account.clone())));
             if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
                 *slot = account;
             }
@@ -724,7 +724,7 @@ impl App {
             return self.toast(format!("Erreur de la base locale : {e}"), true);
         }
         account.name = name;
-        self.send_job(id, Job::UpdateAccount(account.clone()));
+        self.send_job(id, Job::UpdateAccount(Box::new(account.clone())));
         if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
             *slot = account;
         }
@@ -778,7 +778,7 @@ impl App {
             .map_err(|e| format!("Erreur de la base locale : {e}"))?;
         account.imap = imap;
         account.smtp = smtp;
-        self.send_job(id, Job::UpdateAccount(account.clone()));
+        self.send_job(id, Job::UpdateAccount(Box::new(account.clone())));
         if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
             *slot = account;
         }

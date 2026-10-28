@@ -35,7 +35,7 @@ pub struct Store {
 /// Columns read by `account_from_row`, in order.
 const ACCOUNT_COLUMNS: &str = "id, name, email, color_r, color_g, color_b,
      imap_host, imap_port, imap_user, imap_security,
-     smtp_host, smtp_port, smtp_user, smtp_security, auth";
+     smtp_host, smtp_port, smtp_user, smtp_security, auth, signature";
 
 /// Columns read by `folder_from_row`, in order.
 const FOLDER_COLUMNS: &str = "id, account_id, path, role, uid_validity, last_seen_uid";
@@ -120,6 +120,12 @@ impl Store {
             let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(include_str!("schema_v5.sql"))?;
             tx.execute_batch("PRAGMA user_version = 5;")?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(include_str!("schema_v6.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 6;")?;
             tx.commit()?;
         }
         Ok(())
@@ -210,6 +216,7 @@ impl Store {
             imap: new.imap,
             smtp: new.smtp,
             auth: new.auth,
+            signature: String::new(),
         })
     }
 
@@ -251,6 +258,15 @@ impl Store {
                 auth.as_str(),
                 id.0,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Changes the signature of an account (empty: none).
+    pub fn set_signature(&self, id: AccountId, signature: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE accounts SET signature = ?1 WHERE id = ?2",
+            params![signature, id.0],
         )?;
         Ok(())
     }
@@ -1128,6 +1144,7 @@ fn account_from_row(row: &rusqlite::Row) -> rusqlite::Result<Account> {
             security: Security::parse(&smtp_security),
         },
         auth: AuthKind::parse(&auth),
+        signature: row.get(15)?,
     })
 }
 
@@ -1422,6 +1439,23 @@ mod tests {
         assert_eq!(read.imap, imap);
         assert_eq!(read.smtp, smtp);
         assert_eq!(read.auth, AuthKind::OAuthGoogle);
+    }
+
+    #[test]
+    fn signature_is_kept_per_account() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let b = acct(&s, "b@x");
+        assert_eq!(s.accounts().unwrap()[0].signature, "");
+        s.set_signature(a, "Marie\nPâtisserie Durand").unwrap();
+        let imap = server("imap.new.com", 994, "u", Security::Tls);
+        // Changing the other settings keeps it.
+        s.update_account(a, "Perso", &imap, &imap, AuthKind::Password)
+            .unwrap();
+        let accounts = s.accounts().unwrap();
+        assert_eq!(accounts[0].signature, "Marie\nPâtisserie Durand");
+        assert_eq!(accounts[1].signature, "");
+        assert_eq!(accounts[1].id, b);
     }
 
     #[test]
@@ -2100,7 +2134,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let ids = thread_ids(&s);
         assert_eq!(ids["Un"], 1);
         assert_eq!(ids["Deux"], 3);
@@ -2120,8 +2154,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Takes a database back to version 4 (to test older migrations).
+    /// Takes a database back to version 4 (to test older migrations): undoes
+    /// versions 6 and 5.
     const UNDO_V5: &str = "
+        ALTER TABLE accounts DROP COLUMN signature;
         DROP INDEX messages_thread;
         DROP TABLE thread_links;
         ALTER TABLE messages DROP COLUMN in_reply_to;
@@ -2190,7 +2226,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

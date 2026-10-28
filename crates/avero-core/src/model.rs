@@ -175,6 +175,9 @@ pub struct Account {
     pub imap: ServerConfig,
     pub smtp: ServerConfig,
     pub auth: AuthKind,
+    /// Added under the messages written from this account, after a
+    /// `-- ` line (empty: none).
+    pub signature: String,
 }
 
 /// What a folder is used for.

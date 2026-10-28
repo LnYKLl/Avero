@@ -1096,10 +1096,11 @@ fn merged_accounts_secrets_are_erased() {
     }
     {
         // Rebuild what an old version could leave: a second "A@x.fr",
-        // in a version 3 database (without what versions 4 and 5 added).
+        // in a version 3 database (without what versions 4 to 6 added).
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP INDEX messages_thread;
+            "ALTER TABLE accounts DROP COLUMN signature;
+             DROP INDEX messages_thread;
              DROP TABLE thread_links;
              ALTER TABLE messages DROP COLUMN in_reply_to;
              ALTER TABLE messages DROP COLUMN refs;
