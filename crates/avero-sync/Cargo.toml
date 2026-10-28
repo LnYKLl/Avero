@@ -1,0 +1,9 @@
+[package]
+name = "avero-sync"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+avero-core = { path = "../avero-core" }
+mail-parser = "0.11"
