@@ -9,6 +9,7 @@ async-imap = { version = "0.12", default-features = false, features = ["runtime-
 avero-core = { path = "../avero-core" }
 futures = "0.3.34"
 html2text = "0.17.4"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-native-certs"] }
 mail-parser = "0.11"
 rustls-native-certs = "0.8"
 thiserror = "2"
