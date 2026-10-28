@@ -50,6 +50,8 @@ pub struct Settings {
     /// The local spam filter moves new mail it is sure about to the
     /// spam folder.
     pub spam_filter: bool,
+    /// The space shown (its database id); `None` for every account.
+    pub active_space: Option<i64>,
 }
 
 impl Default for Settings {
@@ -60,6 +62,7 @@ impl Default for Settings {
             group_threads: true,
             inbox_tabs: true,
             spam_filter: true,
+            active_space: None,
         }
     }
 }
@@ -117,6 +120,7 @@ mod tests {
             group_threads: false,
             inbox_tabs: false,
             spam_filter: false,
+            active_space: Some(3),
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -126,6 +130,7 @@ mod tests {
         assert!(text.contains("\"group_threads\": false"), "{text}");
         assert!(text.contains("\"inbox_tabs\": false"), "{text}");
         assert!(text.contains("\"spam_filter\": false"), "{text}");
+        assert!(text.contains("\"active_space\": 3"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

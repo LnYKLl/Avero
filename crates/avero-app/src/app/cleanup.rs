@@ -15,7 +15,8 @@ pub const CLEANUP_PAGE: usize = 50;
 /// The state of the "Grand nettoyage" screen.
 #[derive(Debug, Clone)]
 pub struct Cleanup {
-    /// The accounts counted (its own filter, apart from the mail list's).
+    /// The accounts counted (its own chips, apart from the mail list's;
+    /// inside the active space, see `App::cleanup_scope`).
     pub filter: AccountFilter,
     /// The senders loaded, most messages first.
     pub senders: Vec<SenderStats>,
@@ -66,7 +67,7 @@ impl App {
             CleanupMsg::TrashAll(addr) => {
                 let rows = self
                     .store
-                    .sender_rows(&addr, self.cleanup.filter)
+                    .sender_rows(&addr, self.cleanup_scope())
                     .unwrap_or_default();
                 if rows.is_empty() {
                     return Task::none();
@@ -98,7 +99,7 @@ impl App {
             CleanupMsg::Unsubscribe(addr) => {
                 let found = self
                     .store
-                    .latest_unsubscribable(&addr, self.cleanup.filter)
+                    .latest_unsubscribable(&addr, self.cleanup_scope())
                     .ok()
                     .flatten();
                 let name = self.sender_name(&addr);
@@ -147,7 +148,7 @@ impl App {
         // One more than asked tells whether another page follows.
         let mut senders = self
             .store
-            .sender_stats(self.cleanup.filter, limit + 1, 0)
+            .sender_stats(self.cleanup_scope(), limit + 1, 0)
             .unwrap_or_else(|e| {
                 eprintln!("Impossible de compter les expéditeurs : {e}");
                 Vec::new()

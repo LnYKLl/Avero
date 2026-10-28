@@ -1,13 +1,13 @@
-//! The settings page: accounts, notifications, reading, rules, the spam
-//! filter, appearance, about.
+//! The settings page: accounts, spaces, notifications, reading, rules,
+//! the spam filter, appearance, about.
 
 use super::{dot, hr, tip, to_color};
-use crate::app::{AccountMsg, AddMsg, App, Message, RuleMsg, move_name};
+use crate::app::{AccountMsg, AddMsg, App, Message, RuleMsg, SpaceMsg, move_name};
 use crate::icons::{self, Icon, Tone};
 use crate::settings::ThemeChoice;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::rules::Rule;
-use avero_core::{Account, AuthKind};
+use avero_core::{Account, AuthKind, Space};
 use avero_oauth::Provider;
 use iced::widget::{
     Column, button, column, container, row, scrollable, space, text, toggler, tooltip,
@@ -24,6 +24,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let page = column![
         text("Réglages").size(26).font(SEMIBOLD),
         section("Comptes", accounts(app)),
+        section("Espaces", spaces(app)),
         section("Connexion Google / Microsoft", oauth_clients(app)),
         section("Notifications", notifications(app)),
         section("Lecture", reading(app)),
@@ -79,6 +80,112 @@ fn accounts(app: &App) -> Element<'_, Message> {
         .padding([8, 12]),
     );
     list.into()
+}
+
+/// The spaces, in order, each with what can be done to it, then "Nouvel
+/// espace".
+fn spaces(app: &App) -> Element<'_, Message> {
+    let mut list = Column::new();
+    let last = app.spaces.len().saturating_sub(1);
+    for (index, space) in app.spaces.iter().enumerate() {
+        list = list.push(space_row(app, space, index == 0, index == last));
+        list = list.push(hr());
+    }
+    list.push(
+        row![
+            button(
+                row![
+                    icons::icon(Icon::Plus, 16.0, Tone::Accent),
+                    text("Nouvel espace").size(13).font(MEDIUM),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 8])
+            .on_press(Message::Space(SpaceMsg::New))
+            .style(theme::link),
+            text(
+                "Un espace regroupe des comptes (Perso, Pro…) : choisi au-dessus de la liste \
+                 (Ctrl+1, Ctrl+2…), il n'en montre que les mails."
+            )
+            .size(12)
+            .style(theme::muted)
+            .width(Fill),
+        ]
+        .spacing(12)
+        .padding([8, 12])
+        .align_y(Alignment::Center),
+    )
+    .into()
+}
+
+fn space_row<'a>(app: &'a App, space: &'a Space, first: bool, last: bool) -> Element<'a, Message> {
+    let id = space.id;
+    let color = super::list::space_color(space);
+    let names: Vec<&str> = app
+        .accounts
+        .iter()
+        .filter(|a| space.contains(a.id))
+        .map(|a| a.name.as_str())
+        .collect();
+    let accounts = if names.is_empty() {
+        "Aucun compte".to_string()
+    } else {
+        names.join(", ")
+    };
+    let action = |icon, label: &'a str, message: Option<SpaceMsg>, tone| {
+        tip(
+            button(icons::icon(icon, 16.0, tone))
+                .padding(7)
+                .on_press_maybe(message.map(Message::Space))
+                .style(theme::ghost),
+            label,
+            tooltip::Position::Bottom,
+        )
+    };
+    row![
+        container(icons::icon(
+            icons::space_icon(&space.icon),
+            16.0,
+            Tone::Fixed(iced::Color::WHITE)
+        ))
+        .center(30)
+        .style(theme::disc(color)),
+        column![
+            text(space.name.clone()).size(14).font(MEDIUM),
+            text(accounts).size(12).style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        action(
+            Icon::ChevronUp,
+            "Monter",
+            (!first).then_some(SpaceMsg::Move(id, -1)),
+            Tone::Text
+        ),
+        action(
+            Icon::ChevronDown,
+            "Descendre",
+            (!last).then_some(SpaceMsg::Move(id, 1)),
+            Tone::Text
+        ),
+        action(
+            Icon::Pencil,
+            "Modifier",
+            Some(SpaceMsg::Edit(id)),
+            Tone::Text
+        ),
+        action(
+            Icon::Trash,
+            "Supprimer",
+            Some(SpaceMsg::AskDelete(id)),
+            Tone::Danger
+        ),
+    ]
+    .spacing(10)
+    .padding([12, 18])
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn auth_label(auth: AuthKind) -> &'static str {

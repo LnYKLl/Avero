@@ -7,7 +7,9 @@
 //! (keyboard shortcuts), `accounts` (adding, fixing and removing
 //! accounts, worker events), `filters` (spam, the spam filter and the
 //! rules), `cleanup` ("Grand nettoyage"), `composer`, `drafts` (saving
-//! what is written) and `later` ("Plus tard" and "Programmés").
+//! what is written), `later` ("Plus tard" and "Programmés"), `spaces`
+//! (groups of accounts), `server_search` ("Chercher aussi sur le
+//! serveur") and `quick_reply` ("Répondre à tous…" under a conversation).
 
 mod accounts;
 mod cleanup;
@@ -18,7 +20,10 @@ mod keys;
 mod later;
 mod mail;
 mod places;
+mod quick_reply;
 mod selection;
+mod server_search;
+mod spaces;
 mod unsubscribe;
 
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
@@ -28,6 +33,9 @@ pub use filters::{RuleForm, RuleMsg, field_name, move_name};
 pub use keys::SHORTCUTS;
 pub use later::{LaterMsg, LaterPicker, LaterPurpose, scheduled_status};
 pub use places::{SenderView, tab_name};
+pub use quick_reply::{QUICK_REPLY_ID, QuickMsg, QuickReply};
+pub use server_search::{ServerSearch, server_search_result};
+pub use spaces::{SPACE_ICONS, SpaceForm, SpaceMsg};
 pub use unsubscribe::UnsubscribeOffer;
 
 use crate::account_form::{AccountForm, Field};
@@ -44,7 +52,7 @@ use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
     Account, AccountFilter, AccountId, Category, DraftRecord, FolderRole, Security, ServerConfig,
-    UnifiedItem,
+    Space, SpaceId, UnifiedItem,
 };
 use avero_oauth::Provider;
 use iced::widget::text_editor;
@@ -129,6 +137,13 @@ pub enum Overlay {
     },
     /// "Plus tard" or "Envoyer plus tard": when.
     Later(LaterPicker),
+    /// A space being created or changed.
+    SpaceEditor(SpaceForm),
+    /// "Supprimer l'espace", waiting for a confirmation.
+    ConfirmDeleteSpace {
+        space: SpaceId,
+        name: String,
+    },
 }
 
 /// "Changer le mot de passe".
@@ -406,6 +421,13 @@ pub enum Message {
     Rule(RuleMsg),
     Cleanup(CleanupMsg),
     Later(LaterMsg),
+    Space(SpaceMsg),
+    QuickReply(QuickMsg),
+    /// "Chercher aussi sur le serveur".
+    SearchServer,
+    /// What an account's server found for search number `.0` (see
+    /// `App::server_generation`).
+    ServerFound(u64, AccountId, Event),
 }
 
 /// Messages of the add-account card. `Debug` hides a typed password.
@@ -570,9 +592,19 @@ pub struct App {
     /// Unread lines of each tab of the inbox.
     pub(crate) tab_unread: HashMap<Category, usize>,
     pub(crate) filter: AccountFilter,
+    /// The spaces, in order, and the one shown (`None`: every account).
+    pub(crate) spaces: Vec<Space>,
+    pub(crate) space: Option<SpaceId>,
     pub(crate) search_text: String,
     pub(crate) search_query: Option<String>,
     search_generation: u64,
+    /// "Chercher aussi sur le serveur" for the search shown.
+    pub(crate) server_search: ServerSearch,
+    /// The rows the servers found, added to the local results.
+    pub(crate) server_rows: Vec<i64>,
+    /// Bumped by each search on the server, so late answers to an older
+    /// one are ignored.
+    server_generation: u64,
     pub(crate) items: Vec<UnifiedItem>,
     /// Accounts that have a trash folder (Supprimer needs one).
     pub(crate) trash_accounts: HashSet<AccountId>,
@@ -596,6 +628,11 @@ pub struct App {
     /// When `g` was pressed, waiting for the folder letter.
     pub(crate) pending_g: Option<Instant>,
     pub(crate) reading: Option<Reading>,
+    /// "Répondre à tous…" under the conversation read.
+    pub(crate) quick_reply: QuickReply,
+    /// Bumped when another conversation is opened (its quick reply
+    /// starts empty).
+    quick_generation: u64,
 
     pub(crate) composer: Option<Composer>,
     pub(crate) overlay: Option<Overlay>,
@@ -672,9 +709,14 @@ impl App {
             sender: None,
             tab_unread: HashMap::new(),
             filter: AccountFilter::All,
+            spaces: Vec::new(),
+            space: None,
             search_text: String::new(),
             search_query: None,
             search_generation: 0,
+            server_search: ServerSearch::Idle,
+            server_rows: Vec::new(),
+            server_generation: 0,
             items: Vec::new(),
             trash_accounts: HashSet::new(),
             archive_view: false,
@@ -686,6 +728,8 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             pending_g: None,
             reading: None,
+            quick_reply: QuickReply::default(),
+            quick_generation: 0,
             composer: None,
             overlay: None,
             oauth_cancel: None,
@@ -699,6 +743,16 @@ impl App {
         };
         app.read_oauth_clients();
         app.refresh_rules();
+        app.spaces = app.store.spaces().unwrap_or_else(|e| {
+            eprintln!("Impossible de lire les espaces : {e}");
+            Vec::new()
+        });
+        // The space shown last time, if it still exists.
+        app.space = app
+            .settings
+            .active_space
+            .map(SpaceId)
+            .filter(|id| app.spaces.iter().any(|s| s.id == *id));
         // Scheduled mail whose sending a stop cut short is not sent twice.
         if let Err(e) = app.store.interrupted_sends(later::INTERRUPTED) {
             eprintln!("Impossible de relire les envois programmés : {e}");
@@ -748,6 +802,15 @@ impl App {
             iced::time::every(AUTO_SYNC).map(|_| Message::AutoSync),
             iced::time::every(later::TICK).map(|_| Message::Later(LaterMsg::Tick)),
             keyboard::listen().filter_map(|event| match event {
+                // Ctrl+0 to Ctrl+9 change the space, read from the key's
+                // place: on a French keyboard the digits need Maj.
+                keyboard::Event::KeyPressed {
+                    physical_key,
+                    modifiers,
+                    ..
+                } if modifiers.command() && !modifiers.alt() && digit(physical_key).is_some() => {
+                    digit(physical_key).map(|n| Message::Space(SpaceMsg::Number(n)))
+                }
                 keyboard::Event::KeyPressed { key, modifiers, .. } => {
                     Some(Message::Key(key, modifiers))
                 }
@@ -843,6 +906,17 @@ impl App {
             Message::Rule(message) => self.update_rules(message),
             Message::Cleanup(message) => self.update_cleanup(message),
             Message::Later(message) => self.update_later(message),
+            Message::Space(message) => {
+                if self.overlay.is_some() && matches!(message, SpaceMsg::Number(_)) {
+                    return Task::none();
+                }
+                self.update_spaces(message)
+            }
+            Message::QuickReply(message) => self.update_quick_reply(message),
+            Message::SearchServer => self.search_on_server(),
+            Message::ServerFound(generation, _account, event) => {
+                self.server_found(generation, event)
+            }
             Message::FolderSelected(_)
             | Message::FilterSelected(_)
             | Message::SearchChanged(_)
@@ -930,7 +1004,7 @@ impl App {
                 .iter()
                 .any(|entry| matches!(entry.body, Body::Loading))
         });
-        overlay || loading
+        overlay || loading || self.server_search.is_running() || self.quick_reply.sending
     }
 
     pub fn is_demo(&self) -> bool {
@@ -1026,6 +1100,31 @@ impl App {
     }
 }
 
+/// The digit of a key of the top row or of the keypad (Ctrl+1 changes
+/// the space, whatever the keyboard layout).
+fn digit(key: keyboard::key::Physical) -> Option<u8> {
+    use keyboard::key::{Code, Physical};
+    let Physical::Code(code) = key else {
+        return None;
+    };
+    let digits = [
+        (Code::Digit0, Code::Numpad0),
+        (Code::Digit1, Code::Numpad1),
+        (Code::Digit2, Code::Numpad2),
+        (Code::Digit3, Code::Numpad3),
+        (Code::Digit4, Code::Numpad4),
+        (Code::Digit5, Code::Numpad5),
+        (Code::Digit6, Code::Numpad6),
+        (Code::Digit7, Code::Numpad7),
+        (Code::Digit8, Code::Numpad8),
+        (Code::Digit9, Code::Numpad9),
+    ];
+    digits
+        .iter()
+        .position(|(row, pad)| code == *row || code == *pad)
+        .map(|n| n as u8)
+}
+
 /// Waits; the timer is only created when the task first runs.
 pub(crate) async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
@@ -1052,6 +1151,10 @@ fn demo_answer(job: Job) {
         // Kept on this computer only.
         Job::SaveDraft { reply, .. } => {
             let _ = reply.send(Event::DraftSaved(Ok(None)));
+        }
+        // The demo searches its own data (see `demo::server_hits`).
+        Job::SearchServer { reply, .. } => {
+            let _ = reply.send(Event::Found(Ok(Default::default())));
         }
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
@@ -1081,5 +1184,9 @@ pub fn destination_label(destination: Destination) -> &'static str {
 mod filter_tests;
 #[cfg(test)]
 mod later_tests;
+#[cfg(test)]
+mod reply_tests;
+#[cfg(test)]
+mod space_tests;
 #[cfg(test)]
 mod tests;

@@ -3,8 +3,9 @@
 //! make conversations, some newsletters and notifications (for the tabs
 //! and "Se désinscrire"), a few starred ones, a few rules, spam (one of
 //! them caught by the local filter), two conversations put away for
-//! later, a draft and a mail scheduled for tomorrow, and no network at
-//! all.
+//! later, a draft and a mail scheduled for tomorrow, two spaces ("Perso"
+//! and "Pro"), and no network at all: "Chercher aussi sur le serveur"
+//! makes up an older message (see `server_hits`).
 //! `AVERO_DEMO=empty` starts with no account (welcome screen);
 //! `AVERO_DEMO=google-setup` (or `microsoft-setup`) also opens the
 //! connection assistant, as after a click on "Continuer avec Google".
@@ -16,6 +17,7 @@ use avero_core::{
     AccountFilter, AccountId, AuthKind, DraftFields, FolderRole, Listing, MessageHeaders,
     NewAccount, NewMessage, Security, ServerConfig,
 };
+use avero_sync::search::ServerHits;
 use chrono::{Local, TimeZone};
 
 /// What `AVERO_DEMO` asks for.
@@ -425,6 +427,69 @@ pub fn seed(store: &Store) {
         let _ = store.add_rule(&rule);
     }
     seed_later(store, &ids);
+    // "Perso" (with the cycling club) and "Pro".
+    let _ = store.add_space("Perso", "house", 2, &[ids[0], ids[2]]);
+    let _ = store.add_space("Pro", "briefcase", 0, &[ids[1]]);
+}
+
+/// "Chercher aussi sur le serveur" in the demo: an older message of the
+/// account's archives about `query`, as a server would find one (added
+/// once; searching again finds it again).
+pub fn server_hits(store: &Store, account: AccountId, query: &str) -> ServerHits {
+    let query = query.trim();
+    let Ok(folder) = store.upsert_folder(
+        account,
+        folder_for(FolderRole::Archive),
+        FolderRole::Archive,
+    ) else {
+        return ServerHits::default();
+    };
+    // One UID per search text, far above the seeded ones.
+    let uid = 100_000
+        + query
+            .chars()
+            .fold(0u32, |sum, c| sum.wrapping_mul(31).wrapping_add(c as u32))
+            % 100_000;
+    let mut added = 0;
+    if !matches!(store.known_uids(folder.id, &[uid]), Ok(known) if known.contains(&uid)) {
+        let date = Local::now().timestamp() - 400 * D * 60;
+        let message_id = format!("<demo-search-{}-{uid}@avero.demo>", account.0);
+        let subject = format!("{query} (message plus ancien)");
+        let body = "Mode démo : ce message imite un mail trouvé par la recherche sur le \
+                    serveur, qui n'était pas encore sur cet ordinateur.";
+        let raw = format!(
+            "From: Archives démo <archives@avero.demo>\r\nSubject: {subject}\r\n\
+             Date: {}\r\nMessage-ID: {message_id}\r\nMIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n\
+             {body}\r\n",
+            Local
+                .timestamp_opt(date, 0)
+                .single()
+                .map(|d| d.to_rfc2822())
+                .unwrap_or_default()
+        );
+        let message = NewMessage {
+            uid,
+            message_id: Some(message_id),
+            subject,
+            from_name: Some("Archives démo".to_string()),
+            from_addr: "archives@avero.demo".to_string(),
+            date,
+            seen: true,
+            size: Some(raw.len() as u32),
+            ..Default::default()
+        };
+        if store.insert_messages(folder.id, &[message]).is_ok() {
+            added = 1;
+            if let Ok(Some(row)) = store.message_row(folder.id, uid) {
+                let _ = store.put_body(row, raw.as_bytes(), body, false);
+            }
+        }
+    }
+    ServerHits {
+        added,
+        rows: store.rows_of_uids(folder.id, &[uid]).unwrap_or_default(),
+    }
 }
 
 /// Conversations snoozed by the demo ("Plus tard"), and until when.
@@ -737,6 +802,39 @@ mod tests {
         let scheduled = store.scheduled().unwrap();
         assert_eq!(scheduled.len(), 1);
         assert!(scheduled[0].send_at.unwrap() > Local::now().timestamp());
+    }
+
+    #[test]
+    fn demo_has_two_spaces() {
+        let store = seeded_store();
+        let spaces = store.spaces().unwrap();
+        let names: Vec<&str> = spaces.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Perso", "Pro"]);
+        assert_eq!(spaces[0].accounts.len(), 2);
+        assert_eq!(spaces[1].accounts.len(), 1);
+    }
+
+    #[test]
+    fn demo_server_search_adds_one_older_message_once() {
+        let store = seeded_store();
+        let account = store.accounts().unwrap()[1].id;
+        let first = server_hits(&store, account, "budget");
+        assert_eq!(first.added, 1);
+        assert_eq!(first.rows.len(), 1);
+        let again = server_hits(&store, account, "budget");
+        assert_eq!(again.added, 0);
+        assert_eq!(again.rows, first.rows);
+        let found = store
+            .search_with("budget", None, AccountFilter::All, &first.rows, 50)
+            .unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|i| i.subject == "budget (message plus ancien)")
+        );
+        let (raw, _) = store.body(first.rows[0]).unwrap().unwrap();
+        let parsed = avero_sync::parse::parse_body(&raw);
+        assert!(parsed.text.contains("Mode démo"), "{}", parsed.text);
     }
 
     #[test]

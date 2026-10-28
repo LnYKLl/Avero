@@ -6,7 +6,7 @@ use crate::worker::ErrorKind;
 use avero_core::{NewAccount, NewMessage, ServerConfig};
 
 /// Adds an account with an inbox holding `count` messages.
-fn add_account_with_mail(store: &Store, email: &str, count: u32) -> AccountId {
+pub(super) fn add_account_with_mail(store: &Store, email: &str, count: u32) -> AccountId {
     let server = ServerConfig {
         host: "imap.example.com".to_string(),
         port: 993,
@@ -45,7 +45,7 @@ fn add_account_with_mail(store: &Store, email: &str, count: u32) -> AccountId {
     account.id
 }
 
-fn app_with(setup: impl FnOnce(&Store)) -> App {
+pub(super) fn app_with(setup: impl FnOnce(&Store)) -> App {
     let store = Store::open_in_memory().unwrap();
     setup(&store);
     let (app, _task) = App::new(store, Backend::Demo, Settings::default(), None);
@@ -1096,10 +1096,12 @@ fn merged_accounts_secrets_are_erased() {
     }
     {
         // Rebuild what an old version could leave: a second "A@x.fr",
-        // in a version 3 database (without what versions 4 to 9 added).
+        // in a version 3 database (without what versions 4 to 10 added).
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE draft_files;
+            "DROP TABLE space_accounts;
+             DROP TABLE spaces;
+             DROP TABLE draft_files;
              DROP TABLE drafts;
              DROP TABLE snoozes;
              DROP TABLE spam_learned;

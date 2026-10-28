@@ -115,6 +115,7 @@ impl App {
     /// Shows the first page for the current folder, filter and search,
     /// with nothing selected.
     pub(super) fn load_first_page(&mut self) {
+        self.forget_stale_server_search();
         self.selected = None;
         self.clear_checked();
         self.reading = None;
@@ -191,10 +192,13 @@ impl App {
             return Vec::new();
         }
         let result = match &self.search_query {
-            Some(query) => self.store.search(query, None, self.filter, limit),
+            Some(query) => {
+                self.store
+                    .search_with(query, None, self.scope(), &self.server_rows, limit)
+            }
             None => self.store.list(
                 &self.listing(),
-                self.filter,
+                self.scope(),
                 self.lines_are_threads(),
                 limit,
                 0,
@@ -243,7 +247,7 @@ impl App {
                 .map(|category| {
                     let count = self.store.list_unread(
                         &Listing::Tab(category),
-                        self.filter,
+                        self.scope(),
                         self.settings.group_threads,
                     );
                     (category, count.unwrap_or(0))
@@ -300,6 +304,11 @@ impl App {
         let Some(item) = self.items.get(index).cloned() else {
             return Task::none();
         };
+        // A quick reply belongs to the conversation it was typed under.
+        if self.reading.as_ref().is_none_or(|r| r.rows != item.row_ids) {
+            self.quick_reply = super::QuickReply::default();
+            self.quick_generation += 1;
+        }
         self.selected = Some(item.row_ids.clone());
         if item.row_ids.is_empty() {
             return Task::none();
@@ -307,7 +316,7 @@ impl App {
         let mut messages = match item.thread_id {
             Some(thread) if item.count > 1 => self
                 .store
-                .thread_messages(thread, self.reading_role(), self.filter)
+                .thread_messages(thread, self.reading_role(), self.scope())
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
@@ -736,7 +745,18 @@ impl App {
         let Some(reading) = &self.reading else {
             return Task::none();
         };
-        let entry = reading.focused();
+        self.open_answer(reading.focus, mode, "")
+    }
+
+    /// Opens the composer to answer reader entry `index`; `typed` (from
+    /// the quick reply) goes first, above the signature and the quote.
+    pub(super) fn open_answer(&mut self, index: usize, mode: Mode, typed: &str) -> Task<Message> {
+        let Some(reading) = &self.reading else {
+            return Task::none();
+        };
+        let Some(entry) = reading.entries.get(index) else {
+            return Task::none();
+        };
         let Body::Ready { opened, .. } = &entry.body else {
             return Task::none();
         };
@@ -774,12 +794,14 @@ impl App {
         if self.composer.is_some() {
             return close;
         }
-        self.composer = Some(super::Composer::from_fields(
-            from,
-            fields,
-            attachments,
-            &signature,
-        ));
+        let mut composer = super::Composer::from_fields(from, fields, attachments, &signature);
+        if !typed.is_empty() {
+            let body = format!("{typed}{}", composer.body.text());
+            composer.body = text_editor::Content::with_text(&body);
+            composer.dirty = true;
+            composer.edited = true;
+        }
+        self.composer = Some(composer);
         self.screen = super::Screen::Mail;
         let target = if mode == Mode::Forward {
             super::composer::TO_ID
@@ -793,7 +815,11 @@ impl App {
     pub(super) fn default_sender(&self) -> Option<AccountId> {
         match self.filter {
             AccountFilter::Only(id) if self.account(id).is_some() => Some(id),
-            _ => self.accounts.first().map(|a| a.id),
+            _ => self
+                .space_accounts()
+                .first()
+                .map(|a| a.id)
+                .or(self.accounts.first().map(|a| a.id)),
         }
     }
 

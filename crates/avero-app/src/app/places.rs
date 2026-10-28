@@ -153,7 +153,7 @@ impl App {
         if !star {
             let others = self
                 .store
-                .starred_in_threads(&rows, self.filter)
+                .starred_in_threads(&rows, self.scope())
                 .unwrap_or_default();
             rows.extend(others);
         }

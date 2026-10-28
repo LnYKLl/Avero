@@ -1,21 +1,21 @@
 //! Small dialogs: password, rename, signature, delete confirmation,
 //! reconnection, unsubscribe confirmation, keyboard shortcuts, the rule
 //! editor, the confirmations of "Appliquer maintenant" and "Tout
-//! mettre à la corbeille", and the times of "Plus tard" and "Envoyer plus
-//! tard".
+//! mettre à la corbeille", the times of "Plus tard" and "Envoyer plus
+//! tard", and the space editor.
 
 use super::add_account::{error_line, spinner_line};
 use super::{field_label, icon_button};
 use crate::app::{
     AccountMsg, App, CleanupMsg, LaterMsg, LaterPicker, LaterPurpose, Message, Overlay,
-    PasswordDialog, RuleForm, RuleMsg, ServerField, ServersForm, UnsubscribeOffer, field_name,
-    move_name,
+    PasswordDialog, RuleForm, RuleMsg, SPACE_ICONS, ServerField, ServersForm, SpaceForm, SpaceMsg,
+    UnsubscribeOffer, field_name, move_name,
 };
-use crate::icons::Icon;
+use crate::icons::{self, Icon, Tone};
 use crate::later;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
-use avero_core::Security;
 use avero_core::rules::{RuleField, RuleMove};
+use avero_core::{AccountColor, Security};
 use iced::widget::{
     Column, button, checkbox, column, container, row, space, text, text_editor, text_input,
 };
@@ -40,7 +40,117 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::ConfirmApplyRule { name, count, .. } => confirm_apply_rule(name, *count),
         Overlay::ConfirmTrashSender { name, rows, .. } => confirm_trash_sender(name, rows.len()),
         Overlay::Later(picker) => later_picker(app, picker),
+        Overlay::SpaceEditor(form) => space_editor(app, form),
+        Overlay::ConfirmDeleteSpace { name, .. } => confirm_delete_space(name),
     }
+}
+
+/// A space: its name, icon, colour and accounts.
+fn space_editor<'a>(app: &'a App, form: &'a SpaceForm) -> Element<'a, Message> {
+    let color = super::to_color(AccountColor::palette(form.color));
+    let name = text_input("Par exemple : Perso, Pro", &form.name)
+        .on_input(|v| Message::Space(SpaceMsg::Name(v)))
+        .on_submit(Message::Space(SpaceMsg::Save))
+        .padding([8, 10])
+        .size(13)
+        .style(theme::input);
+
+    let mut icons_row = row![].spacing(4).align_y(Alignment::Center);
+    for name in SPACE_ICONS {
+        let selected = form.icon == name;
+        let tone = if selected {
+            Tone::Fixed(color)
+        } else {
+            Tone::Muted
+        };
+        icons_row = icons_row.push(
+            button(icons::icon(icons::space_icon(name), 18.0, tone))
+                .padding(7)
+                .on_press(Message::Space(SpaceMsg::Icon(name.to_string())))
+                .style(theme::chip(selected)),
+        );
+    }
+
+    let mut colors = row![].spacing(6).align_y(Alignment::Center);
+    for index in 0..AccountColor::COUNT {
+        let selected = form.color == index;
+        let swatch = super::to_color(AccountColor::palette(index));
+        let mark: Element<'a, Message> = if selected {
+            icons::icon(Icon::Check, 14.0, Tone::Fixed(iced::Color::WHITE))
+        } else {
+            space().into()
+        };
+        colors = colors.push(
+            button(container(mark).center(22).style(theme::disc(swatch)))
+                .padding(2)
+                .on_press(Message::Space(SpaceMsg::Color(index)))
+                .style(theme::ghost),
+        );
+    }
+
+    let mut accounts = Column::new().spacing(8);
+    for account in &app.accounts {
+        let id = account.id;
+        accounts = accounts.push(
+            row![
+                checkbox(form.accounts.contains(&id))
+                    .on_toggle(move |on| Message::Space(SpaceMsg::Account(id, on)))
+                    .size(15),
+                super::dot(super::to_color(account.color), 8.0),
+                text(account.name.clone()).size(13).font(MEDIUM),
+                text(account.email.clone()).size(12).style(theme::muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    let mut body = Column::new()
+        .spacing(14)
+        .push(column![field_label("Nom"), name].spacing(6))
+        .push(column![field_label("Icône"), icons_row.wrap()].spacing(6))
+        .push(column![field_label("Couleur"), colors.wrap()].spacing(6))
+        .push(column![field_label("Comptes"), accounts].spacing(8))
+        .push(
+            text(
+                "Un compte peut faire partie de plusieurs espaces. L'espace choisi limite la \
+                 liste, les compteurs et la recherche à ses comptes.",
+            )
+            .size(12)
+            .style(theme::muted),
+        );
+    if let Some(error) = &form.error {
+        body = body.push(error_line(error));
+    }
+    body = body.push(buttons(
+        "Enregistrer",
+        Some(Message::Space(SpaceMsg::Save)),
+        theme::primary,
+    ));
+    let title = if form.id.is_some() {
+        "Modifier l'espace"
+    } else {
+        "Nouvel espace"
+    };
+    card_width(title, body.into(), 520.0)
+}
+
+fn confirm_delete_space<'a>(name: &'a str) -> Element<'a, Message> {
+    let body = column![
+        text(format!("Supprimer l'espace « {name} » ?"))
+            .size(14)
+            .font(MEDIUM),
+        text("Ses comptes et leurs mails restent dans Avero ; seul le regroupement disparaît.")
+            .size(13)
+            .style(theme::muted),
+        buttons(
+            "Supprimer",
+            Some(Message::Space(SpaceMsg::ConfirmDelete)),
+            theme::danger,
+        ),
+    ]
+    .spacing(14);
+    card("Supprimer l'espace", body.into())
 }
 
 /// "Plus tard" and "Envoyer plus tard": the ready-made times, each with

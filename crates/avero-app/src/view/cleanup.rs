@@ -81,7 +81,7 @@ fn account_chips(app: &App) -> Element<'_, Message> {
     let mut chips = Row::new()
         .spacing(5)
         .push(chip("Tous".to_string(), None, AccountFilter::All));
-    for account in &app.accounts {
+    for account in app.space_accounts() {
         chips = chips.push(chip(
             account.name.clone(),
             Some(to_color(account.color)),

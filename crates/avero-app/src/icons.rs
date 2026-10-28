@@ -64,10 +64,18 @@ pub enum Icon {
     Logo,
     Google,
     Microsoft,
+    // The icons a space can take (see `space_icon`), and "Tous".
+    House,
+    Briefcase,
+    Heart,
+    Bike,
+    BookOpen,
+    /// "Tous": every account, whatever the space.
+    Layers,
 }
 
 /// All icons, in the order of `bytes`; used to build the handle cache.
-const ALL: [Icon; 46] = [
+const ALL: [Icon; 52] = [
     Icon::AlarmClock,
     Icon::Archive,
     Icon::CalendarClock,
@@ -114,6 +122,12 @@ const ALL: [Icon; 46] = [
     Icon::Logo,
     Icon::Google,
     Icon::Microsoft,
+    Icon::House,
+    Icon::Briefcase,
+    Icon::Heart,
+    Icon::Bike,
+    Icon::BookOpen,
+    Icon::Layers,
 ];
 
 /// The SVG source of an icon.
@@ -165,6 +179,27 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Logo => include_bytes!("../assets/logo/avero-icon.svg"),
         Icon::Google => include_bytes!("../assets/logo/google.svg"),
         Icon::Microsoft => include_bytes!("../assets/logo/microsoft.svg"),
+        Icon::House => include_bytes!("../assets/icons/house.svg"),
+        Icon::Briefcase => include_bytes!("../assets/icons/briefcase.svg"),
+        Icon::Heart => include_bytes!("../assets/icons/heart.svg"),
+        Icon::Bike => include_bytes!("../assets/icons/bike.svg"),
+        Icon::BookOpen => include_bytes!("../assets/icons/book-open.svg"),
+        Icon::Layers => include_bytes!("../assets/icons/layers.svg"),
+    }
+}
+
+/// The icon of a space, by the name stored with it (see
+/// `app::SPACE_ICONS`); an unknown name gets the people icon.
+pub fn space_icon(name: &str) -> Icon {
+    match name {
+        "house" => Icon::House,
+        "briefcase" => Icon::Briefcase,
+        "heart" => Icon::Heart,
+        "star" => Icon::Star,
+        "bike" => Icon::Bike,
+        "book-open" => Icon::BookOpen,
+        "globe" => Icon::Globe,
+        _ => Icon::Users,
     }
 }
 
@@ -303,6 +338,14 @@ mod tests {
             rotated_handle(Icon::Loader, 0.5),
             rotated_handle(Icon::Loader, 0.52)
         );
+    }
+
+    #[test]
+    fn every_space_icon_is_drawn() {
+        for name in crate::app::SPACE_ICONS {
+            let icon = space_icon(name);
+            assert!(name == "users" || icon != Icon::Users, "{name}");
+        }
     }
 
     #[test]

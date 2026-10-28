@@ -1,15 +1,20 @@
-//! The list column: title, search, account chips, folders, the tabs of
-//! the inbox, account problems, then the messages (or, in "Programmés",
-//! the mail waiting to be sent).
+//! The list column: title, search, spaces and account chips, folders,
+//! the tabs of the inbox, account problems, then the messages (or, in
+//! "Programmés", the mail waiting to be sent). Under search results,
+//! "Chercher aussi sur le serveur".
 
 use super::{dot, ellipsize, find_account, format_date, hr, shared_avatar, tip, to_color};
-use crate::app::{AccountMsg, App, LaterMsg, Message, PAGE, SEARCH_ID, scheduled_status, tab_name};
+use crate::app::{
+    AccountMsg, App, LaterMsg, Message, PAGE, SEARCH_ID, ServerSearch, SpaceMsg, scheduled_status,
+    server_search_result, tab_name,
+};
 use crate::icons::{self, Icon, Tone};
 use crate::later;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use crate::worker::ErrorKind;
 use avero_core::{
-    Account, AccountFilter, AuthKind, Category, DraftRecord, FolderRole, UnifiedItem,
+    Account, AccountColor, AccountFilter, AuthKind, Category, DraftRecord, FolderRole, Space,
+    UnifiedItem,
 };
 use chrono::{DateTime, Local};
 use iced::widget::text::Wrapping;
@@ -42,12 +47,14 @@ pub fn folder_name(role: FolderRole) -> &'static str {
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let mut header = Column::new()
-        .push(title_row(app))
-        .push(search(app))
-        .push(account_chips(app))
-        .push(folders(app))
         .spacing(14)
-        .padding(Padding::new(20.0).bottom(14));
+        .padding(Padding::new(20.0).bottom(14))
+        .push(title_row(app))
+        .push(search(app));
+    if !app.spaces.is_empty() {
+        header = header.push(space_chips(app));
+    }
+    header = header.push(account_chips(app)).push(folders(app));
     if app.tabs_shown() {
         header = header.push(tabs(app));
     }
@@ -79,10 +86,14 @@ fn title_row(app: &App) -> Element<'_, Message> {
         (None, None) if app.starred => "Favoris".to_string(),
         (None, None) => folder_name(app.folder).to_string(),
     };
-    let scope = match app.filter {
+    let scope = match app.scope() {
         AccountFilter::All => "Tous les comptes".to_string(),
         AccountFilter::Only(id) => find_account(&app.accounts, id)
             .map(|a| a.email.clone())
+            .unwrap_or_default(),
+        AccountFilter::Space(_) => app
+            .active_space()
+            .map(|space| format!("Espace {}", space.name))
             .unwrap_or_default(),
     };
     let syncing = app.is_syncing();
@@ -170,8 +181,72 @@ fn search(app: &App) -> Element<'_, Message> {
     stack(layers).width(Fill).into()
 }
 
+/// The colour of a space (an index in the accounts' palette).
+pub fn space_color(space: &Space) -> iced::Color {
+    to_color(AccountColor::palette(space.color))
+}
+
+/// "Tous" and the spaces, each with its icon and its unread mail (Ctrl+0,
+/// Ctrl+1…).
+fn space_chips(app: &App) -> Element<'_, Message> {
+    let chip =
+        |icon: Element<'static, Message>, label: String, unread: usize, selected: bool, space| {
+            let mut content = Row::new()
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .push(icon)
+                .push(text(label).size(13).font(MEDIUM));
+            if unread > 0 {
+                content = content.push(text(unread.to_string()).size(12).style(theme::muted));
+            }
+            button(content)
+                .padding([5, 10])
+                .on_press(Message::Space(SpaceMsg::Select(space)))
+                .style(theme::chip(selected))
+        };
+    let mut chips = Row::new().spacing(5).push(tip(
+        chip(
+            icons::icon(Icon::Layers, 14.0, Tone::Muted),
+            "Tous".to_string(),
+            app.space_unread(None),
+            app.space.is_none(),
+            None,
+        ),
+        "Tous les comptes (Ctrl+0)",
+        tooltip::Position::Bottom,
+    ));
+    for (index, space) in app.spaces.iter().enumerate() {
+        let icon = icons::icon(
+            icons::space_icon(&space.icon),
+            14.0,
+            Tone::Fixed(space_color(space)),
+        );
+        let chip = chip(
+            icon,
+            space.name.clone(),
+            app.space_unread(Some(space.id)),
+            app.space == Some(space.id),
+            Some(space.id),
+        );
+        chips = if index < 9 {
+            chips.push(tip(
+                chip,
+                format!("Espace {} (Ctrl+{})", space.name, index + 1),
+                tooltip::Position::Bottom,
+            ))
+        } else {
+            chips.push(chip)
+        };
+    }
+    scrollable(chips)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(0).scroller_width(0),
+        ))
+        .into()
+}
+
 fn account_chips(app: &App) -> Element<'_, Message> {
-    let total: usize = app.unread.values().sum();
+    let total = app.space_unread(app.space);
     let mut chips = Row::new().spacing(5).push(chip(
         None,
         "Tous",
@@ -179,7 +254,7 @@ fn account_chips(app: &App) -> Element<'_, Message> {
         app.filter == AccountFilter::All,
         AccountFilter::All,
     ));
-    for account in &app.accounts {
+    for account in app.space_accounts() {
         let only = AccountFilter::Only(account.id);
         let count = app.unread.get(&account.id).copied().unwrap_or(0);
         let chip = chip(
@@ -235,7 +310,7 @@ fn folders(app: &App) -> Element<'_, Message> {
             .push(icons::icon(icon, 16.0, tone));
         if selected {
             content = content.push(text(name).size(13).font(MEDIUM));
-            let unread: usize = app.unread.values().sum();
+            let unread = app.space_unread(app.space);
             if role == FolderRole::Inbox && unread > 0 {
                 content = content.push(
                     container(text(unread.to_string()).size(11).font(SEMIBOLD))
@@ -470,6 +545,9 @@ fn messages(app: &App) -> Element<'_, Message> {
             .center_x(Fill),
         );
     }
+    if app.search_query.is_some() {
+        lines = lines.push(server_search(app));
+    }
     scrollable(lines)
         .height(Fill)
         .style(theme::scrollbar)
@@ -480,6 +558,52 @@ fn messages(app: &App) -> Element<'_, Message> {
                 .margin(2),
         ))
         .into()
+}
+
+/// Under search results: "Chercher aussi sur le serveur", then how the
+/// search on the servers goes.
+fn server_search(app: &App) -> Element<'_, Message> {
+    let content: Element<'_, Message> = match &app.server_search {
+        ServerSearch::Idle => button(
+            row![
+                icons::icon(Icon::Globe, 15.0, Tone::Accent),
+                text("Chercher aussi sur le serveur").size(13).font(MEDIUM),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 14])
+        .on_press(Message::SearchServer)
+        .style(theme::secondary)
+        .into(),
+        ServerSearch::Running { .. } => row![
+            icons::icon_rotated(Icon::Loader, 15.0, Tone::Accent, app.spinner),
+            text("Recherche sur le serveur…")
+                .size(13)
+                .style(theme::muted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into(),
+        ServerSearch::Done { added, failed, .. } => row![
+            icons::icon(
+                if *failed > 0 {
+                    Icon::Alert
+                } else {
+                    Icon::Check
+                },
+                15.0,
+                Tone::Muted
+            ),
+            text(server_search_result(*added, *failed))
+                .size(13)
+                .style(theme::muted),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into(),
+    };
+    container(content).padding(12).center_x(Fill).into()
 }
 
 fn empty(app: &App) -> Element<'_, Message> {
@@ -507,22 +631,24 @@ fn empty(app: &App) -> Element<'_, Message> {
         None if app.tabs_shown() => ("Aucun message".to_string(), "Cet onglet est vide."),
         None => ("Aucun message".to_string(), "Ce dossier est vide."),
     };
-    container(
-        column![
-            icons::icon(Icon::Inbox, 32.0, Tone::Muted),
-            text(title).size(15).font(SEMIBOLD),
-            text(detail)
-                .size(13)
-                .style(theme::muted)
-                .align_x(Alignment::Center),
-        ]
-        .spacing(10)
-        .align_x(Alignment::Center)
-        .max_width(280),
-    )
-    .center_x(Fill)
-    .padding(Padding::new(48.0).left(24).right(24))
-    .into()
+    let mut page = column![
+        icons::icon(Icon::Inbox, 32.0, Tone::Muted),
+        text(title).size(15).font(SEMIBOLD),
+        text(detail)
+            .size(13)
+            .style(theme::muted)
+            .align_x(Alignment::Center),
+    ]
+    .spacing(10)
+    .align_x(Alignment::Center)
+    .max_width(280);
+    if app.search_query.is_some() {
+        page = page.push(server_search(app));
+    }
+    container(page)
+        .center_x(Fill)
+        .padding(Padding::new(48.0).left(24).right(24))
+        .into()
 }
 
 /// Who wrote the line: the sender of a message, or the people of a

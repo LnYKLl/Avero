@@ -264,6 +264,21 @@ pub fn answer(parsed: &ParsedBody, mode: Mode, own: &[String]) -> Fields {
     }
 }
 
+/// The fields of a quick reply ("Répondre à tous…" under a
+/// conversation): a reply to all of `parsed` whose body is only what was
+/// typed, then the signature; no quote (the conversation is there).
+pub fn quick_reply(parsed: &ParsedBody, own: &[String], text: &str, signature: &str) -> Fields {
+    let fields = answer(parsed, Mode::ReplyAll, own);
+    let text = text.trim_end();
+    let block = signature_block(signature);
+    let body = if block.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text}\n\n{block}")
+    };
+    Fields { body, ..fields }
+}
+
 /// The signature as a draft shows it: the `-- ` line, then the text
 /// (empty when the account has none).
 pub fn signature_block(signature: &str) -> String {
@@ -591,6 +606,23 @@ mod tests {
         let fields = answer(&original(), Mode::ReplyAll, &["moi@ex.com".into()]);
         assert_eq!(fields.to, "Marie Durand <marie@ex.com>, Paul <paul@ex.com>");
         assert_eq!(fields.cc, "zoe@ex.com");
+    }
+
+    #[test]
+    fn quick_reply_answers_everyone_without_quote() {
+        let own = ["moi@ex.com".to_string()];
+        let fields = quick_reply(&original(), &own, "D'accord, à jeudi !\n\n", "Camille");
+        assert_eq!(fields.to, "Marie Durand <marie@ex.com>, Paul <paul@ex.com>");
+        assert_eq!(fields.cc, "zoe@ex.com");
+        assert_eq!(fields.subject, "Re: Réunion jeudi");
+        assert_eq!(fields.in_reply_to.as_deref(), Some("<b@ex.com>"));
+        assert_eq!(fields.references.as_deref(), Some("<a@ex.com> <b@ex.com>"));
+        assert_eq!(fields.body, "D'accord, à jeudi !\n\n-- \nCamille");
+        assert!(!fields.body.contains("a écrit"));
+        assert!(!fields.body.contains("> "));
+        // No signature: just the text.
+        let plain = quick_reply(&original(), &own, "Merci", "  ");
+        assert_eq!(plain.body, "Merci");
     }
 
     #[test]

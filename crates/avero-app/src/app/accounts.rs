@@ -58,6 +58,8 @@ impl App {
             Event::Sent(result) => self.sent(result),
             // Answered through `LaterMsg::DraftSaved`.
             Event::DraftSaved(_) => Task::none(),
+            // Answered through `Message::ServerFound`.
+            Event::Found(_) => Task::none(),
             Event::NewMail(arrivals) => self.new_mail(account, arrivals),
             Event::Gone => {
                 let status = self.status.entry(account).or_default();
@@ -107,6 +109,7 @@ impl App {
             | Event::Done(_)
             | Event::Sent(_)
             | Event::DraftSaved(_)
+            | Event::Found(_)
             | Event::Gone => Task::none(),
         }
     }
@@ -608,6 +611,11 @@ impl App {
         }
         self.overlay = None;
         self.accounts.push(account.clone());
+        // Added while a space is shown: it joins that space, so it shows.
+        if let Some(space) = self.space {
+            let _ = self.store.set_space_account(space, account.id, true);
+            self.spaces = self.store.spaces().unwrap_or_default();
+        }
         let watching = self.start_worker(&account);
         self.screen = super::Screen::Mail;
         self.reload();
@@ -943,6 +951,11 @@ impl App {
         if self.filter == AccountFilter::Only(id) {
             self.filter = AccountFilter::All;
         }
+        if self.cleanup.filter == AccountFilter::Only(id) {
+            self.cleanup.filter = AccountFilter::All;
+        }
+        // The database took it out of its spaces.
+        self.spaces = self.store.spaces().unwrap_or_default();
         if self.composer.as_ref().is_some_and(|c| c.from == id) {
             self.composer = None;
         }

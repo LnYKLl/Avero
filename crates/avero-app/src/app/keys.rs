@@ -1,8 +1,10 @@
 //! Keyboard shortcuts.
 //!
 //! The keyboard subscription only receives the keys no widget used: a
-//! focused text field (search, composer, dialog) keeps the letters typed
-//! in it, so the one-key shortcuts never fire while typing. As a second
+//! focused text field (search, composer, quick reply, dialog) keeps the
+//! letters typed in it, so the one-key shortcuts never fire while typing.
+//! Ctrl+0 to Ctrl+9 (spaces) are read by their key's place, before
+//! this (see `App::subscription`). As a second
 //! guard they are also off while the composer or a dialog is open, where
 //! a click outside the fields would otherwise give them back.
 
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 pub const G_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Every shortcut, as the help (`?`) lists them: keys, then what they do.
-pub const SHORTCUTS: [(&str, &str); 19] = [
+pub const SHORTCUTS: [(&str, &str); 20] = [
     ("J  ou  ↓", "Ligne suivante"),
     ("K  ou  ↑", "Ligne précédente"),
     ("Entrée", "Ouvrir"),
@@ -33,6 +35,10 @@ pub const SHORTCUTS: [(&str, &str); 19] = [
     ("X", "Sélectionner la ligne"),
     ("Ctrl+clic, Maj+clic", "Sélectionner plusieurs lignes"),
     ("/  ou  Ctrl+F", "Rechercher"),
+    (
+        "Ctrl+1 … Ctrl+9, Ctrl+0",
+        "Changer d'espace, ou tous les comptes",
+    ),
     (
         "G puis I, S, D, A, T",
         "Réception, Envoyés, Brouillons, Archives, Corbeille",

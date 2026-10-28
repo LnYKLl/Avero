@@ -22,6 +22,7 @@ use avero_core::{
 };
 use avero_sync::imap::{ImapSource, ImapWatch};
 use avero_sync::parse::{guarded, parse_body};
+use avero_sync::search::{SEARCH_LIMIT, ServerHits, search_server};
 use avero_sync::smtp::{self, Outgoing, SendError};
 use avero_sync::source::{MailSource, SyncError};
 use avero_sync::sync::{Arrival, sync_account};
@@ -147,6 +148,8 @@ pub enum Event {
     /// Unread messages that just came into the inbox, to notify. Sent
     /// once per sync, to the [`Job::Watch`] subscriber only.
     NewMail(Vec<Arrival>),
+    /// A search on the server is done (see [`Job::SearchServer`]).
+    Found(Result<ServerHits, String>),
     /// The worker is not running any more.
     Gone,
 }
@@ -217,6 +220,16 @@ pub enum Job {
     /// thrown away, or saved on another account).
     DropDraft {
         copy: DraftCopy,
+        reply: Reply,
+    },
+    /// "Chercher aussi sur le serveur": searches the inbox, sent,
+    /// archive and "all messages" folders for `query` and stores the
+    /// messages found that were missing (see `search::search_server`).
+    /// Stops once `cancel` gets a value or its sender is dropped (the
+    /// search changed): no `Found` then, the stream just ends.
+    SearchServer {
+        query: String,
+        cancel: oneshot::Receiver<()>,
         reply: Reply,
     },
     /// Starts watching the inbox. `reply` then gets what the worker does
@@ -383,6 +396,9 @@ fn refuse(job: Job, message: &str) {
         }
         Job::SaveDraft { reply, .. } => {
             let _ = reply.send(Event::DraftSaved(Err(message.to_string())));
+        }
+        Job::SearchServer { reply, .. } => {
+            let _ = reply.send(Event::Found(Err(message.to_string())));
         }
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
@@ -1039,6 +1055,16 @@ impl<C: Connector> Worker<C> {
                 let result = self.drop_draft(&copy.folder, &[copy.uid]).await;
                 let _ = reply.send(Event::Done(result));
             }
+            Job::SearchServer {
+                query,
+                cancel,
+                reply,
+            } => {
+                // Cancelled: the reply is dropped without a word.
+                if let Some(result) = self.search_server(&query, cancel).await {
+                    let _ = reply.send(Event::Found(result.map_err(|e| e.message)));
+                }
+            }
             Job::Shutdown { delete_secret } => {
                 // The sync and watcher threads must be done with the
                 // secret before it is deleted (a refresh could store a
@@ -1112,6 +1138,25 @@ impl<C: Connector> Worker<C> {
                 }
             }
             None => self.start_sync(vec![events]),
+        }
+    }
+
+    /// Searches the server for `query` on the user's session; `None` if
+    /// `cancel` fired first. The session in use then goes with the
+    /// search (a command cut in the middle leaves it unusable); the next
+    /// job opens a new one.
+    async fn search_server(
+        &mut self,
+        query: &str,
+        cancel: oneshot::Receiver<()>,
+    ) -> Option<Result<ServerHits, AccountError>> {
+        let id = self.account.id;
+        let searching = self.with_session(async |session, store| {
+            search_server(store, session, id, query, SEARCH_LIMIT).await
+        });
+        tokio::select! {
+            result = searching => Some(result),
+            _ = cancel => None,
         }
     }
 
@@ -2292,6 +2337,15 @@ mod tests {
                 .map(|d| d.0)
                 .collect())
         }
+        async fn search_text(&mut self, _query: &str) -> Result<Vec<u32>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_headers_of(
+            &mut self,
+            _uids: &[u32],
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            Ok(Vec::new())
+        }
     }
 
     /// A worker on a fake server, with one inbox message (no body yet)
@@ -2405,6 +2459,53 @@ mod tests {
         events
             .iter()
             .any(|event| matches!(event, Event::Synced(Ok(true))))
+    }
+
+    #[tokio::test]
+    async fn server_search_answers_what_it_found() {
+        let fake = fake_worker("searchdone");
+        fake.open.send(true).unwrap();
+        let (_cancel, cancelled) = oneshot::channel();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SearchServer {
+                query: "facture".into(),
+                cancel: cancelled,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.as_slice(), [Event::Found(Ok(hits))] if hits.added == 0),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_server_search_frees_the_worker() {
+        let fake = fake_worker("searchcancel");
+        let (cancel, cancelled) = oneshot::channel();
+        let search = tokio::spawn(
+            fake.worker
+                .request(|reply| Job::SearchServer {
+                    query: "facture".into(),
+                    cancel: cancelled,
+                    reply,
+                })
+                .collect::<Vec<Event>>(),
+        );
+        // The search waits on the server's folder list.
+        fake.server.listing.notified().await;
+        drop(cancel);
+        let events = search.await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Found(_))),
+            "{events:?}"
+        );
+        // The worker serves the next jobs; the session cut in the middle
+        // was dropped.
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.dropped.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

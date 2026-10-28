@@ -303,10 +303,13 @@ impl App {
 
     /// The scheduled mail, read again for "Programmés".
     pub(super) fn refresh_outbox(&mut self) {
-        self.outbox = self.store.scheduled().unwrap_or_else(|e| {
+        let mut outbox = self.store.scheduled().unwrap_or_else(|e| {
             eprintln!("Impossible de lire les envois programmés : {e}");
             Vec::new()
         });
+        // Only the active space's (the others still leave on time).
+        outbox.retain(|record| self.in_space(record.fields.account));
+        self.outbox = outbox;
     }
 
     /// "Envoyer plus tard": the message is checked now (recipients,

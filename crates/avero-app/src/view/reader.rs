@@ -1,11 +1,14 @@
 //! The reading pane: actions, the sorting bar (tab, unsubscribe),
 //! headers, attachments and the text. A conversation shows its messages
 //! one under the other, oldest first; the folded ones take one line each.
+//! Under it, the quick reply ("Répondre à tous…").
 
 use super::{
     avatar, find_account, format_full_date, hr, icon_button, icon_label_button, tip, to_color,
 };
-use crate::app::{App, Body, Entry, LaterMsg, Message, Reading, tab_name};
+use crate::app::{
+    App, Body, Entry, LaterMsg, Message, QUICK_REPLY_ID, QuickMsg, Reading, tab_name,
+};
 use crate::compose::{Mode, human_size};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
@@ -17,7 +20,7 @@ use iced::widget::{
     Column, Row, button, center, column, container, row, scrollable, space, text, text_editor,
     tooltip,
 };
-use iced::{Alignment, Color, Element, Fill, Padding};
+use iced::{Alignment, Color, Element, Fill, Padding, keyboard};
 
 /// Comfortable reading width.
 const MAX_WIDTH: f32 = 720.0;
@@ -225,6 +228,7 @@ fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Ele
             .height(Fill)
             .center_x(Fill),
     )
+    .push(quick_reply(app, reading))
     .into()
 }
 
@@ -275,7 +279,90 @@ fn conversation<'a>(
         .height(Fill)
         .style(theme::scrollbar),
     )
+    .push(quick_reply(app, reading))
     .into()
+}
+
+/// Under the conversation: "Répondre à tous…", a field that grows with
+/// its text (Ctrl+Entrée sends), "Envoyer", and the full composer one
+/// click away with the text typed.
+fn quick_reply<'a>(app: &'a App, reading: &'a Reading) -> Element<'a, Message> {
+    let reply = &app.quick_reply;
+    let ready = reading
+        .entries
+        .last()
+        .is_some_and(|entry| matches!(entry.body, Body::Ready { .. }));
+    let mut field = text_editor(&reply.content)
+        .id(QUICK_REPLY_ID)
+        .placeholder("Répondre à tous…")
+        .key_binding(quick_reply_binding)
+        .size(14)
+        .line_height(1.45)
+        .padding([9, 12])
+        .min_height(40)
+        .max_height(180)
+        .wrapping(Wrapping::WordOrGlyph)
+        .style(theme::editor);
+    // Without `on_action` the field is disabled: nothing changes while
+    // the reply leaves.
+    if !reply.sending {
+        field = field.on_action(|action| Message::QuickReply(QuickMsg::Edit(action)));
+    }
+    let can_send = ready && !reply.sending && reply.has_text();
+    let send_label = if reply.sending { "Envoi…" } else { "Envoyer" };
+    let send = super::icon_label_button(
+        Icon::Send,
+        send_label,
+        Tone::OnAccent,
+        can_send.then_some(Message::QuickReply(QuickMsg::Send)),
+        theme::primary,
+    );
+    let expand = icon_button(
+        Icon::Compose,
+        "Ouvrir dans l'éditeur complet",
+        (ready && !reply.sending).then_some(Message::QuickReply(QuickMsg::Expand)),
+    );
+    let note: Element<'a, Message> = match &reply.error {
+        Some(error) => row![
+            icons::icon(Icon::Alert, 14.0, Tone::Danger),
+            text(error.clone()).size(12).style(theme::danger_text),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+        None => text("Ctrl+Entrée pour envoyer à tous, sans citer la conversation")
+            .size(12)
+            .style(theme::muted)
+            .into(),
+    };
+    let bar = row![container(note).width(Fill), expand, send]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    column![
+        hr(),
+        container(column![field, bar].spacing(8).max_width(MAX_WIDTH))
+            .padding([12, 32])
+            .center_x(Fill),
+    ]
+    .into()
+}
+
+/// The keys of the quick reply: Ctrl+Entrée sends, the others type
+/// (a focused field keeps every letter, so the one-key shortcuts stay
+/// off while typing in it).
+pub fn quick_reply_binding(press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    let focused = matches!(press.status, text_editor::Status::Focused { .. });
+    let enter = matches!(
+        press.key.as_ref(),
+        keyboard::Key::Named(keyboard::key::Named::Enter)
+    );
+    if focused && enter && press.modifiers.command() {
+        Some(text_editor::Binding::Custom(Message::QuickReply(
+            QuickMsg::Send,
+        )))
+    } else {
+        text_editor::Binding::from_key_press(press)
+    }
 }
 
 /// Whether every line acted on is starred.
