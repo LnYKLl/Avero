@@ -1,6 +1,7 @@
 //! End to end against a real IMAP/SMTP server running locally (GreenMail),
 //! through the same code paths as the app: SMTP sending, APPEND to Sent,
-//! sync into a store, body download and parsing, flags, moves, deletions.
+//! sync into a store, body download and parsing, flags, moves, deletions,
+//! and IDLE.
 //!
 //! Run everything with `scripts/e2e-local.ps1` (see `docs/e2e-local.md`),
 //! which starts the server and sets these variables:
@@ -23,11 +24,12 @@ use avero_core::model::{
     ServerConfig, UnifiedItem,
 };
 use avero_core::store::Store;
-use avero_sync::imap::ImapSource;
+use avero_sync::imap::{ImapSource, ImapWatch};
 use avero_sync::parse::{attachment_data, parse_body};
 use avero_sync::smtp::{self, Outgoing, OutgoingAttachment, Recipient, SendError};
 use avero_sync::source::{MailSource, SyncError};
 use avero_sync::sync::sync_account;
+use avero_sync::watch::{Change, InboxWatch};
 use std::time::Duration;
 
 /// One test account: its address (also its login) and password.
@@ -518,5 +520,49 @@ async fn mail_goes_round_end_to_end() {
     assert_eq!(
         in_role(&fresh, fresh_account, FolderRole::Archive)[0].subject,
         "Réunion à 14 h"
+    );
+}
+
+/// IDLE: a mail delivered while the watcher waits wakes it up, and the
+/// sync that follows reports it as new (to be notified), unlike the
+/// messages of the first fill.
+#[tokio::test]
+#[ignore]
+async fn idle_wakes_up_when_a_mail_arrives() {
+    let (alice, bob) = (alice(), bob());
+    let (store, account) = store_for(&bob);
+    let mut source = connect(&bob).await;
+    let report = sync_account(&store, &mut source, account, |_| {})
+        .await
+        .unwrap();
+    assert!(report.arrivals.is_empty(), "first fill: {report:?}");
+
+    let mut watch = ImapWatch::connect(&imap(&bob), &password(&bob))
+        .await
+        .expect("IMAP login for the watcher");
+    assert!(watch.uses_idle(), "GreenMail announces IDLE");
+    let subject = format!("Réveil IDLE {}", std::process::id());
+    let send = async {
+        // Leave the watcher time to enter IDLE.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let msg = outgoing(&alice, &bob, &subject, "Coucou");
+        smtp::send(&smtp_cfg(&alice), &password(&alice), &msg)
+            .await
+            .unwrap();
+    };
+    let waiting = tokio::time::timeout(Duration::from_secs(60), watch.wait());
+    let (woken, ()) = tokio::join!(waiting, send);
+    let change = woken.expect("woken up within a minute").unwrap();
+    assert_eq!(change, Change::Changed);
+
+    let report = sync_account(&store, &mut source, account, |_| {})
+        .await
+        .unwrap();
+    assert!(
+        report
+            .arrivals
+            .iter()
+            .any(|a| a.subject == subject && a.from_name.as_deref() == Some("Alice Martin")),
+        "{report:?}"
     );
 }

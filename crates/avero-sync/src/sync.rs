@@ -13,13 +13,27 @@ pub const FIRST_SYNC: u32 = 2000;
 pub const FLAG_CHUNK: usize = 2000;
 
 /// What a synchronisation did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncReport {
     /// Folders brought up to date.
     pub folders: usize,
     pub new_messages: usize,
     /// Folders left aside because the server refused a command on them.
     pub skipped_folders: usize,
+    /// Unread messages that just came into the inbox: worth a
+    /// notification. Empty on the first fill of the inbox (or after a
+    /// UIDVALIDITY change): those messages are not new, only new here.
+    pub arrivals: Vec<Arrival>,
+}
+
+/// A new unread message of the inbox, with only what a notification
+/// shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arrival {
+    pub uid: u32,
+    pub from_name: Option<String>,
+    pub from_addr: String,
+    pub subject: String,
 }
 
 /// Brings the local copy of the special folders (inbox, sent, drafts,
@@ -43,11 +57,7 @@ pub async fn sync_account<S: MailSource>(
     account: AccountId,
     mut on_progress: impl FnMut(&SyncReport),
 ) -> Result<SyncReport, SyncError> {
-    let mut report = SyncReport {
-        folders: 0,
-        new_messages: 0,
-        skipped_folders: 0,
-    };
+    let mut report = SyncReport::default();
 
     let mut remotes: Vec<(RemoteFolder, FolderRole)> = source
         .list_folders()
@@ -126,7 +136,7 @@ async fn sync_folder<S: MailSource>(
             while to >= oldest && to > 0 {
                 let from = to.saturating_sub(BATCH - 1).max(oldest);
                 let headers = source.fetch_headers_by_seq(from, to).await?;
-                report.new_messages += save_batch(store, folder.id, headers)?;
+                report.new_messages += save_batch(store, folder.id, headers)?.len();
                 on_progress(report);
                 to = from - 1;
             }
@@ -139,7 +149,11 @@ async fn sync_folder<S: MailSource>(
                 for chunk in uids.chunks(BATCH as usize) {
                     let (first, last) = (chunk[0], chunk[chunk.len() - 1]);
                     let headers = source.fetch_headers(first, Some(last)).await?;
-                    report.new_messages += save_batch(store, folder.id, headers)?;
+                    let saved = save_batch(store, folder.id, headers)?;
+                    report.new_messages += saved.len();
+                    if folder.role == FolderRole::Inbox {
+                        report.arrivals.extend(arrivals(saved));
+                    }
                     on_progress(report);
                 }
             }
@@ -202,18 +216,32 @@ async fn resync_flags<S: MailSource>(
     Ok(())
 }
 
-/// Parses and stores one batch; returns how many headers it held.
+/// Parses and stores one batch; returns the messages it held.
 fn save_batch(
     store: &Store,
     folder: FolderId,
     headers: Vec<FetchedHeader>,
-) -> Result<usize, SyncError> {
+) -> Result<Vec<NewMessage>, SyncError> {
     let messages: Vec<NewMessage> = headers
         .iter()
         .map(|h| parse_headers(h.uid, h.seen, &h.raw))
         .collect();
     store.insert_messages(folder, &messages)?;
-    Ok(messages.len())
+    Ok(messages)
+}
+
+/// The unread ones among messages just saved (read ones were already
+/// seen elsewhere: no notification for them).
+fn arrivals(messages: Vec<NewMessage>) -> impl Iterator<Item = Arrival> {
+    messages
+        .into_iter()
+        .filter(|message| !message.seen)
+        .map(|message| Arrival {
+            uid: message.uid,
+            from_name: message.from_name,
+            from_addr: message.from_addr,
+            subject: message.subject,
+        })
 }
 
 #[cfg(test)]
@@ -546,6 +574,51 @@ mod tests {
         assert_eq!(report.new_messages, 1);
         assert_eq!(source.fetches[0].0, 4);
         assert_eq!(total_rows(&store, account), 4);
+    }
+
+    #[tokio::test]
+    async fn only_new_unread_inbox_messages_are_arrivals() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("INBOX", &[], 1, vec![1, 2]);
+        source.add_folder("Sent", &["\\Sent"], 1, vec![1]);
+
+        // First fill: nothing is new, only new here.
+        let report = sync(&store, &mut source, account).await.unwrap();
+        assert!(report.arrivals.is_empty(), "{:?}", report.arrivals);
+
+        // 3 and 4 arrive, 4 already read elsewhere; Sent gets one too.
+        source.folder("INBOX").uids.extend([3, 4]);
+        source.folder("INBOX").seen.push(4);
+        source.folder("Sent").uids.push(2);
+        let report = sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(
+            report.arrivals,
+            vec![Arrival {
+                uid: 3,
+                from_name: None,
+                from_addr: "a@b.c".into(),
+                subject: "m3".into(),
+            }]
+        );
+
+        // Nothing new: nothing to tell.
+        let report = sync(&store, &mut source, account).await.unwrap();
+        assert!(report.arrivals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refill_after_uidvalidity_change_has_no_arrivals() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("INBOX", &[], 1, vec![1]);
+        sync(&store, &mut source, account).await.unwrap();
+
+        source.folders[0].uid_validity = 2;
+        source.folders[0].uids = vec![7, 8];
+        let report = sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(report.new_messages, 2);
+        assert!(report.arrivals.is_empty());
     }
 
     #[tokio::test]

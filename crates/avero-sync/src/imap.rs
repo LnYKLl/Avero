@@ -3,7 +3,9 @@
 //! (AUTHENTICATE XOAUTH2).
 
 use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncError};
+use crate::watch::{Change, IDLE_RENEW, InboxWatch, POLL_EVERY};
 use async_imap::error::Error as ImapError;
+use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
 use async_imap::types::NameAttribute;
 use async_imap::{Authenticator, Client, Session};
@@ -38,6 +40,8 @@ struct ServerCaps {
     move_command: bool,
     /// `UID EXPUNGE` (RFC 4315).
     uidplus: bool,
+    /// `IDLE` (RFC 2177).
+    idle: bool,
 }
 
 /// A logged-in connection to an IMAP server.
@@ -221,6 +225,7 @@ where
     Ok(ServerCaps {
         move_command: caps.has_str("MOVE"),
         uidplus: caps.has_str("UIDPLUS"),
+        idle: caps.has_str("IDLE"),
     })
 }
 
@@ -571,6 +576,151 @@ fn quote_mailbox(name: &str) -> Result<String, SyncError> {
         "\"{}\"",
         name.replace('\\', "\\\\").replace('"', "\\\"")
     ))
+}
+
+/// A connection of its own that watches the inbox: IDLE when the server
+/// has it (renewed every [`IDLE_RENEW`]), else a STATUS of the inbox
+/// every [`POLL_EVERY`].
+pub struct ImapWatch {
+    /// `None` once the connection is given up (a wait was cancelled or
+    /// failed half-way).
+    session: Option<Session<TlsStream<TcpStream>>>,
+    idle: bool,
+    /// What the last poll saw (without IDLE).
+    last: Option<InboxState>,
+}
+
+impl ImapWatch {
+    /// Connects and logs in like [`ImapSource::connect`]; with IDLE, the
+    /// inbox is opened read-only (EXAMINE) to be watched.
+    pub async fn connect(cfg: &ServerConfig, creds: &Credentials) -> Result<ImapWatch, SyncError> {
+        let ImapSource { mut session, caps } = ImapSource::connect(cfg, creds).await?;
+        if caps.idle {
+            examine_inbox(&mut session).await?;
+        }
+        Ok(ImapWatch {
+            session: Some(session),
+            idle: caps.idle,
+            last: None,
+        })
+    }
+
+    /// Whether the server announced IDLE (else the inbox is polled).
+    pub fn uses_idle(&self) -> bool {
+        self.idle
+    }
+}
+
+impl InboxWatch for ImapWatch {
+    async fn wait(&mut self) -> Result<Change, SyncError> {
+        let Some(mut session) = self.session.take() else {
+            return Err(SyncError::Connect("connection given up".to_string()));
+        };
+        let change = if self.idle {
+            let (back, change) = idle_once(session, IDLE_RENEW).await?;
+            session = back;
+            change
+        } else {
+            poll_once(&mut session, &mut self.last, POLL_EVERY).await?
+        };
+        self.session = Some(session);
+        Ok(change)
+    }
+}
+
+/// Opens the inbox read-only, so that IDLE reports its changes.
+async fn examine_inbox<T>(session: &mut Session<T>) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let examining = async { session.examine("INBOX").await.map_err(command_error) };
+    with_timeout(COMMAND_TIMEOUT, "EXAMINE", examining)
+        .await
+        .map(|_| ())
+}
+
+/// Sends IDLE and waits for any news from the server, at most `limit`
+/// (the server's keep-alive lines are not news), then sends DONE. Gives
+/// the session back for the next round.
+async fn idle_once<T>(
+    session: Session<T>,
+    limit: Duration,
+) -> Result<(Session<T>, Change), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let mut handle = session.idle();
+    let starting = async { handle.init().await.map_err(command_error) };
+    with_timeout(COMMAND_TIMEOUT, "IDLE", starting).await?;
+    let change = {
+        // Dropping `_stop` would end the wait at once: keep it alive.
+        let (waiting, _stop) = handle.wait_with_timeout(limit);
+        // The library's own limit starts again after every keep-alive
+        // line; this one makes sure IDLE is renewed in time.
+        match timeout(limit, waiting).await {
+            Err(_) | Ok(Ok(IdleResponse::Timeout)) => Change::Quiet,
+            Ok(Ok(IdleResponse::NewData(_))) => Change::Changed,
+            // Since `_stop` is kept, only the end of the connection
+            // stops the wait this way.
+            Ok(Ok(IdleResponse::ManualInterrupt)) => {
+                return Err(SyncError::Connect(
+                    "connection lost during IDLE".to_string(),
+                ));
+            }
+            Ok(Err(error)) => return Err(command_error(error)),
+        }
+    };
+    let ending = async { handle.done().await.map_err(command_error) };
+    let session = with_timeout(COMMAND_TIMEOUT, "DONE", ending).await?;
+    Ok((session, change))
+}
+
+/// What a STATUS of the inbox says, compared from one poll to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InboxState {
+    exists: u32,
+    uid_next: Option<u32>,
+    uid_validity: Option<u32>,
+}
+
+async fn inbox_state<T>(session: &mut Session<T>) -> Result<InboxState, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let asking = async {
+        session
+            .status("INBOX", "(MESSAGES UIDNEXT UIDVALIDITY)")
+            .await
+            .map_err(command_error)
+    };
+    let mailbox = with_timeout(COMMAND_TIMEOUT, "STATUS", asking).await?;
+    Ok(InboxState {
+        exists: mailbox.exists,
+        uid_next: mailbox.uid_next,
+        uid_validity: mailbox.uid_validity,
+    })
+}
+
+/// Without IDLE: waits `every`, then asks the inbox's STATUS and
+/// compares it with the one before (the first call takes note first).
+async fn poll_once<T>(
+    session: &mut Session<T>,
+    last: &mut Option<InboxState>,
+    every: Duration,
+) -> Result<Change, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if last.is_none() {
+        *last = Some(inbox_state(session).await?);
+    }
+    tokio::time::sleep(every).await;
+    let now = inbox_state(session).await?;
+    if last.replace(now) == Some(now) {
+        Ok(Change::Quiet)
+    } else {
+        Ok(Change::Changed)
+    }
 }
 
 impl MailSource for ImapSource {
@@ -929,7 +1079,8 @@ mod tests {
             caps,
             ServerCaps {
                 move_command: true,
-                uidplus: true
+                uidplus: true,
+                idle: true,
             }
         );
     }
@@ -988,6 +1139,7 @@ mod tests {
         let caps = ServerCaps {
             move_command: true,
             uidplus: true,
+            idle: false,
         };
         expunge_uids(&mut session, caps, &[4, 8]).await.unwrap();
         let sent = commands(session, server).await;
@@ -1052,6 +1204,7 @@ mod tests {
         let caps = ServerCaps {
             move_command: true,
             uidplus: true,
+            idle: false,
         };
         move_uids(&mut session, caps, &[3, 5], "[Gmail]/Corbeille")
             .await
@@ -1066,6 +1219,7 @@ mod tests {
         let caps = ServerCaps {
             move_command: false,
             uidplus: true,
+            idle: false,
         };
         move_uids(&mut session, caps, &[3], "Trash").await.unwrap();
         let sent = commands(session, server).await;
@@ -1126,6 +1280,86 @@ mod tests {
             session_recording(vec!["{tag} NO [ALREADYEXISTS] exists\r\n"]).await;
         let result = create_mailbox(&mut session, "Trash").await;
         assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn idle_wakes_up_on_new_data_and_ends_with_done() {
+        let (session, server) = session_recording(vec![
+            "+ idling\r\n* 5 EXISTS\r\n",
+            "{tag} OK IDLE terminated\r\n",
+        ])
+        .await;
+        let (session, change) = idle_once(session, IDLE_RENEW).await.unwrap();
+        assert_eq!(change, Change::Changed);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["IDLE", "DONE"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_is_renewed_after_its_limit() {
+        // A keep-alive line is not news (time is simulated).
+        let (session, server) = session_recording(vec![
+            "+ idling\r\n* OK still here\r\n",
+            "{tag} OK IDLE terminated\r\n",
+        ])
+        .await;
+        let (session, change) = idle_once(session, IDLE_RENEW).await.unwrap();
+        assert_eq!(change, Change::Quiet);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["IDLE", "DONE"]);
+    }
+
+    #[tokio::test]
+    async fn idle_on_a_closed_connection_is_a_connect_error() {
+        // A server that accepts IDLE, then hangs up.
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_side);
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"* OK ready\r\n").await.unwrap();
+            let login = lines.next_line().await.unwrap().unwrap();
+            let tag = login.split(' ').next().unwrap().to_string();
+            write
+                .write_all(format!("{tag} OK logged in\r\n").as_bytes())
+                .await
+                .unwrap();
+            lines.next_line().await.unwrap().unwrap();
+            write.write_all(b"+ idling\r\n").await.unwrap();
+        });
+        let mut client = Client::new(client_side);
+        client.read_response().await.unwrap().unwrap();
+        let session = login(client, "user", "pw").await.unwrap();
+        let result = idle_once(session, IDLE_RENEW).await;
+        assert!(
+            matches!(result, Err(SyncError::Connect(_))),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_compares_the_inbox_status() {
+        let status = |messages: u32, next: u32| {
+            format!(
+                "* STATUS INBOX (MESSAGES {messages} UIDNEXT {next} UIDVALIDITY 1)\r\n{{tag}} OK\r\n"
+            )
+        };
+        let (first, same, more) = (status(2, 10), status(2, 10), status(3, 11));
+        let (mut session, server) = session_recording(vec![&first, &same, &more]).await;
+        let mut last = None;
+        let quiet = poll_once(&mut session, &mut last, POLL_EVERY)
+            .await
+            .unwrap();
+        assert_eq!(quiet, Change::Quiet);
+        let changed = poll_once(&mut session, &mut last, POLL_EVERY)
+            .await
+            .unwrap();
+        assert_eq!(changed, Change::Changed);
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec!["STATUS \"INBOX\" (MESSAGES UIDNEXT UIDVALIDITY)"; 3]
+        );
     }
 
     #[test]

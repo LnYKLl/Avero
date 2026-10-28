@@ -1,5 +1,5 @@
 //! Talking to mail servers: IMAP synchronisation and actions, SMTP
-//! sending, and MIME parsing.
+//! sending, MIME parsing, and watching the inbox.
 
 pub mod imap;
 pub mod parse;
@@ -8,3 +8,4 @@ pub mod source;
 pub mod sync;
 #[cfg(feature = "test-ca")]
 mod test_ca;
+pub mod watch;
