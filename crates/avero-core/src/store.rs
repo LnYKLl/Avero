@@ -2745,8 +2745,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Undoes versions 10, 9 and 8 (to test older migrations).
+    /// Undoes versions 11 (its trigger), 10, 9 and 8 (to test older
+    /// migrations).
     const UNDO_V8: &str = "
+        DROP TRIGGER messages_forget_row_keys;
         DROP TABLE space_accounts;
         DROP TABLE spaces;
         DROP TABLE draft_files;

@@ -729,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn a_new_message_is_never_taken_for_a_deleted_one_already_learned() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "moi@x.fr");
+        let box_a = inbox(&s, a).id;
+        let mut first = sample(1, "x@promo.fr", "Promo");
+        first.message_id = None;
+        s.insert_messages(box_a, &[first]).unwrap();
+        let row = row_of(&s, box_a, 1);
+        assert_eq!(s.learn_spam(&[row], true).unwrap(), 1);
+        s.delete_messages(&[row]).unwrap();
+        // Still counted: its words are still in the model.
+        assert_eq!(s.spam_learned().unwrap(), Learned { spam: 1, ham: 0 });
+        let mut next = sample(2, "y@ami.fr", "Bonjour");
+        next.message_id = None;
+        s.insert_messages(box_a, &[next]).unwrap();
+        assert_eq!(row_of(&s, box_a, 2), row);
+        // Not "already learned": learning it counts.
+        assert_eq!(s.learn_spam(&[row], false).unwrap(), 1);
+        assert_eq!(s.spam_learned().unwrap(), Learned { spam: 1, ham: 1 });
+    }
+
+    #[test]
     fn learning_twice_counts_once_and_the_other_way_takes_back() {
         let s = Store::open_in_memory().unwrap();
         let a = acct(&s, "moi@x.fr");

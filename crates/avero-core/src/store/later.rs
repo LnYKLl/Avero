@@ -205,6 +205,71 @@ mod tests {
     }
 
     #[test]
+    fn a_new_message_never_inherits_a_deleted_one_s_snooze() {
+        let store = Store::open_in_memory().unwrap();
+        let account = acct(&store, "a@x.fr");
+        let folder = inbox(&store, account);
+        // No Message-ID: known by its row.
+        store
+            .insert_messages(folder.id, &[msg(1, None, 100)])
+            .unwrap();
+        let rows: Vec<i64> = list(&store, &Listing::Folder(FolderRole::Inbox))
+            .into_iter()
+            .flat_map(|item| item.row_ids)
+            .collect();
+        store.snooze(&rows, 5_000).unwrap();
+        // Deleted elsewhere; the next message gets the same row id.
+        store.delete_messages(&rows).unwrap();
+        store
+            .insert_messages(folder.id, &[msg(2, None, 200)])
+            .unwrap();
+        let inbox_list = list(&store, &Listing::Folder(FolderRole::Inbox));
+        assert_eq!(inbox_list[0].row_ids, rows);
+        assert_eq!(subjects(&inbox_list), vec!["subject 2"]);
+        assert!(list(&store, &Listing::Snoozed).is_empty());
+        assert_eq!(store.next_wake().unwrap(), None);
+    }
+
+    #[test]
+    fn snoozes_of_rows_deleted_before_version_11_go() {
+        let path = std::env::temp_dir().join(format!("avero-rowkeys-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = Store::open(&path).unwrap();
+            let account = acct(&store, "a@x.fr");
+            let folder = inbox(&store, account);
+            store
+                .insert_messages(folder.id, &[msg(1, None, 100)])
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "INSERT INTO snoozes (key, until) VALUES ('row:1', 9), ('row:77', 9);
+                     INSERT INTO spam_learned (key, spam) VALUES ('row:77', 1);
+                     PRAGMA user_version = 10;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let keys: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT key FROM snoozes UNION ALL SELECT key FROM spam_learned")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // Row 1 is still there; row 77 is gone (still counted as learned).
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "row:1");
+        assert!(keys[1].starts_with("gone:"), "{keys:?}");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn later_lists_the_next_to_wake_first() {
         let (store, rows) = store_with_thread();
         store.snooze(&rows[..1], 9_000).unwrap();

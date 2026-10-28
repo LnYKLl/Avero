@@ -1099,7 +1099,8 @@ fn merged_accounts_secrets_are_erased() {
         // in a version 3 database (without what versions 4 to 10 added).
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE space_accounts;
+            "DROP TRIGGER messages_forget_row_keys;
+             DROP TABLE space_accounts;
              DROP TABLE spaces;
              DROP TABLE draft_files;
              DROP TABLE drafts;

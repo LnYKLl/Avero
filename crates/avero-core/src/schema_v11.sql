@@ -25,3 +25,25 @@ WHERE field = 'from' AND instr(value, '@') > 0
         AND r.name LIKE 'Bloquer %'
         AND (SELECT COUNT(*) FROM rule_conditions c WHERE c.rule_id = r.id) = 1
   );
+
+-- A message without Message-ID is known to "Plus tard" and to the spam
+-- filter by its row ('row:' and its id). Row ids are given again once
+-- the newest row is deleted, so a new message could be born snoozed or
+-- "already learned". When such a row is deleted, its snooze goes; what
+-- the spam filter learned from it stays counted (its words are still in
+-- `spam_tokens`) under a key no row can have ('gone:' and random hex).
+-- The keys earlier versions left behind are treated the same way now.
+CREATE TRIGGER IF NOT EXISTS messages_forget_row_keys AFTER DELETE ON messages
+WHEN old.message_id IS NULL
+BEGIN
+    DELETE FROM snoozes WHERE key = 'row:' || old.id;
+    UPDATE spam_learned SET key = 'gone:' || hex(randomblob(8))
+    WHERE key = 'row:' || old.id;
+END;
+
+DELETE FROM snoozes
+WHERE key LIKE 'row:%'
+  AND key NOT IN (SELECT 'row:' || id FROM messages WHERE message_id IS NULL);
+UPDATE spam_learned SET key = 'gone:' || hex(randomblob(8))
+WHERE key LIKE 'row:%'
+  AND key NOT IN (SELECT 'row:' || id FROM messages WHERE message_id IS NULL);
