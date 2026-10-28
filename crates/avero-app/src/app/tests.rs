@@ -1143,11 +1143,16 @@ fn merged_accounts_secrets_are_erased() {
     secrets.set(AccountId(1), "keep").unwrap();
     secrets.set(AccountId(2), "forget").unwrap();
 
+    // Like `main`, which opens the database once to check it (and so
+    // migrates it) before the window's state opens it again.
+    drop(Store::open(&path).unwrap());
     let store = Store::open(&path).unwrap();
     forget_merged_secrets(&store, &secrets);
 
     assert_eq!(secrets.get(AccountId(1)).unwrap().as_deref(), Some("keep"));
     assert_eq!(secrets.get(AccountId(2)).unwrap(), None);
+    // Done: nothing left to erase at the next start.
+    assert!(store.merged_accounts().unwrap().is_empty());
     drop(store);
     let _ = std::fs::remove_file(&path);
 }

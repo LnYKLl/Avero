@@ -72,9 +72,6 @@ const SNIPPET_CHARS: usize = 140;
 /// The Avero database (one SQLite connection).
 pub struct Store {
     conn: Connection,
-    /// Accounts removed when the database was opened because another
-    /// account had the same address (see `merged_accounts`).
-    merged: Vec<AccountId>,
 }
 
 /// Columns read by `account_from_row`, in order.
@@ -191,24 +188,37 @@ impl Store {
     fn init(conn: Connection) -> Result<Store, StoreError> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let mut store = Store {
-            conn,
-            merged: Vec::new(),
-        };
+        let store = Store { conn };
         store.migrate()?;
         Ok(store)
     }
 
     /// The accounts deleted by the version 4 migration, which merged
-    /// accounts sharing one address. The caller must erase their secrets:
-    /// the store cannot reach the `SecretStore`.
-    pub fn merged_accounts(&self) -> &[AccountId] {
-        &self.merged
+    /// accounts sharing one address, whose secrets are still to be
+    /// erased. The caller must erase them (the store cannot reach the
+    /// `SecretStore`), then call `secret_deleted`. They are kept in the
+    /// database until then, so a crash or a second opening of the
+    /// database loses none.
+    pub fn merged_accounts(&self) -> Result<Vec<AccountId>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account_id FROM pending_secret_deletions ORDER BY account_id")?;
+        let rows = stmt.query_map([], |row| Ok(AccountId(row.get(0)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The secret of a merged account (see `merged_accounts`) is erased.
+    pub fn secret_deleted(&self, id: AccountId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM pending_secret_deletions WHERE account_id = ?1",
+            params![id.0],
+        )?;
+        Ok(())
     }
 
     /// Applies the schema versions the database has not seen yet, each in
     /// its own transaction.
-    fn migrate(&mut self) -> Result<(), StoreError> {
+    fn migrate(&self) -> Result<(), StoreError> {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -272,14 +282,21 @@ impl Store {
             tx.execute_batch("PRAGMA user_version = 10;")?;
             tx.commit()?;
         }
+        if version < 11 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v11.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 11;")?;
+            tx.commit()?;
+        }
         Ok(())
     }
 
     /// Version 4: one account per address. Accounts with the same address
     /// (case and spaces ignored) are merged into the oldest one, then a
     /// unique index keeps it that way. Foreign keys stay on, so bodies go
-    /// with their messages.
-    fn migrate_to_v4(&mut self) -> Result<(), StoreError> {
+    /// with their messages. The merged accounts' secrets are left for the
+    /// app to erase (see `merged_accounts`).
+    fn migrate_to_v4(&self) -> Result<(), StoreError> {
         let tx = write_tx(&self.conn)?;
         let doomed: Vec<i64> = {
             let mut stmt = tx.prepare(
@@ -291,13 +308,22 @@ impl Store {
             let rows = stmt.query_map([], |row| row.get(0))?;
             rows.collect::<Result<_, _>>()?
         };
+        // The table of version 11, needed this early.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_secret_deletions (
+                 account_id  INTEGER PRIMARY KEY
+             );",
+        )?;
         for id in &doomed {
             delete_account_rows(&tx, AccountId(*id))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_secret_deletions (account_id) VALUES (?1)",
+                params![id],
+            )?;
         }
         tx.execute_batch(include_str!("schema_v4.sql"))?;
         tx.execute_batch("PRAGMA user_version = 4;")?;
         tx.commit()?;
-        self.merged.extend(doomed.into_iter().map(AccountId));
         Ok(())
     }
 
@@ -352,8 +378,12 @@ impl Store {
                 other?;
             }
         }
+        let id = AccountId(self.conn.last_insert_rowid());
+        // The id of a merged account given again: its secret will be this
+        // account's, which must not be erased.
+        self.secret_deleted(id)?;
         Ok(Account {
-            id: AccountId(self.conn.last_insert_rowid()),
+            id,
             name: new.name,
             email: new.email,
             color,
@@ -2343,6 +2373,17 @@ mod tests {
     }
 
     #[test]
+    fn an_account_given_a_merged_id_keeps_its_secret() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute_batch("INSERT INTO pending_secret_deletions VALUES (1), (5);")
+            .unwrap();
+        // The new account is number 1: its secret replaces the old one.
+        assert_eq!(acct(&s, "a@x.fr"), AccountId(1));
+        assert_eq!(s.merged_accounts().unwrap(), vec![AccountId(5)]);
+    }
+
+    #[test]
     fn version_3_duplicates_are_merged_into_the_oldest() {
         let path = std::env::temp_dir().join(format!("avero-merge-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -2376,15 +2417,20 @@ mod tests {
 
         let ids: Vec<i64> = s.accounts().unwrap().iter().map(|a| a.id.0).collect();
         assert_eq!(ids, vec![1, 2]);
-        assert_eq!(s.merged_accounts(), &[AccountId(3)]);
+        assert_eq!(s.merged_accounts().unwrap(), vec![AccountId(3)]);
         assert_eq!(count(&s, "messages"), 2);
         assert_eq!(count(&s, "folders"), 2);
         assert_eq!(count(&s, "bodies"), 0);
         assert!(s.add_account(new_account("a@X.fr")).is_err());
         drop(s);
-        // A second opening has nothing left to merge.
+        // Opened again (the app's check, or a crash before the secrets
+        // were erased): the merged account is still to be erased.
         let s = Store::open(&path).unwrap();
-        assert!(s.merged_accounts().is_empty());
+        assert_eq!(s.merged_accounts().unwrap(), vec![AccountId(3)]);
+        s.secret_deleted(AccountId(3)).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(s.merged_accounts().unwrap().is_empty());
         drop(s);
         let _ = std::fs::remove_file(&path);
     }
@@ -2677,7 +2723,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let ids = thread_ids(&s);
         assert_eq!(ids["Un"], 1);
         assert_eq!(ids["Deux"], 3);
@@ -3034,7 +3080,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
         assert_eq!(tab(&s, Category::Notification), vec!["noreply@banque.fr 2"]);
         assert!(tab(&s, Category::Important).is_empty());
@@ -3095,7 +3141,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

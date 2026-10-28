@@ -675,12 +675,23 @@ pub struct App {
     pub(crate) cleanup: Cleanup,
 }
 
-/// Erases the secrets of the accounts the store merged at startup (the
-/// store cannot reach the keyring itself).
+/// Erases the secrets of the accounts the store merged when it was
+/// migrated (the store cannot reach the keyring itself). Each one is
+/// crossed off once erased; one that could not be is tried again at the
+/// next start.
 fn forget_merged_secrets(store: &Store, secrets: &dyn SecretStore) {
-    for id in store.merged_accounts() {
-        if let Err(e) = secrets.delete(*id) {
-            eprintln!("Impossible d'effacer le secret d'un compte fusionné : {e}");
+    let merged = store.merged_accounts().unwrap_or_else(|e| {
+        eprintln!("Impossible de lire les comptes fusionnés : {e}");
+        Vec::new()
+    });
+    for id in merged {
+        match secrets.delete(id) {
+            Ok(()) => {
+                if let Err(e) = store.secret_deleted(id) {
+                    eprintln!("Impossible de noter l'effacement d'un secret : {e}");
+                }
+            }
+            Err(e) => eprintln!("Impossible d'effacer le secret d'un compte fusionné : {e}"),
         }
     }
 }

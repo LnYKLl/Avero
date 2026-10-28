@@ -31,20 +31,30 @@ fn main() -> iced::Result {
     // know the process as Avero.
     notify::set_process_app_id();
     // Without a console (release builds), a database that cannot be
-    // opened must be explained in a window, not by a silent crash.
+    // opened must be explained in a window, not by a silent crash. It is
+    // opened here once, and that connection goes to the window's state:
+    // opening migrates the database, and what the migration leaves for
+    // the app (see `Store::merged_accounts`) is read from it.
+    let mut opened = None;
     if demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref()).is_none() {
         let db_path = paths::database_path();
-        if let Err(e) = Store::open(&db_path) {
-            rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Error)
-                .set_title("Avero")
-                .set_description(database_error_text(&db_path, &e))
-                .set_buttons(rfd::MessageButtons::Ok)
-                .show();
-            std::process::exit(1);
+        match Store::open(&db_path) {
+            Ok(store) => opened = Some(store),
+            Err(e) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Avero")
+                    .set_description(database_error_text(&db_path, &e))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                std::process::exit(1);
+            }
         }
     }
-    let mut application = iced::application(boot, App::update, App::view)
+    // `boot` may in theory be called more than once: the next calls open
+    // the database again.
+    let opened = std::cell::Cell::new(opened);
+    let mut application = iced::application(move || boot(opened.take()), App::update, App::view)
         .title("Avero")
         .theme(App::theme)
         .subscription(App::subscription)
@@ -61,8 +71,9 @@ fn main() -> iced::Result {
     application.run()
 }
 
-/// Opens the database (or the demo one) and builds the window's state.
-fn boot() -> (App, Task<Message>) {
+/// Builds the window's state on the database `main` opened (or the demo
+/// one).
+fn boot(opened: Option<Store>) -> (App, Task<Message>) {
     let demo = demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref());
     let config_dir = paths::config_dir();
     let settings_path = settings::path_in(&config_dir);
@@ -110,7 +121,7 @@ fn boot() -> (App, Task<Message>) {
         None => {
             let db_path = paths::database_path();
             // Checked in `main` before the window opened.
-            let store = Store::open(&db_path).expect("open database");
+            let store = opened.unwrap_or_else(|| Store::open(&db_path).expect("open database"));
             let backend = Backend::Live {
                 db_path,
                 secrets: Arc::new(KeyringSecrets),
