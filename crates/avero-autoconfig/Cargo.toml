@@ -1,0 +1,15 @@
+[package]
+name = "avero-autoconfig"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Mail server auto-detection for Avero (built-in table, ISPDB, autoconfig)"
+
+[dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+roxmltree = "0.21.2"
+thiserror = "2"
+tokio = { version = "1.54", features = ["net", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["macros", "rt"] }
