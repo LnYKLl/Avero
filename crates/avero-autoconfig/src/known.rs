@@ -94,8 +94,10 @@ pub fn known(email: &str) -> Option<ProviderConfig> {
             "smtp.aol.com",
             help(APP_PASSWORD, "https://login.aol.com/account/security"),
         ),
-        "gmx.com" | "gmx.fr" | "gmx.de" | "gmx.net" => {
-            simple("GMX", "imap.gmx.com", "mail.gmx.com", None)
+        "gmx.com" | "gmx.fr" => simple("GMX", "imap.gmx.com", "mail.gmx.com", None),
+        // Same company, but the German domains use other servers (ISPDB).
+        "gmx.de" | "gmx.net" | "gmx.at" | "gmx.ch" => {
+            simple("GMX", "imap.gmx.net", "mail.gmx.net", None)
         }
         "orange.fr" | "wanadoo.fr" => simple("Orange", "imap.orange.fr", "smtp.orange.fr", None),
         "free.fr" => simple("Free", "imap.free.fr", "smtp.free.fr", None),
