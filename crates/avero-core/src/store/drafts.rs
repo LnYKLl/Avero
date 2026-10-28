@@ -274,15 +274,22 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Notes that sending a scheduled mail starts at `now`: if Avero
+    /// Reserves the sending of a scheduled mail, from `now`: if Avero
     /// stops before knowing how it went, `interrupted_sends` reports it
-    /// instead of sending it twice.
-    pub fn mark_send_attempt(&self, id: i64, now: i64) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE drafts SET attempted_at = ?1, error = NULL WHERE id = ?2",
+    /// instead of sending it twice. Returns `false` (and changes nothing)
+    /// when it cannot be sent: already being sent (by another window of
+    /// Avero, for example), sent, back in a composer, or gone. Checking and
+    /// reserving are one statement, so two senders never both get `true`.
+    /// A failed mail (with an `error`) can be reserved again ("Envoyer
+    /// maintenant").
+    pub fn reserve_send(&self, id: i64, now: i64) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE drafts SET attempted_at = ?1, error = NULL
+             WHERE id = ?2 AND send_at IS NOT NULL AND attempted_at IS NULL
+               AND sent_at IS NULL AND open = 0",
             params![now, id],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     /// Scheduled mail whose sending was started by a previous run that
@@ -482,16 +489,27 @@ mod tests {
         store.set_draft_open(id, true).unwrap();
         assert!(store.due_scheduled(1_000).unwrap().is_empty());
         store.set_draft_open(id, false).unwrap();
-        // Being sent: not sent twice.
-        store.mark_send_attempt(id, 1_000).unwrap();
+        // Being sent: not sent twice, even by a sender that read it as
+        // due before (another window of Avero).
+        assert!(store.reserve_send(id, 1_000).unwrap());
         assert!(store.due_scheduled(1_000).unwrap().is_empty());
+        assert!(!store.reserve_send(id, 1_000).unwrap());
         store.scheduled_failed(id, "refusé").unwrap();
         assert!(store.due_scheduled(2_000).unwrap().is_empty());
         let failed = &store.scheduled().unwrap()[0];
         assert_eq!(failed.error.as_deref(), Some("refusé"));
+        // "Envoyer maintenant" after a failure.
+        assert!(store.reserve_send(id, 1_200).unwrap());
+        store.scheduled_failed(id, "refusé").unwrap();
         // Scheduled again: the error is forgotten.
         store.schedule_draft(id, 1_500).unwrap();
         assert_eq!(store.due_scheduled(2_000).unwrap().len(), 1);
+        // Open in a composer, or sent: not reserved.
+        store.set_draft_open(id, true).unwrap();
+        assert!(!store.reserve_send(id, 2_000).unwrap());
+        store.set_draft_open(id, false).unwrap();
+        store.scheduled_sent(id, 9_000, 120).unwrap();
+        assert!(!store.reserve_send(id, 9_500).unwrap());
     }
 
     #[test]
@@ -524,7 +542,7 @@ mod tests {
             .save_draft(None, &fields(account, "A"), None, 1)
             .unwrap();
         store.schedule_draft(id, 1_000).unwrap();
-        store.mark_send_attempt(id, 1_000).unwrap();
+        assert!(store.reserve_send(id, 1_000).unwrap());
         assert_eq!(store.interrupted_sends("interrompu").unwrap(), 1);
         assert_eq!(
             store.draft(id).unwrap().unwrap().error.as_deref(),

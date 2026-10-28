@@ -1735,7 +1735,11 @@ mod tests {
     }
 
     fn temp_db(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("avero-worker-{}-{tag}.db", std::process::id()))
+        let path =
+            std::env::temp_dir().join(format!("avero-worker-{}-{tag}.db", std::process::id()));
+        // Left by an earlier run that had the same process id.
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     fn account_at(db: &Path, host: &str, port: u16, auth: AuthKind) -> Account {

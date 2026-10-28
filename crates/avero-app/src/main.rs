@@ -8,6 +8,7 @@ mod background;
 mod compose;
 mod demo;
 mod icons;
+mod instance;
 mod later;
 mod notify;
 mod oauth_setup;
@@ -36,8 +37,24 @@ fn main() -> iced::Result {
     // opening migrates the database, and what the migration leaves for
     // the app (see `Store::merged_accounts`) is read from it.
     let mut opened = None;
+    // Held until Avero quits (see `instance`).
+    let mut _instance = None;
     if demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref()).is_none() {
         let db_path = paths::database_path();
+        match instance::claim(&db_path) {
+            instance::Claim::First(guard) => _instance = Some(guard),
+            instance::Claim::Running => {
+                if !instance::show_running() {
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Info)
+                        .set_title("Avero")
+                        .set_description(instance::ALREADY_RUNNING)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+                std::process::exit(0);
+            }
+        }
         match Store::open(&db_path) {
             Ok(store) => opened = Some(store),
             Err(e) => {

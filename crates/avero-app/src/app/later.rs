@@ -435,7 +435,11 @@ impl App {
                 return Task::none();
             }
         };
-        let _ = self.store.mark_send_attempt(id, self.clock.now());
+        // Sent once only, even when two windows of Avero see it due.
+        if !matches!(self.store.reserve_send(id, self.clock.now()), Ok(true)) {
+            self.refresh_outbox();
+            return Task::none();
+        }
         self.sending.insert(id);
         self.refresh_outbox();
         self.request(account.id, |reply| Job::Send {

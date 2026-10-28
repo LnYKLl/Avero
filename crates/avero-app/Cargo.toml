@@ -35,10 +35,17 @@ tokio = { version = "1.54", features = ["rt", "sync", "net", "time", "macros"] }
 webbrowser = "1.2.5"
 
 # Windows only: gives the process Avero's AppUserModelID (notifications,
-# taskbar). Already in the dependency tree (through iced and others) with
-# the `Win32_UI_Shell` feature, so nothing new is compiled.
+# taskbar), and keeps Avero to one window per user (a named mutex, then
+# the running window brought to the front). Already in the dependency tree
+# (through iced and others), so no new crate: only more of its bindings.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Windows only: puts the icon and the version details (name, description,
 # version from Cargo) inside avero.exe. Without its default `toml` feature

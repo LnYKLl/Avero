@@ -565,6 +565,18 @@ fn send_cut_short_is_reported_not_repeated() {
 }
 
 #[test]
+fn mail_another_window_is_sending_is_not_sent_again() {
+    let mut app = app_with_mail(1);
+    let id = schedule(&mut app, When::Tonight);
+    // Another Avero on the same database reserved it first.
+    assert!(app.store.reserve_send(id, NOW).unwrap());
+    later(&mut app, LaterMsg::SendNow(id));
+    app.clock.set(NOW + 10 * 86_400);
+    later(&mut app, LaterMsg::Tick);
+    assert!(app.sending.is_empty());
+}
+
+#[test]
 fn scheduled_mail_is_edited_then_keeps_its_time_or_is_cancelled() {
     let mut app = app_with_mail(1);
     let id = schedule(&mut app, When::Monday);
