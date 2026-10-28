@@ -18,7 +18,7 @@ use crate::background::oauth_message;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
-    Account, AccountFilter, AccountId, Credentials, FolderRole, MessageRef, ServerConfig,
+    Account, AccountFilter, AccountId, Credentials, DraftCopy, FolderRole, MessageRef, ServerConfig,
 };
 use avero_sync::imap::{ImapSource, ImapWatch};
 use avero_sync::parse::{guarded, parse_body};
@@ -141,6 +141,9 @@ pub enum Event {
     Done(Result<(), AccountError>),
     /// A message was sent; `Ok(Some(warning))` if the Sent copy failed.
     Sent(Result<Option<String>, String>),
+    /// A draft was saved in the drafts folder: where its copy now is
+    /// (`None` when the server would not say).
+    DraftSaved(Result<Option<DraftCopy>, String>),
     /// Unread messages that just came into the inbox, to notify. Sent
     /// once per sync, to the [`Job::Watch`] subscriber only.
     NewMail(Vec<Arrival>),
@@ -199,6 +202,21 @@ pub enum Job {
     },
     Send {
         outgoing: Box<Outgoing>,
+        reply: Reply,
+    },
+    /// Saves a draft (`raw`, see `smtp::draft_message`) in the account's
+    /// drafts folder, flagged `\Draft`, then deletes its previous copies:
+    /// `replace`, and any other with the same Message-ID.
+    SaveDraft {
+        raw: Vec<u8>,
+        message_id: String,
+        replace: Option<DraftCopy>,
+        reply: Reply,
+    },
+    /// Deletes the copy of a draft from the server (it was sent, or
+    /// thrown away, or saved on another account).
+    DropDraft {
+        copy: DraftCopy,
         reply: Reply,
     },
     /// Starts watching the inbox. `reply` then gets what the worker does
@@ -363,12 +381,16 @@ fn refuse(job: Job, message: &str) {
         Job::Send { reply, .. } => {
             let _ = reply.send(Event::Sent(Err(message.to_string())));
         }
+        Job::SaveDraft { reply, .. } => {
+            let _ = reply.send(Event::DraftSaved(Err(message.to_string())));
+        }
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
         | Job::SetFlagged { reply, .. }
         | Job::Move { reply, .. }
-        | Job::DeleteForever { reply, .. } => {
+        | Job::DeleteForever { reply, .. }
+        | Job::DropDraft { reply, .. } => {
             let _ = reply.send(Event::Done(Err(error())));
         }
         // Nothing will happen on its own: the stream just ends.
@@ -1004,6 +1026,19 @@ impl<C: Connector> Worker<C> {
                 let result = self.send(&outgoing).await;
                 let _ = reply.send(Event::Sent(result));
             }
+            Job::SaveDraft {
+                raw,
+                message_id,
+                replace,
+                reply,
+            } => {
+                let result = self.save_draft(&raw, &message_id, replace).await;
+                let _ = reply.send(Event::DraftSaved(result));
+            }
+            Job::DropDraft { copy, reply } => {
+                let result = self.drop_draft(&copy.folder, &[copy.uid]).await;
+                let _ = reply.send(Event::Done(result));
+            }
             Job::Shutdown { delete_secret } => {
                 // The sync and watcher threads must be done with the
                 // secret before it is deleted (a refresh could store a
@@ -1463,6 +1498,80 @@ impl<C: Connector> Worker<C> {
         }))
     }
 }
+
+impl<C: Connector> Worker<C> {
+    /// Appends the new version of a draft, finds its UID by its
+    /// Message-ID, then deletes the older versions (failing to delete
+    /// them only leaves a duplicate: the save itself worked).
+    async fn save_draft(
+        &mut self,
+        raw: &[u8],
+        message_id: &str,
+        replace: Option<DraftCopy>,
+    ) -> Result<Option<DraftCopy>, String> {
+        let drafts = self
+            .store
+            .folder_by_role(self.account.id, FolderRole::Drafts)
+            .ok()
+            .flatten()
+            .ok_or_else(|| NO_DRAFTS_FOLDER.to_string())?;
+        let path = drafts.path.clone();
+        // Never retried after a timeout: the draft may already be there.
+        self.with_session_retrying(false, async |session, _store| {
+            session.append_draft(&path, raw).await
+        })
+        .await
+        .map_err(|e| e.message)?;
+        let found = self
+            .with_session(async |session, _store| {
+                session.select(&path).await?;
+                session.search_message_id(message_id).await
+            })
+            .await
+            .unwrap_or_default();
+        // UIDs only grow: the newest copy is the one just added.
+        let replaced = replace
+            .filter(|old| old.account == self.account.id && old.folder == path)
+            .map(|old| old.uid);
+        let newest = found.iter().copied().filter(|&u| Some(u) != replaced).max();
+        let mut older: Vec<u32> = found.into_iter().filter(|&u| Some(u) != newest).collect();
+        if let Some(uid) = replaced
+            && !older.contains(&uid)
+        {
+            older.push(uid);
+        }
+        if !older.is_empty() {
+            let _ = self.drop_draft(&path, &older).await;
+        }
+        Ok(newest.map(|uid| DraftCopy {
+            account: self.account.id,
+            folder: path,
+            uid,
+        }))
+    }
+
+    /// Deletes draft copies for good, and their rows in the list.
+    async fn drop_draft(&mut self, folder: &str, uids: &[u32]) -> Result<(), AccountError> {
+        self.with_session(async |session, _store| {
+            session.select(folder).await?;
+            session.delete_permanently(uids).await
+        })
+        .await?;
+        let known = self.store.folders(self.account.id).unwrap_or_default();
+        if let Some(local) = known.iter().find(|f| f.path == folder) {
+            for &uid in uids {
+                if let Ok(Some(row)) = self.store.message_row(local.id, uid) {
+                    let _ = self.store.delete_messages(&[row]);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shown when an account has no drafts folder.
+pub const NO_DRAFTS_FOLDER: &str =
+    "Aucun dossier « Brouillons » sur ce compte : le brouillon reste sur cet ordinateur";
 
 /// Shown when an account has no SMTP server (accounts made before V1).
 pub const SMTP_MISSING: &str =
@@ -1929,6 +2038,79 @@ mod tests {
         });
     }
 
+    /// Saves a draft on the fake server and returns where it went.
+    async fn save_draft(
+        fake: &Fake,
+        version: u32,
+        replace: Option<DraftCopy>,
+    ) -> Result<Option<DraftCopy>, String> {
+        let raw = format!("Message-ID: <d1@x.fr>\r\nSubject: v{version}\r\n\r\nx").into_bytes();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SaveDraft {
+                raw,
+                message_id: "<d1@x.fr>".into(),
+                replace,
+                reply,
+            })
+            .collect()
+            .await;
+        match events.last() {
+            Some(Event::DraftSaved(result)) => result.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The UIDs left in the fake drafts folder.
+    fn draft_uids(fake: &Fake) -> Vec<u32> {
+        fake.server
+            .drafts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.0)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn draft_replaces_its_previous_copy_and_goes_when_dropped() {
+        let fake = fake_worker("drafts");
+        assert_eq!(
+            save_draft(&fake, 1, None).await,
+            Err(NO_DRAFTS_FOLDER.to_string())
+        );
+        fake.store
+            .upsert_folder(fake.account, "Drafts", FolderRole::Drafts)
+            .unwrap();
+        let first = save_draft(&fake, 1, None).await.unwrap().unwrap();
+        assert_eq!((first.folder.as_str(), first.uid), ("Drafts", 11));
+        let raw = String::from_utf8(fake.server.drafts.lock().unwrap()[0].2.clone()).unwrap();
+        assert!(raw.contains("Subject: v1"), "{raw}");
+        // The next save replaces it (found by its UID).
+        let second = save_draft(&fake, 2, Some(first)).await.unwrap().unwrap();
+        assert_eq!(second.uid, 12);
+        assert_eq!(draft_uids(&fake), vec![12]);
+        // A copy the computer did not know (same Message-ID) goes too.
+        fake.server.drafts.lock().unwrap().push((
+            13,
+            "Drafts".into(),
+            b"Message-ID: <d1@x.fr>\r\n\r\nold".to_vec(),
+        ));
+        let third = save_draft(&fake, 3, Some(second)).await.unwrap().unwrap();
+        assert_eq!(draft_uids(&fake), vec![third.uid]);
+        // Sent or thrown away: dropped.
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::DropDraft { copy: third, reply })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Done(Ok(())))),
+            "{events:?}"
+        );
+        assert!(draft_uids(&fake).is_empty());
+    }
+
     /// A fake IMAP server whose folder list waits until `open` turns
     /// true: a sync on it lasts as long as the test wants.
     ///
@@ -1953,6 +2135,9 @@ mod tests {
         watch_refused: std::sync::atomic::AtomicBool,
         /// Every `(uid, starred)` sent by `set_flagged`.
         stars: std::sync::Mutex<Vec<(u32, bool)>>,
+        /// The drafts folder: `(uid, folder, raw)` of each draft appended
+        /// and not deleted.
+        drafts: std::sync::Mutex<Vec<(u32, String, Vec<u8>)>>,
     }
 
     struct FakeConnector(Arc<FakeServer>);
@@ -2076,7 +2261,12 @@ mod tests {
         async fn move_to(&mut self, _uids: &[u32], _dest: &str) -> Result<(), SyncError> {
             Ok(())
         }
-        async fn delete_permanently(&mut self, _uids: &[u32]) -> Result<(), SyncError> {
+        async fn delete_permanently(&mut self, uids: &[u32]) -> Result<(), SyncError> {
+            self.0
+                .drafts
+                .lock()
+                .unwrap()
+                .retain(|d| !uids.contains(&d.0));
             Ok(())
         }
         async fn append(
@@ -2086,6 +2276,21 @@ mod tests {
             _seen: bool,
         ) -> Result<(), SyncError> {
             Ok(())
+        }
+        async fn append_draft(&mut self, folder: &str, raw: &[u8]) -> Result<(), SyncError> {
+            let mut drafts = self.0.drafts.lock().unwrap();
+            let uid = drafts.iter().map(|d| d.0).max().unwrap_or(10) + 1;
+            drafts.push((uid, folder.to_string(), raw.to_vec()));
+            Ok(())
+        }
+        async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError> {
+            let drafts = self.0.drafts.lock().unwrap();
+            let header = format!("Message-ID: {message_id}");
+            Ok(drafts
+                .iter()
+                .filter(|d| String::from_utf8_lossy(&d.2).contains(&header))
+                .map(|d| d.0)
+                .collect())
         }
     }
 
@@ -2149,6 +2354,7 @@ mod tests {
             watch_failures: AtomicUsize::new(0),
             watch_refused: std::sync::atomic::AtomicBool::new(false),
             stars: std::sync::Mutex::new(Vec::new()),
+            drafts: std::sync::Mutex::new(Vec::new()),
         });
 
         let worker = WorkerHandle::spawn_with(
