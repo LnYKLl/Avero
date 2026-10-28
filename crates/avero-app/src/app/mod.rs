@@ -433,6 +433,16 @@ pub struct App {
     pub(crate) spinner: f32,
 }
 
+/// Erases the secrets of the accounts the store merged at startup (the
+/// store cannot reach the keyring itself).
+fn forget_merged_secrets(store: &Store, secrets: &dyn SecretStore) {
+    for id in store.merged_accounts() {
+        if let Err(e) = secrets.delete(*id) {
+            eprintln!("Impossible d'effacer le secret d'un compte fusionné : {e}");
+        }
+    }
+}
+
 impl App {
     /// Loads the accounts and the first page, starts one worker per
     /// account and asks for a sync of all of them.
@@ -450,6 +460,10 @@ impl App {
         // server flags apply again.
         if let Err(e) = store.clear_pending() {
             eprintln!("Impossible de remettre la base en ordre : {e}");
+        }
+        // Accounts merged by the database migration lose their secrets too.
+        if let Backend::Live { secrets, .. } = &backend {
+            forget_merged_secrets(&store, secrets.as_ref());
         }
         let mut app = App {
             store,

@@ -15,6 +15,9 @@ use crate::{
 pub enum StoreError {
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// An account with this e-mail address (case and spaces ignored) exists.
+    #[error("an account with this address already exists")]
+    DuplicateAccount,
 }
 
 /// Length of `UnifiedItem::snippet`, in characters.
@@ -23,6 +26,9 @@ const SNIPPET_CHARS: usize = 140;
 /// The Avero database (one SQLite connection).
 pub struct Store {
     conn: Connection,
+    /// Accounts removed when the database was opened because another
+    /// account had the same address (see `merged_accounts`).
+    merged: Vec<AccountId>,
 }
 
 /// Columns read by `account_from_row`, in order.
@@ -49,14 +55,24 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store, StoreError> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let store = Store { conn };
+        let mut store = Store {
+            conn,
+            merged: Vec::new(),
+        };
         store.migrate()?;
         Ok(store)
     }
 
+    /// The accounts deleted by the version 4 migration, which merged
+    /// accounts sharing one address. The caller must erase their secrets:
+    /// the store cannot reach the `SecretStore`.
+    pub fn merged_accounts(&self) -> &[AccountId] {
+        &self.merged
+    }
+
     /// Applies the schema versions the database has not seen yet, each in
     /// its own transaction.
-    fn migrate(&self) -> Result<(), StoreError> {
+    fn migrate(&mut self) -> Result<(), StoreError> {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -80,6 +96,35 @@ impl Store {
                 result?;
             }
         }
+        if version < 4 {
+            self.migrate_to_v4()?;
+        }
+        Ok(())
+    }
+
+    /// Version 4: one account per address. Accounts with the same address
+    /// (case and spaces ignored) are merged into the oldest one, then a
+    /// unique index keeps it that way. Foreign keys stay on, so bodies go
+    /// with their messages.
+    fn migrate_to_v4(&mut self) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let doomed: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM accounts
+                 WHERE id NOT IN (SELECT MIN(id) FROM accounts
+                                  GROUP BY lower(trim(email)))
+                 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for id in &doomed {
+            delete_account_rows(&tx, AccountId(*id))?;
+        }
+        tx.execute_batch(include_str!("schema_v4.sql"))?;
+        tx.execute_batch("PRAGMA user_version = 4;")?;
+        tx.commit()?;
+        self.merged.extend(doomed.into_iter().map(AccountId));
         Ok(())
     }
 
@@ -100,7 +145,7 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
         let color = AccountColor::palette(count as usize);
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT INTO accounts
                  (name, email, color_r, color_g, color_b,
                   imap_host, imap_port, imap_user, imap_security,
@@ -122,7 +167,18 @@ impl Store {
                 new.smtp.security.as_str(),
                 new.auth.as_str(),
             ],
-        )?;
+        );
+        // The unique index on the address is the guarantee.
+        match inserted {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StoreError::DuplicateAccount);
+            }
+            other => {
+                other?;
+            }
+        }
         Ok(Account {
             id: AccountId(self.conn.last_insert_rowid()),
             name: new.name,
@@ -180,14 +236,7 @@ impl Store {
     /// entries. Its secret is not touched (that is the `SecretStore`'s job).
     pub fn delete_account(&self, id: AccountId) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        // Bodies go by ON DELETE CASCADE, search entries by trigger.
-        tx.execute(
-            "DELETE FROM messages
-             WHERE folder_id IN (SELECT id FROM folders WHERE account_id = ?1)",
-            params![id.0],
-        )?;
-        tx.execute("DELETE FROM folders WHERE account_id = ?1", params![id.0])?;
-        tx.execute("DELETE FROM accounts WHERE id = ?1", params![id.0])?;
+        delete_account_rows(&tx, id)?;
         tx.commit()?;
         Ok(())
     }
@@ -607,6 +656,19 @@ impl Store {
 }
 
 /// `None` for all accounts, else the account id (for `?n IS NULL OR ...`).
+/// Deletes the rows an account owns, inside the caller's transaction.
+fn delete_account_rows(conn: &Connection, id: AccountId) -> Result<(), StoreError> {
+    // Bodies go by ON DELETE CASCADE, search entries by trigger.
+    conn.execute(
+        "DELETE FROM messages
+         WHERE folder_id IN (SELECT id FROM folders WHERE account_id = ?1)",
+        params![id.0],
+    )?;
+    conn.execute("DELETE FROM folders WHERE account_id = ?1", params![id.0])?;
+    conn.execute("DELETE FROM accounts WHERE id = ?1", params![id.0])?;
+    Ok(())
+}
+
 fn filter_account(filter: AccountFilter) -> Option<i64> {
     match filter {
         AccountFilter::All => None,
@@ -1269,6 +1331,60 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_address_is_refused_whatever_the_case() {
+        let s = Store::open_in_memory().unwrap();
+        acct(&s, "a@x.fr");
+        let err = s.add_account(new_account(" A@X.fr ")).unwrap_err();
+        assert!(matches!(err, StoreError::DuplicateAccount), "{err:?}");
+        assert_eq!(s.accounts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn version_3_duplicates_are_merged_into_the_oldest() {
+        let path = std::env::temp_dir().join(format!("avero-merge-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            let first = acct(&s, "A@x.fr");
+            let second = acct(&s, "b@x.fr");
+            // Same address as `first`: only possible without the v4 index.
+            s.conn
+                .execute_batch("DROP INDEX accounts_email_unique;")
+                .unwrap();
+            let dup = acct(&s, "a@x.fr ");
+            for (account, uid) in [(first, 1), (second, 2), (dup, 3)] {
+                let f = inbox(&s, account);
+                s.insert_messages(f.id, &[msg(uid, None, 10)]).unwrap();
+            }
+            let dup_row = s
+                .message_refs(&inbox_rows(&s))
+                .unwrap()
+                .into_iter()
+                .find(|m| m.uid == 3)
+                .unwrap();
+            s.put_body(dup_row.row_id, b"raw", "texte", false).unwrap();
+            s.conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+            assert_eq!((first.0, dup.0), (1, 3));
+        }
+
+        let s = Store::open(&path).unwrap();
+
+        let ids: Vec<i64> = s.accounts().unwrap().iter().map(|a| a.id.0).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(s.merged_accounts(), &[AccountId(3)]);
+        assert_eq!(count(&s, "messages"), 2);
+        assert_eq!(count(&s, "folders"), 2);
+        assert_eq!(count(&s, "bodies"), 0);
+        assert!(s.add_account(new_account("a@X.fr")).is_err());
+        drop(s);
+        // A second opening has nothing left to merge.
+        let s = Store::open(&path).unwrap();
+        assert!(s.merged_accounts().is_empty());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn fts_query_quotes_every_word() {
         assert_eq!(fts_query("  "), None);
         assert_eq!(fts_query("- * ("), None);
@@ -1321,7 +1437,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

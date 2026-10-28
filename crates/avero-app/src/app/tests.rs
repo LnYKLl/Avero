@@ -1071,3 +1071,39 @@ fn shortcuts_do_not_disturb_composer_or_dialogs() {
     let _ = app.update(key_j);
     assert_eq!(app.selected_index(), before);
 }
+
+/// Accounts merged by the database migration lose their secrets, the
+/// kept account's secret stays.
+#[test]
+fn merged_accounts_secrets_are_erased() {
+    use avero_core::secrets::{MemorySecrets, SecretStore};
+    let path = std::env::temp_dir().join(format!("avero-merged-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let store = Store::open(&path).unwrap();
+        add_account_with_mail(&store, "a@x.fr", 1);
+    }
+    {
+        // Rebuild what an old version could leave: a second "A@x.fr".
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX accounts_email_unique;
+             INSERT INTO accounts (id, name, email, color_r, color_g, color_b,
+                                   imap_host, imap_port, imap_user)
+             VALUES (2, 'A', 'A@x.fr', 1, 2, 3, 'imap.x.fr', 993, 'A@x.fr');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+    let secrets = MemorySecrets::new();
+    secrets.set(AccountId(1), "keep").unwrap();
+    secrets.set(AccountId(2), "forget").unwrap();
+
+    let store = Store::open(&path).unwrap();
+    forget_merged_secrets(&store, &secrets);
+
+    assert_eq!(secrets.get(AccountId(1)).unwrap().as_deref(), Some("keep"));
+    assert_eq!(secrets.get(AccountId(2)).unwrap(), None);
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+}

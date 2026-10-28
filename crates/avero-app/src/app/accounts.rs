@@ -7,6 +7,7 @@ use crate::account_form::{self, AccountForm, Stage};
 use crate::auth::{self, OAuthGrant};
 use crate::background::{self, LoginError};
 use crate::worker::{AccountError, ErrorKind, Event, Job};
+use avero_core::store::StoreError;
 use avero_core::{AccountFilter, AccountId, Credentials, NewAccount, ServerConfig};
 use avero_oauth::Provider;
 use iced::Task;
@@ -505,21 +506,25 @@ impl App {
     /// Saves a checked account, hands its secret to the new worker and
     /// starts its first sync.
     fn finish_account(&mut self, new: NewAccount, secret: NewSecret) -> Task<Message> {
-        if self
+        // Quick check for the common case; the database is the guarantee.
+        let known = self
             .accounts
             .iter()
-            .any(|a| a.email.eq_ignore_ascii_case(&new.email))
-        {
-            if let Some(form) = self.form() {
-                form.error = Some("Ce compte est déjà dans Avero.".to_string());
-            }
-            return Task::none();
-        }
-        let account = match self.store.add_account(new) {
+            .any(|a| a.email.trim().eq_ignore_ascii_case(new.email.trim()));
+        let added = if known {
+            Err(StoreError::DuplicateAccount)
+        } else {
+            self.store.add_account(new)
+        };
+        let account = match added {
             Ok(account) => account,
             Err(e) => {
+                let text = match e {
+                    StoreError::DuplicateAccount => "Ce compte est déjà dans Avero.".to_string(),
+                    e => format!("Impossible d'ajouter le compte : {e}"),
+                };
                 if let Some(form) = self.form() {
-                    form.error = Some(format!("Impossible d'ajouter le compte : {e}"));
+                    form.error = Some(text);
                 }
                 return Task::none();
             }
