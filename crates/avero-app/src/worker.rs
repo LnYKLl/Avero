@@ -2037,6 +2037,13 @@ mod tests {
         ) -> Result<Vec<ServerFlags>, SyncError> {
             Ok(Vec::new())
         }
+        async fn fetch_sizes(
+            &mut self,
+            _from_uid: u32,
+            _to_uid: u32,
+        ) -> Result<Vec<(u32, u32)>, SyncError> {
+            Ok(Vec::new())
+        }
         async fn fetch_body(&mut self, _uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
             Ok(Some(b"Subject: s\r\n\r\nBonjour".to_vec()))
         }

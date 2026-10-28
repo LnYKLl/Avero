@@ -248,6 +248,9 @@ pub struct NewMessage {
     pub has_attachments: bool,
     /// Threading, mailing-list and recipient headers.
     pub headers: MessageHeaders,
+    /// Size of the whole message on the server (RFC822.SIZE), in bytes,
+    /// when the server said it.
+    pub size: Option<u32>,
 }
 
 /// The headers kept besides those shown in the list: they link a message
@@ -331,6 +334,24 @@ pub struct UnifiedItem {
     /// the user's own addresses are `moi`. Just the sender for a single
     /// message.
     pub senders: Vec<String>,
+}
+
+/// One sender of "Grand nettoyage": how much mail they left in the
+/// user's folders (trash, spam, sent and drafts left out).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderStats {
+    /// The address, trimmed and in lower case.
+    pub addr: String,
+    /// The name of their most recent message (else the address).
+    pub name: String,
+    /// Number of messages (each copy counts).
+    pub count: usize,
+    /// How many were never opened (still unread).
+    pub unread: usize,
+    /// Total size in bytes (messages of unknown size count 0).
+    pub size: u64,
+    /// One of their messages offers to unsubscribe (List-Unsubscribe).
+    pub can_unsubscribe: bool,
 }
 
 /// Where one stored message lives on the server.

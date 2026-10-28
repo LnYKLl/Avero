@@ -343,6 +343,7 @@ pub fn seed(store: &Store) {
         let date = now - sample.minutes_ago * 60;
         let references = ancestors(&samples, index);
         let (unsubscribe, unsubscribe_post, list_id) = list_headers(sample.from.1);
+        let raw = raw_message(sample, ACCOUNTS[sample.account].1, uid, date, &references);
         let message = NewMessage {
             uid,
             message_id: Some(demo_id(index)),
@@ -362,11 +363,11 @@ pub fn seed(store: &Store) {
                 list_id: list_id.map(str::to_string),
                 ..Default::default()
             },
+            size: Some(raw.len() as u32),
         };
         store
             .insert_messages(folder.id, &[message])
             .expect("demo message");
-        let raw = raw_message(sample, ACCOUNTS[sample.account].1, uid, date, &references);
         if let Some(row) = row_for(store, account, sample.role, date) {
             let _ = store.put_body(
                 row,

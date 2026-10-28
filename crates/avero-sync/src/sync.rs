@@ -104,6 +104,10 @@ pub async fn sync_account<S: MailSource>(
             Ok(()) | Err(SyncError::Protocol(_)) => {}
             Err(other) => return Err(other),
         }
+        match complete_sizes(store, source, folder).await {
+            Ok(()) | Err(SyncError::Protocol(_)) => {}
+            Err(other) => return Err(other),
+        }
     }
 
     Ok(report)
@@ -148,6 +152,35 @@ async fn complete_headers<S: MailSource>(
         store.complete_headers(folder.id, &uids, &messages)?;
         report.completed_headers += messages.len();
         on_progress(report);
+    }
+}
+
+/// Fetches, [`BATCH`] at a time and newest first, the size of the
+/// folder's messages stored before Avero kept it ("Grand nettoyage"
+/// shows it). Selects the folder only if there is something to do.
+async fn complete_sizes<S: MailSource>(
+    store: &Store,
+    source: &mut S,
+    folder: &Folder,
+) -> Result<(), SyncError> {
+    let mut selected = false;
+    loop {
+        let mut uids = store.missing_sizes(folder.id, BATCH as usize)?;
+        if uids.is_empty() {
+            return Ok(());
+        }
+        if !selected {
+            let status = source.select(&folder.path).await?;
+            if folder.uid_validity != Some(status.uid_validity) {
+                return Ok(());
+            }
+            selected = true;
+        }
+        uids.sort_unstable();
+        let (first, last) = (uids[0], uids[uids.len() - 1]);
+        let sizes = source.fetch_sizes(first, last).await?;
+        // Every UID asked gets a size (0 if gone), so this loop ends.
+        store.set_sizes(folder.id, &uids, &sizes)?;
     }
 }
 
@@ -345,9 +378,16 @@ mod tests {
         fetch_fails_from: Option<(u32, Fail)>,
         /// Extra header lines of some messages, by UID.
         extra: Vec<(u32, String)>,
+        /// The headers come without RFC822.SIZE (an old Avero).
+        no_sizes: bool,
     }
 
     impl FakeFolder {
+        /// The RFC822.SIZE of `uid`: ten times the UID.
+        fn size(&self, uid: u32) -> Option<u32> {
+            (!self.no_sizes).then_some(uid * 10)
+        }
+
         /// The header block of `uid`: its Message-ID tells the folder
         /// apart, so copies in two folders are different messages.
         fn raw(&self, uid: u32) -> Vec<u8> {
@@ -377,6 +417,8 @@ mod tests {
         flag_fetches: Vec<String>,
         /// (from, to) of every fetch_flags call.
         flag_ranges: Vec<(u32, u32)>,
+        /// (from, to) of every fetch_sizes call.
+        size_fetches: Vec<(u32, u32)>,
     }
 
     impl FakeSource {
@@ -392,6 +434,7 @@ mod tests {
                 select_fails: None,
                 fetch_fails_from: None,
                 extra: Vec::new(),
+                no_sizes: false,
             });
         }
 
@@ -457,6 +500,7 @@ mod tests {
                     uid,
                     seen: folder.seen.contains(&uid),
                     flagged: folder.flagged.contains(&uid),
+                    size: folder.size(uid),
                     raw: folder.raw(uid),
                 })
                 .collect())
@@ -488,6 +532,7 @@ mod tests {
                     uid,
                     seen: folder.seen.contains(&uid),
                     flagged: folder.flagged.contains(&uid),
+                    size: folder.size(uid),
                     raw: folder.raw(uid),
                 })
                 .collect())
@@ -525,6 +570,21 @@ mod tests {
             self.flag_fetches.push(path);
             self.flag_ranges.push((from_uid, to_uid));
             Ok(flags)
+        }
+
+        async fn fetch_sizes(
+            &mut self,
+            from_uid: u32,
+            to_uid: u32,
+        ) -> Result<Vec<(u32, u32)>, SyncError> {
+            self.size_fetches.push((from_uid, to_uid));
+            let folder = self.selected();
+            Ok(folder
+                .uids
+                .iter()
+                .filter(|&&uid| (from_uid..=to_uid).contains(&uid))
+                .map(|&uid| (uid, uid * 10))
+                .collect())
         }
 
         async fn delete_permanently(&mut self, uids: &[u32]) -> Result<(), SyncError> {
@@ -1215,6 +1275,30 @@ mod tests {
         let report = sync(&store, &mut source, account).await.unwrap();
         assert_eq!(report.completed_headers, 0);
         assert_eq!(source.selects, vec!["INBOX", "Sent"]);
+    }
+
+    #[tokio::test]
+    async fn sizes_are_stored_then_completed_for_old_messages() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("INBOX", &[], 1, vec![1, 2, 3]);
+        source.folder("INBOX").no_sizes = true;
+        sync(&store, &mut source, account).await.unwrap();
+        // Stored without their size, then completed in the same sync.
+        assert_eq!(source.size_fetches, vec![(1, 3)]);
+        let inbox = inbox_id(&store, account);
+        assert!(store.missing_sizes(inbox, 10).unwrap().is_empty());
+        let stats = store.sender_stats(AccountFilter::All, 10, 0).unwrap();
+        assert_eq!(stats[0].size, 60);
+
+        // New messages come with their size: nothing more to ask.
+        source.folder("INBOX").no_sizes = false;
+        source.folder("INBOX").uids.push(4);
+        source.size_fetches.clear();
+        sync(&store, &mut source, account).await.unwrap();
+        assert!(source.size_fetches.is_empty());
+        let stats = store.sender_stats(AccountFilter::All, 10, 0).unwrap();
+        assert_eq!(stats[0].size, 100);
     }
 
     #[tokio::test]

@@ -27,6 +27,8 @@ pub struct FetchedHeader {
     pub seen: bool,
     /// Starred (`\Flagged`).
     pub flagged: bool,
+    /// RFC822.SIZE: the size of the whole message, in bytes.
+    pub size: Option<u32>,
     pub raw: Vec<u8>,
 }
 
@@ -35,6 +37,7 @@ impl FetchedHeader {
     pub fn parse(&self) -> NewMessage {
         let mut message = parse_headers(self.uid, self.seen, &self.raw);
         message.flagged = self.flagged;
+        message.size = self.size;
         message
     }
 }
@@ -90,6 +93,14 @@ pub trait MailSource {
         from_uid: u32,
         to_uid: u32,
     ) -> Result<Vec<ServerFlags>, SyncError>;
+
+    /// The size (RFC822.SIZE) of every message with a UID in
+    /// `from_uid..=to_uid`, as `(uid, bytes)`.
+    async fn fetch_sizes(
+        &mut self,
+        from_uid: u32,
+        to_uid: u32,
+    ) -> Result<Vec<(u32, u32)>, SyncError>;
 
     /// The full raw message `uid` of the selected folder, without marking it
     /// as read. `None` when the server has no such message.

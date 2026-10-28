@@ -6,6 +6,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+mod cleanup;
+mod filters;
+
 use crate::category::{classify, sender_key};
 use crate::{
     Account, AccountColor, AccountFilter, AccountId, AuthKind, Category, Folder, FolderId,
@@ -187,6 +190,12 @@ impl Store {
             tx.execute_batch(include_str!("schema_v7.sql"))?;
             classify_unsorted(&tx)?;
             tx.execute_batch("PRAGMA user_version = 7;")?;
+            tx.commit()?;
+        }
+        if version < 8 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(include_str!("schema_v8.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 8;")?;
             tx.commit()?;
         }
         Ok(())
@@ -417,9 +426,9 @@ impl Store {
                      (folder_id, uid, message_id, subject, from_name, from_addr, date, seen,
                       has_attachments, in_reply_to, refs, to_addrs, delivered_to,
                       list_unsubscribe, list_unsubscribe_post, list_id, precedence,
-                      auto_submitted, headers_v2, flagged, category)
+                      auto_submitted, headers_v2, flagged, category, size)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                         ?14, ?15, ?16, ?17, ?18, 1, ?19, ?20)",
+                         ?14, ?15, ?16, ?17, ?18, 1, ?19, ?20, ?21)",
             )?;
             for m in msgs {
                 let h = &m.headers;
@@ -445,6 +454,7 @@ impl Store {
                     h.auto_submitted,
                     m.flagged,
                     category.as_str(),
+                    m.size,
                 ])?;
                 if inserted == 1 {
                     let row = tx.last_insert_rowid();
@@ -1510,11 +1520,11 @@ mod tests {
         }
     }
 
-    fn acct(store: &Store, email: &str) -> AccountId {
+    pub(super) fn acct(store: &Store, email: &str) -> AccountId {
         store.add_account(new_account(email)).unwrap().id
     }
 
-    fn inbox(store: &Store, account: AccountId) -> Folder {
+    pub(super) fn inbox(store: &Store, account: AccountId) -> Folder {
         store
             .upsert_folder(account, "INBOX", FolderRole::Inbox)
             .unwrap()
@@ -1534,14 +1544,14 @@ mod tests {
             .collect()
     }
 
-    fn count(store: &Store, table: &str) -> i64 {
+    pub(super) fn count(store: &Store, table: &str) -> i64 {
         store
             .conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
     }
 
-    fn msg(uid: u32, message_id: Option<&str>, date: i64) -> NewMessage {
+    pub(super) fn msg(uid: u32, message_id: Option<&str>, date: i64) -> NewMessage {
         NewMessage {
             uid,
             message_id: message_id.map(|s| s.to_string()),
@@ -1563,7 +1573,12 @@ mod tests {
         m
     }
 
-    fn folder(store: &Store, account: AccountId, path: &str, role: FolderRole) -> FolderId {
+    pub(super) fn folder(
+        store: &Store,
+        account: AccountId,
+        path: &str,
+        role: FolderRole,
+    ) -> FolderId {
         store.upsert_folder(account, path, role).unwrap().id
     }
 
@@ -2152,6 +2167,7 @@ mod tests {
                 .find(|m| m.uid == 3)
                 .unwrap();
             s.put_body(dup_row.row_id, b"raw", "texte", false).unwrap();
+            s.conn.execute_batch(UNDO_V8).unwrap();
             s.conn.execute_batch(UNDO_V5).unwrap();
             s.conn.execute_batch("PRAGMA user_version = 3;").unwrap();
             assert_eq!((first.0, dup.0), (1, 3));
@@ -2462,7 +2478,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let ids = thread_ids(&s);
         assert_eq!(ids["Un"], 1);
         assert_eq!(ids["Deux"], 3);
@@ -2482,8 +2498,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Undoes version 8 (to test older migrations).
+    const UNDO_V8: &str = "
+        DROP TABLE spam_learned;
+        DROP TABLE spam_tokens;
+        DROP TABLE rule_conditions;
+        DROP TABLE rules;
+        ALTER TABLE accounts DROP COLUMN spam_bootstrapped;
+        ALTER TABLE senders DROP COLUMN not_spam;
+        ALTER TABLE messages DROP COLUMN size;
+    ";
+
     /// Takes a database back to version 4 (to test older migrations): undoes
-    /// versions 7, 6 and 5.
+    /// versions 7, 6 and 5 (after `UNDO_V8`).
     const UNDO_V5: &str = "
         DROP TABLE senders;
         DROP INDEX messages_sender;
@@ -2786,15 +2813,16 @@ mod tests {
             s.insert_messages(f.id, &[news, from(2, "noreply@banque.fr", 20)])
                 .unwrap();
             s.conn
-                .execute_batch(
-                    "DROP TABLE senders;
+                .execute_batch(&format!(
+                    "{UNDO_V8}
+                     DROP TABLE senders;
                      DROP INDEX messages_sender;
                      DROP INDEX messages_flagged;
                      ALTER TABLE messages DROP COLUMN flagged;
                      ALTER TABLE messages DROP COLUMN flag_pending;
                      ALTER TABLE messages DROP COLUMN category;
-                     PRAGMA user_version = 6;",
-                )
+                     PRAGMA user_version = 6;"
+                ))
                 .unwrap();
         }
         let s = Store::open(&path).unwrap();
@@ -2802,7 +2830,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
         assert_eq!(tab(&s, Category::Notification), vec!["noreply@banque.fr 2"]);
         assert!(tab(&s, Category::Important).is_empty());
@@ -2863,7 +2891,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

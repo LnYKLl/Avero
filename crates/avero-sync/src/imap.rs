@@ -338,7 +338,10 @@ where
         Some(to) => format!("{from_uid}:{to}"),
         None => format!("{from_uid}:*"),
     };
-    let command = format!("UID FETCH {range} (UID FLAGS {})", header_section());
+    let command = format!(
+        "UID FETCH {range} (UID FLAGS RFC822.SIZE {})",
+        header_section()
+    );
     let mut headers = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         headers.extend(header_from_fetch(attributes, from_uid));
@@ -358,7 +361,10 @@ async fn fetch_headers_seq<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
-    let command = format!("FETCH {from_seq}:{to_seq} (UID FLAGS {})", header_section());
+    let command = format!(
+        "FETCH {from_seq}:{to_seq} (UID FLAGS RFC822.SIZE {})",
+        header_section()
+    );
     let mut headers = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         headers.extend(header_from_fetch(attributes, 0));
@@ -410,6 +416,38 @@ where
     })
     .await?;
     Ok(flags)
+}
+
+/// The size (RFC822.SIZE) of every message with a UID in
+/// `from_uid..=to_uid`.
+async fn fetch_sizes_range<T>(
+    session: &mut Session<T>,
+    from_uid: u32,
+    to_uid: u32,
+) -> Result<Vec<(u32, u32)>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("UID FETCH {from_uid}:{to_uid} (UID RFC822.SIZE)");
+    let mut sizes = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        let (uid, _, _) = read_fetch(attributes);
+        if let Some(uid) = uid.filter(|uid| (from_uid..=to_uid).contains(uid))
+            && let Some(size) = size_of(attributes)
+        {
+            sizes.push((uid, size));
+        }
+    })
+    .await?;
+    Ok(sizes)
+}
+
+/// The RFC822.SIZE of a FETCH answer, if it holds one.
+fn size_of(attributes: &[AttributeValue<'_>]) -> Option<u32> {
+    attributes.iter().find_map(|attribute| match attribute {
+        AttributeValue::Rfc822Size(size) => Some(*size),
+        _ => None,
+    })
 }
 
 /// The full raw message, without setting `\Seen` (BODY.PEEK).
@@ -478,6 +516,7 @@ fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option
         uid,
         seen: read.seen,
         flagged: read.flagged,
+        size: size_of(attributes),
         raw,
     })
 }
@@ -832,6 +871,15 @@ impl MailSource for ImapSource {
         with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
 
+    async fn fetch_sizes(
+        &mut self,
+        from_uid: u32,
+        to_uid: u32,
+    ) -> Result<Vec<(u32, u32)>, SyncError> {
+        let fetching = fetch_sizes_range(&mut self.session, from_uid, to_uid);
+        with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
+    }
+
     async fn fetch_body(&mut self, uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
         let fetching = fetch_body_of(&mut self.session, uid);
         with_timeout(TRANSFER_TIMEOUT, "UID FETCH", fetching).await
@@ -948,7 +996,8 @@ mod tests {
     /// One FETCH answer carrying `header` as a literal.
     fn fetch_line(seq: u32, uid: u32, flags: &str, header: &str) -> String {
         format!(
-            "* {seq} FETCH (UID {uid} FLAGS ({flags}) BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            "* {seq} FETCH (UID {uid} FLAGS ({flags}) RFC822.SIZE {} BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            uid * 100,
             header.len()
         )
     }
@@ -1002,6 +1051,8 @@ mod tests {
         assert!(headers[0].seen);
         assert!(!headers[1].seen);
         assert_eq!(headers[0].raw, header.as_bytes());
+        assert_eq!(headers[0].size, Some(500));
+        assert_eq!(headers[0].parse().size, Some(500));
     }
 
     #[tokio::test]
@@ -1167,7 +1218,10 @@ mod tests {
         let sent = commands(session, server).await;
         assert_eq!(
             sent,
-            vec![format!("FETCH 1999:2000 (UID FLAGS {})", header_section())]
+            vec![format!(
+                "FETCH 1999:2000 (UID FLAGS RFC822.SIZE {})",
+                header_section()
+            )]
         );
     }
 
@@ -1186,7 +1240,9 @@ mod tests {
         assert_eq!(headers[0].raw, header.as_bytes());
         let sent = commands(session, server).await;
         assert!(
-            sent[0].starts_with("UID FETCH 4:9 (UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID "),
+            sent[0].starts_with(
+                "UID FETCH 4:9 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID "
+            ),
             "{sent:?}"
         );
         for field in [
