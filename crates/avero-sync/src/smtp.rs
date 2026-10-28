@@ -105,8 +105,17 @@ fn send_error(error: lettre::transport::smtp::Error) -> SendError {
     match error.status().map(|code| code.to_string()) {
         Some(code) if code == "534" || code == "535" => SendError::Auth(error.to_string()),
         Some(_) => SendError::Rejected(error.to_string()),
+        None if is_rejected_token(&error) => SendError::Auth(error.to_string()),
         None => SendError::Connect(error.to_string()),
     }
+}
+
+/// When it refuses an XOAUTH2 token, the server answers with a 334
+/// challenge (a JSON error) before the final 535; lettre does not expect
+/// that challenge and gives up with this client error. Checked against
+/// smtp.gmail.com (tests/live_refusals.rs).
+fn is_rejected_token(error: &lettre::transport::smtp::Error) -> bool {
+    error.is_client() && error.to_string().contains("does not expect a challenge")
 }
 
 /// Builds the MIME message: plain text alone, or text followed by the
