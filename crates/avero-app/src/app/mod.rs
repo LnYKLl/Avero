@@ -192,16 +192,52 @@ pub struct AccountStatus {
     pub archive: Option<bool>,
 }
 
-/// The message shown in the reading pane.
+/// The conversation (or the single message) shown in the reading pane.
 pub struct Reading {
-    /// Every copy of the message (merged across accounts), newest first.
+    /// The rows of the list item read: every copy of the message, or of
+    /// every message of the conversation in the folder.
     pub rows: Vec<i64>,
     pub accounts: Vec<AccountId>,
+    /// The conversation read, when the list groups them.
+    pub thread: Option<i64>,
+    /// The messages, oldest first: just one outside conversations.
+    pub entries: Vec<Entry>,
+    /// The entry Reply and Forward answer: the last one unfolded (the
+    /// newest at first).
+    pub focus: usize,
+}
+
+impl Reading {
+    /// The entry Reply and Forward answer.
+    pub fn focused(&self) -> &Entry {
+        &self.entries[self.focus]
+    }
+
+    /// The body of the focused entry.
+    pub fn body(&self) -> &Body {
+        &self.focused().body
+    }
+
+    /// Whether the pane shows a conversation of several messages.
+    pub fn is_thread(&self) -> bool {
+        self.entries.len() > 1
+    }
+}
+
+/// One message of the reading pane.
+pub struct Entry {
+    /// Its copies (the one with a cached body first), sender, date,
+    /// snippet.
+    pub item: UnifiedItem,
+    /// Unfolded (its text shown) or folded to one line.
+    pub expanded: bool,
     pub body: Body,
 }
 
-/// The body of the message being read.
+/// The body of a message of the reading pane.
 pub enum Body {
+    /// Not asked for yet: a folded message of a conversation.
+    NotLoaded,
     Loading,
     Ready {
         /// Parsed once, attachments decoded (forward and save reuse them).
@@ -236,6 +272,8 @@ pub enum Message {
     CopyText(String),
     ThemeChosen(ThemeChoice),
     NotificationsToggled(bool),
+    /// "Regrouper les conversations" in the settings.
+    ThreadsToggled(bool),
 
     ShowMail,
     ShowSettings,
@@ -260,12 +298,16 @@ pub enum Message {
     Moved(Vec<i64>, Event),
     ConfirmDeleteForever,
 
-    ReaderAction(text_editor::Action),
+    /// Selection or scrolling in the text of a reader entry.
+    ReaderAction(usize, text_editor::Action),
+    /// Unfolds (or folds) a message of the conversation being read.
+    EntryToggled(usize),
     Answer(Mode),
     Archive,
     Delete,
     MarkUnread,
-    SaveAttachment(usize),
+    /// Attachment `.1` of reader entry `.0`.
+    SaveAttachment(usize, usize),
     AttachmentSaved(Result<Option<String>, String>),
 
     Compose(ComposeMsg),
@@ -592,6 +634,12 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::ThreadsToggled(on) => {
+                self.settings.group_threads = on;
+                self.save_settings();
+                self.load_first_page();
+                Task::none()
+            }
             Message::ShowMail => {
                 self.screen = Screen::Mail;
                 Task::none()
@@ -608,12 +656,13 @@ impl App {
             | Message::SearchCleared
             | Message::MessageSelected(_)
             | Message::LoadMore
-            | Message::ReaderAction(_)
+            | Message::ReaderAction(..)
+            | Message::EntryToggled(_)
             | Message::Answer(_)
             | Message::Archive
             | Message::Delete
             | Message::MarkUnread
-            | Message::SaveAttachment(_)
+            | Message::SaveAttachment(..)
             | Message::AttachmentSaved(_) => self.update_mail(message),
             Message::Worker(account, event) => self.on_worker_event(account, event),
             Message::Background(account, event) => self.on_background_event(account, event),
@@ -669,13 +718,12 @@ impl App {
             Some(Overlay::Reconnect(_)) => true,
             _ => false,
         };
-        let loading = matches!(
-            self.reading,
-            Some(Reading {
-                body: Body::Loading,
-                ..
-            })
-        );
+        let loading = self.reading.as_ref().is_some_and(|reading| {
+            reading
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.body, Body::Loading))
+        });
         overlay || loading
     }
 

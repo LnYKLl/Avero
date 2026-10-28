@@ -1,11 +1,14 @@
 //! Demo mode (`AVERO_DEMO=1`): an in-memory database with three made-up
-//! accounts and about forty French messages, and no network at all.
+//! accounts and about forty French messages, a few of them answers that
+//! make conversations, and no network at all.
 //! `AVERO_DEMO=empty` starts with no account (welcome screen);
 //! `AVERO_DEMO=google-setup` (or `microsoft-setup`) also opens the
 //! connection assistant, as after a click on "Continuer avec Google".
 
 use avero_core::store::Store;
-use avero_core::{AccountId, AuthKind, FolderRole, NewAccount, NewMessage, Security, ServerConfig};
+use avero_core::{
+    AccountId, AuthKind, FolderRole, MessageHeaders, NewAccount, NewMessage, Security, ServerConfig,
+};
 use chrono::{Local, TimeZone};
 
 /// What `AVERO_DEMO` asks for.
@@ -195,7 +198,50 @@ fn samples() -> Vec<Sample> {
         s(2, Inbox, ("Marc Fontaine", "marc.fontaine@velo-club-lyon.org"), "Merci pour la trésorerie !",
           "Camille, merci encore pour le travail sur les comptes, l'expert-comptable était ravi.",
           20 * D, true, None),
+        s(1, Sent, ("Camille Martin", "camille@atelier-lumen.fr"), "Re: Point budget T4 — à préparer pour jeudi",
+          "Bien reçu, je te prépare ça pour mercredi soir. Tu veux aussi le détail par client ?\n\nCamille",
+          90, true, None),
+        s(1, Inbox, ("Julien Roche", "julien.roche@atelier-lumen.fr"), "Re: Point budget T4 — à préparer pour jeudi",
+          "Oui, le détail par client serait parfait. Merci !\n\nJulien",
+          25, false, None),
+        s(0, Inbox, ("Maman", "francoise.martin@orange.fr"), "Re: Repas de dimanche",
+          "Parfait, je fais le gratin ! Ton frère demande si tu peux apporter du pain.\n\nBisous\nMaman",
+          70, false, None),
     ]
+}
+
+/// The message a sample answers: for "Re: X", the closest older sample
+/// called "X" or "Re: X". Only the demo threads by subject; real mail is
+/// threaded by its headers (see `Store::insert_messages`).
+fn parent_of(samples: &[Sample], index: usize) -> Option<usize> {
+    let sample = &samples[index];
+    let topic = sample.subject.strip_prefix("Re: ")?;
+    samples
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| {
+            (other.subject == topic || other.subject == sample.subject)
+                && other.minutes_ago > sample.minutes_ago
+        })
+        .min_by_key(|(_, other)| other.minutes_ago)
+        .map(|(i, _)| i)
+}
+
+/// The Message-ID of sample `index`.
+fn demo_id(index: usize) -> String {
+    format!("<demo-{}@avero.demo>", index + 1)
+}
+
+/// The ids a sample's References header lists: its ancestors, oldest
+/// first.
+fn ancestors(samples: &[Sample], index: usize) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = index;
+    while let Some(parent) = parent_of(samples, current) {
+        chain.insert(0, demo_id(parent));
+        current = parent;
+    }
+    chain
 }
 
 /// Opens an in-memory store filled with the demo data.
@@ -237,21 +283,27 @@ pub fn seed(store: &Store) {
             .expect("demo folder");
         let uid = index as u32 + 1;
         let date = now - sample.minutes_ago * 60;
+        let references = ancestors(&samples, index);
         let message = NewMessage {
             uid,
-            message_id: Some(format!("<demo-{uid}@avero.demo>")),
+            message_id: Some(demo_id(index)),
             subject: sample.subject.to_string(),
             from_name: Some(sample.from.0.to_string()),
             from_addr: sample.from.1.to_string(),
             date,
             seen: sample.seen,
             has_attachments: sample.attachment.is_some(),
-            ..Default::default()
+            headers: MessageHeaders {
+                in_reply_to: references.last().cloned(),
+                references: references.clone(),
+                to: vec![ACCOUNTS[sample.account].1.to_string()],
+                ..Default::default()
+            },
         };
         store
             .insert_messages(folder.id, &[message])
             .expect("demo message");
-        let raw = raw_message(sample, ACCOUNTS[sample.account].1, uid, date);
+        let raw = raw_message(sample, ACCOUNTS[sample.account].1, uid, date, &references);
         if let Some(row) = row_for(store, account, sample.role, date) {
             let _ = store.put_body(
                 row,
@@ -297,17 +349,24 @@ fn row_for(store: &Store, account: AccountId, role: FolderRole, date: i64) -> Op
         .and_then(|item| item.row_ids.first().copied())
 }
 
-/// A small RFC 5322 message, with one attachment when the sample has one.
-fn raw_message(sample: &Sample, to: &str, uid: u32, date: i64) -> String {
+/// A small RFC 5322 message, with one attachment when the sample has one
+/// and the threading headers when it answers another (`references`).
+fn raw_message(sample: &Sample, to: &str, uid: u32, date: i64, references: &[String]) -> String {
     let date = Local
         .timestamp_opt(date, 0)
         .single()
         .map(|d| d.to_rfc2822())
         .unwrap_or_default();
-    let headers = format!(
+    let mut headers = format!(
         "From: {} <{}>\r\nTo: Camille Martin <{to}>\r\nSubject: {}\r\nDate: {date}\r\nMessage-ID: <demo-{uid}@avero.demo>\r\nMIME-Version: 1.0\r\n",
         sample.from.0, sample.from.1, sample.subject
     );
+    if let Some(parent) = references.last() {
+        headers.push_str(&format!(
+            "In-Reply-To: {parent}\r\nReferences: {}\r\n",
+            references.join(" ")
+        ));
+    }
     let body = sample.body.replace('\n', "\r\n");
     match sample.attachment {
         None => format!(
@@ -372,6 +431,45 @@ mod tests {
                 assert!(store.folder_by_role(account.id, role).unwrap().is_some());
             }
         }
+    }
+
+    #[test]
+    fn demo_has_conversations_across_folders() {
+        let store = seeded_store();
+        let threads = store
+            .threads(FolderRole::Inbox, AccountFilter::All, 200, 0)
+            .unwrap();
+        let count = |subject: &str| {
+            threads
+                .iter()
+                .find(|t| t.subject == subject)
+                .map(|t| t.count)
+        };
+        assert_eq!(
+            count("Re: Point budget T4 — à préparer pour jeudi"),
+            Some(3)
+        );
+        assert_eq!(count("Re: Repas de dimanche"), Some(3));
+        assert_eq!(count("Remboursement des maillots"), Some(2));
+        assert_eq!(count("Re: Atelier design system"), Some(2));
+        let budget = threads
+            .iter()
+            .find(|t| t.subject.starts_with("Re: Point budget"))
+            .unwrap();
+        assert_eq!(budget.senders, vec!["Julien Roche", "moi"]);
+        assert!(!budget.seen);
+        // The raw messages carry the same headers.
+        let messages = store
+            .thread_messages(
+                budget.thread_id.unwrap(),
+                FolderRole::Inbox,
+                AccountFilter::All,
+            )
+            .unwrap();
+        let (raw, _) = store.body(messages[2].row_ids[0]).unwrap().unwrap();
+        let parsed = avero_sync::parse::parse_body(&raw);
+        let references = parsed.references.unwrap_or_default();
+        assert_eq!(references.split(' ').count(), 2, "{references}");
     }
 
     #[test]

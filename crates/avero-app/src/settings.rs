@@ -42,6 +42,8 @@ pub struct Settings {
     pub theme: ThemeChoice,
     /// A system notification for each new unread message of an inbox.
     pub notifications: bool,
+    /// One line per conversation in the list (off: one per message).
+    pub group_threads: bool,
 }
 
 impl Default for Settings {
@@ -49,6 +51,7 @@ impl Default for Settings {
         Settings {
             theme: ThemeChoice::default(),
             notifications: true,
+            group_threads: true,
         }
     }
 }
@@ -103,17 +106,19 @@ mod tests {
         let settings = Settings {
             theme: ThemeChoice::Dark,
             notifications: false,
+            group_threads: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"dark\""), "{text}");
         assert!(text.contains("\"notifications\": false"), "{text}");
+        assert!(text.contains("\"group_threads\": false"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn older_files_get_notifications_on() {
+    fn older_files_get_notifications_and_conversations_on() {
         let dir = temp_dir("older");
         std::fs::create_dir_all(&dir).unwrap();
         let path = path_in(&dir);
@@ -121,6 +126,7 @@ mod tests {
         let settings = Settings::load(&path);
         assert_eq!(settings.theme, ThemeChoice::Light);
         assert!(settings.notifications);
+        assert!(settings.group_threads);
         let _ = std::fs::remove_dir_all(dir);
     }
 

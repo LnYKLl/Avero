@@ -337,6 +337,35 @@ fn empty(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+/// Who wrote the line: the sender of a message, or the people of a
+/// conversation, oldest first ("Marie, moi"), by first name when they are
+/// several; past three, the first one then the last two.
+pub fn sender_line(item: &UnifiedItem) -> String {
+    if item.thread_id.is_none() || item.senders.len() <= 1 {
+        return item
+            .senders
+            .first()
+            .cloned()
+            .unwrap_or_else(|| item.from_display.clone());
+    }
+    let short: Vec<&str> = item.senders.iter().map(|s| first_name(s)).collect();
+    match short.as_slice() {
+        [first, .., before_last, last] if short.len() > 3 => {
+            format!("{first} … {before_last}, {last}")
+        }
+        _ => short.join(", "),
+    }
+}
+
+/// "Marie" for "Marie Durand", "paul" for "paul@ex.fr".
+fn first_name(name: &str) -> &str {
+    let name = name.trim();
+    match name.split_once('@') {
+        Some((local, _)) if !name.contains(' ') => local,
+        _ => name.split_whitespace().next().unwrap_or(name),
+    }
+}
+
 fn message_row<'a>(
     app: &'a App,
     index: usize,
@@ -352,10 +381,17 @@ fn message_row<'a>(
         .map(|a| to_color(a.color))
         .collect();
 
-    let sender = text(ellipsize(&item.from_display, 30))
+    let sender = text(ellipsize(&sender_line(item), 30))
         .size(14)
         .font(if unread { SEMIBOLD } else { MEDIUM })
         .wrapping(Wrapping::None);
+    let mut who = Row::new()
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .push(container(sender).clip(true));
+    if item.count > 1 {
+        who = who.push(text(item.count.to_string()).size(12).style(theme::muted));
+    }
     let mut meta = Row::new().spacing(6).align_y(Alignment::Center);
     if item.has_attachments {
         meta = meta.push(icons::icon(Icon::Paperclip, 13.0, Tone::Muted));
@@ -367,7 +403,7 @@ fn message_row<'a>(
             .font(if unread { SEMIBOLD } else { theme::INTER })
             .style(date_style),
     );
-    let first = row![container(sender).width(Fill).clip(true), meta]
+    let first = row![container(who).width(Fill).clip(true), meta]
         .spacing(8)
         .align_y(Alignment::Center);
 

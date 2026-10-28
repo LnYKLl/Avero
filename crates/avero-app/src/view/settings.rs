@@ -1,4 +1,4 @@
-//! The settings page: accounts, notifications, appearance, about.
+//! The settings page: accounts, notifications, reading, appearance, about.
 
 use super::{dot, hr, tip, to_color};
 use crate::app::{AccountMsg, AddMsg, App, Message};
@@ -24,6 +24,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         section("Comptes", accounts(app)),
         section("Connexion Google / Microsoft", oauth_clients(app)),
         section("Notifications", notifications(app)),
+        section("Lecture", reading(app)),
         section("Apparence", appearance(app)),
         section("À propos", about()),
     ]
@@ -268,6 +269,24 @@ fn notifications(app: &App) -> Element<'_, Message> {
         .spacing(3)
         .width(Fill),
         toggler(app.settings.notifications).on_toggle(Message::NotificationsToggled),
+    ]
+    .spacing(12)
+    .padding(18)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn reading(app: &App) -> Element<'_, Message> {
+    row![
+        column![
+            text("Regrouper les conversations").size(14).font(MEDIUM),
+            text("Une ligne par échange, avec les réponses ; désactivé, une ligne par message.")
+                .size(12)
+                .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.group_threads).on_toggle(Message::ThreadsToggled),
     ]
     .spacing(12)
     .padding(18)

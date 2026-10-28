@@ -1,6 +1,6 @@
 //! The message list, the reading pane and the actions on a message.
 
-use super::{App, Body, Message, Overlay, PAGE, RELOAD_EVERY, Reading};
+use super::{App, Body, Entry, Message, Overlay, PAGE, RELOAD_EVERY, Reading};
 use crate::background::{self, OpenedBody};
 use crate::compose::Mode;
 use crate::worker::{Destination, Event, Job};
@@ -60,23 +60,25 @@ impl App {
                 self.items = self.fetch(self.items.len() + PAGE);
                 Task::none()
             }
-            Message::ReaderAction(action) => {
+            Message::ReaderAction(entry, action) => {
                 // Read-only: selection and scrolling, never edits.
                 if !action.is_edit()
-                    && let Some(Reading {
+                    && let Some(reading) = &mut self.reading
+                    && let Some(Entry {
                         body: Body::Ready { content, .. },
                         ..
-                    }) = &mut self.reading
+                    }) = reading.entries.get_mut(entry)
                 {
                     content.perform(action);
                 }
                 Task::none()
             }
+            Message::EntryToggled(entry) => self.toggle_entry(entry),
             Message::Answer(mode) => self.answer(mode),
             Message::Archive => self.move_selected(Destination::Archive),
             Message::Delete => self.move_selected(Destination::Trash),
             Message::MarkUnread => self.mark_unread(),
-            Message::SaveAttachment(index) => self.save_attachment(index),
+            Message::SaveAttachment(entry, index) => self.save_attachment(entry, index),
             Message::AttachmentSaved(result) => match result {
                 Ok(Some(name)) => self.toast(format!("Enregistré : {name}"), false),
                 Ok(None) => Task::none(),
@@ -106,7 +108,27 @@ impl App {
     pub(super) fn reload(&mut self) {
         let pages = self.items.len().div_ceil(PAGE).max(1);
         self.items = self.fetch(pages * PAGE);
+        self.follow_thread();
         self.refresh_unread();
+    }
+
+    /// When a message joins or leaves the conversation being read, its
+    /// line in the list has other rows: the selection follows it.
+    fn follow_thread(&mut self) {
+        if self.selected_index().is_some() {
+            return;
+        }
+        let Some(reading) = &mut self.reading else {
+            return;
+        };
+        let Some(thread) = reading.thread else {
+            return;
+        };
+        if let Some(item) = self.items.iter().find(|i| i.thread_id == Some(thread)) {
+            reading.rows = item.row_ids.clone();
+            reading.accounts = item.accounts.clone();
+            self.selected = Some(item.row_ids.clone());
+        }
     }
 
     /// `reload`, and remember when (for `reload_soon`).
@@ -138,9 +160,15 @@ impl App {
 
     /// The first `limit` items for the current view; on a database error
     /// logs it and returns nothing so the window keeps working.
+    ///
+    /// With "Regrouper les conversations" on, one item per conversation;
+    /// search results stay one item per message.
     fn fetch(&self, limit: usize) -> Vec<UnifiedItem> {
         let result = match &self.search_query {
             Some(query) => self.store.search(query, None, self.filter, limit),
+            None if self.settings.group_threads => {
+                self.store.threads(self.folder, self.filter, limit, 0)
+            }
             None => self.store.unified(self.folder, self.filter, limit, 0),
         };
         result.unwrap_or_else(|e| {
@@ -171,11 +199,13 @@ impl App {
             .accounts
             .iter()
             .map(|a| {
-                let count = self
-                    .store
-                    .unread_count(FolderRole::Inbox, AccountFilter::Only(a.id))
-                    .unwrap_or(0);
-                (a.id, count)
+                let only = AccountFilter::Only(a.id);
+                let count = if self.settings.group_threads {
+                    self.store.unread_threads(FolderRole::Inbox, only)
+                } else {
+                    self.store.unread_count(FolderRole::Inbox, only)
+                };
+                (a.id, count.unwrap_or(0))
             })
             .collect();
     }
@@ -204,31 +234,93 @@ impl App {
     }
 
     /// Selects an item: shows its body (cached, or downloaded in the
-    /// background) and marks it read, locally first.
+    /// background) and marks it read, locally first. A conversation shows
+    /// all its messages, the newest unfolded; the others are loaded when
+    /// unfolded.
     fn open(&mut self, index: usize) -> Task<Message> {
         let Some(item) = self.items.get(index).cloned() else {
             return Task::none();
         };
         self.selected = Some(item.row_ids.clone());
-        let Some(&row) = item.row_ids.first() else {
+        if item.row_ids.is_empty() {
             return Task::none();
-        };
-        let mut tasks = Vec::new();
-        match self.store.body(row) {
-            Ok(Some((raw, _))) => tasks.push(parse_task(row, raw)),
-            _ => tasks.push(self.fetch_body(row)),
         }
+        let mut messages = match item.thread_id {
+            Some(thread) if item.count > 1 => self
+                .store
+                .thread_messages(thread, self.folder, self.filter)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if messages.is_empty() {
+            messages.push(item.clone());
+        }
+        let newest = messages.len() - 1;
         self.reading = Some(Reading {
             rows: item.row_ids.clone(),
             accounts: item.accounts.clone(),
-            body: Body::Loading,
+            thread: item.thread_id,
+            entries: messages
+                .into_iter()
+                .map(|message| Entry {
+                    item: message,
+                    expanded: false,
+                    body: Body::NotLoaded,
+                })
+                .collect(),
+            focus: newest,
         });
+        let mut tasks = vec![self.unfold(newest)];
         if !item.seen {
             let _ = self.store.set_seen(&item.row_ids, true);
             self.reload();
             tasks.push(self.remote_seen(&item.row_ids, true));
         }
         Task::batch(tasks)
+    }
+
+    /// Unfolds a message of the reader and makes it the one Reply and
+    /// Forward answer; its body is loaded the first time.
+    fn unfold(&mut self, index: usize) -> Task<Message> {
+        let Some(reading) = &mut self.reading else {
+            return Task::none();
+        };
+        let Some(entry) = reading.entries.get_mut(index) else {
+            return Task::none();
+        };
+        entry.expanded = true;
+        reading.focus = index;
+        if !matches!(entry.body, Body::NotLoaded) {
+            return Task::none();
+        }
+        let Some(&row) = entry.item.row_ids.first() else {
+            return Task::none();
+        };
+        entry.body = Body::Loading;
+        match self.store.body(row) {
+            Ok(Some((raw, _))) => parse_task(row, raw),
+            _ => self.fetch_body(row),
+        }
+    }
+
+    /// A click on a message of the conversation: unfolds it, or folds it
+    /// back (one message always stays unfolded).
+    fn toggle_entry(&mut self, index: usize) -> Task<Message> {
+        let Some(reading) = &mut self.reading else {
+            return Task::none();
+        };
+        let unfolded = reading.entries.iter().filter(|e| e.expanded).count();
+        match reading.entries.get_mut(index) {
+            Some(entry) if entry.expanded && unfolded > 1 => {
+                entry.expanded = false;
+                if let Some(last) = reading.entries.iter().rposition(|e| e.expanded) {
+                    reading.focus = last;
+                }
+                Task::none()
+            }
+            Some(entry) if !entry.expanded => self.unfold(index),
+            _ => Task::none(),
+        }
     }
 
     fn fetch_body(&self, row: i64) -> Task<Message> {
@@ -239,44 +331,53 @@ impl App {
         self.request(account, |reply| Job::FetchBody { target, reply })
     }
 
+    /// The reader entry waiting for the body of `row`, if any.
+    fn entry_for(&mut self, row: i64) -> Option<&mut Entry> {
+        self.reading
+            .as_mut()?
+            .entries
+            .iter_mut()
+            .find(|entry| entry.item.row_ids.first() == Some(&row))
+    }
+
     /// Called when a worker cached a body: it is parsed off the UI thread.
     pub(super) fn body_arrived(&mut self, row: i64, result: Result<(), String>) -> Task<Message> {
-        let Some(reading) = &mut self.reading else {
+        let cached = match &result {
+            Ok(()) => self.store.body(row),
+            Err(_) => Ok(None),
+        };
+        let Some(entry) = self.entry_for(row) else {
             return Task::none();
         };
-        if reading.rows.first() != Some(&row) {
-            return Task::none();
-        }
-        match result {
-            Ok(()) => match self.store.body(row) {
-                Ok(Some((raw, _))) => return parse_task(row, raw),
-                _ => reading.body = Body::Failed("Le message n'a pas pu être lu".to_string()),
-            },
-            Err(e) => reading.body = Body::Failed(e),
+        match (result, cached) {
+            (Ok(()), Ok(Some((raw, _)))) => return parse_task(row, raw),
+            (Ok(()), _) => entry.body = Body::Failed("Le message n'a pas pu être lu".to_string()),
+            (Err(e), _) => entry.body = Body::Failed(e),
         }
         Task::none()
     }
 
-    /// A parsed body is ready: show it if it is still the one being read.
+    /// A parsed body is ready: show it if its message is still in the
+    /// reader.
     pub(super) fn body_parsed(&mut self, row: i64, result: Result<Arc<OpenedBody>, String>) {
-        let Some(reading) = &mut self.reading else {
+        let Some(entry) = self.entry_for(row) else {
             return;
         };
-        if reading.rows.first() != Some(&row) {
-            return;
-        }
-        reading.body = match result {
+        entry.body = match result {
             Ok(opened) => ready_body(opened),
             Err(e) => Body::Failed(e),
         };
     }
 
-    /// A worker lost the job of the message being loaded.
+    /// A worker lost the jobs of the messages being loaded.
     pub(super) fn body_lost(&mut self) {
-        if let Some(reading) = &mut self.reading
-            && matches!(reading.body, Body::Loading)
-        {
-            reading.body = Body::Failed("Le message n'a pas pu être chargé".to_string());
+        let Some(reading) = &mut self.reading else {
+            return;
+        };
+        for entry in &mut reading.entries {
+            if matches!(entry.body, Body::Loading) {
+                entry.body = Body::Failed("Le message n'a pas pu être chargé".to_string());
+            }
         }
     }
 
@@ -509,19 +610,27 @@ impl App {
         }
     }
 
+    /// Reply, reply all or forward: answers the focused message of the
+    /// reader (the newest of a conversation, or the last one unfolded),
+    /// from the account that received it.
     fn answer(&mut self, mode: Mode) -> Task<Message> {
-        let Some(Reading {
-            body: Body::Ready { opened, .. },
-            accounts,
-            ..
-        }) = &self.reading
-        else {
+        let Some(reading) = &self.reading else {
+            return Task::none();
+        };
+        let entry = reading.focused();
+        let Body::Ready { opened, .. } = &entry.body else {
             return Task::none();
         };
         let parsed = &opened.parsed;
         let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
         let fields = crate::compose::answer(parsed, mode, &own);
-        let from = accounts.first().copied().or_else(|| self.default_sender());
+        let from = entry
+            .item
+            .accounts
+            .first()
+            .or(reading.accounts.first())
+            .copied()
+            .or_else(|| self.default_sender());
         let Some(from) = from else {
             return Task::none();
         };
@@ -558,11 +667,11 @@ impl App {
         }
     }
 
-    fn save_attachment(&mut self, index: usize) -> Task<Message> {
-        let Some(Reading {
+    fn save_attachment(&mut self, entry: usize, index: usize) -> Task<Message> {
+        let Some(Entry {
             body: Body::Ready { opened, .. },
             ..
-        }) = &self.reading
+        }) = self.reading.as_ref().and_then(|r| r.entries.get(entry))
         else {
             return Task::none();
         };

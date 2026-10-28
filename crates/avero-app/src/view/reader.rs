@@ -1,23 +1,28 @@
-//! The reading pane: actions, headers, attachments and the text.
+//! The reading pane: actions, headers, attachments and the text. A
+//! conversation shows its messages one under the other, oldest first; the
+//! folded ones take one line each.
 
 use super::{avatar, find_account, format_full_date, hr, icon_button, tip, to_color};
-use crate::app::{App, Body, Message, Reading};
+use crate::app::{App, Body, Entry, Message, Reading};
 use crate::compose::{Mode, human_size};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::UnifiedItem;
 use avero_sync::parse::{Address, ParsedBody};
+use chrono::Local;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, center, column, container, row, space, text, text_editor, tooltip,
+    Column, Row, button, center, column, container, row, scrollable, space, text, text_editor,
+    tooltip,
 };
-use iced::{Alignment, Element, Fill, Padding};
+use iced::{Alignment, Color, Element, Fill, Padding};
 
 /// Comfortable reading width.
 const MAX_WIDTH: f32 = 720.0;
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = match (app.selected_item(), &app.reading) {
+        (Some(item), Some(reading)) if reading.is_thread() => conversation(app, item, reading),
         (Some(item), Some(reading)) => message(app, item, reading),
         _ => empty(),
     };
@@ -50,35 +55,54 @@ fn empty<'a>() -> Element<'a, Message> {
     .into()
 }
 
-fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Element<'a, Message> {
-    let parsed = match &reading.body {
+/// The parsed message of an entry, once its body is ready.
+fn parsed_of(entry: &Entry) -> Option<&ParsedBody> {
+    match &entry.body {
         Body::Ready { opened, .. } => Some(&opened.parsed),
         _ => None,
-    };
-    let body: Element<'a, Message> = match &reading.body {
-        Body::Loading => notice(Icon::Loader, "Chargement du message…", false),
+    }
+}
+
+/// The text of entry `index`; `fill` lets it take the pane's height (and
+/// scroll by itself) instead of its own.
+fn body_text<'a>(entry: &'a Entry, index: usize, fill: bool) -> Element<'a, Message> {
+    match &entry.body {
+        Body::NotLoaded | Body::Loading => notice(Icon::Loader, "Chargement du message…", false),
         Body::Failed(error) => notice(Icon::Alert, error, true),
-        Body::Ready { content, .. } => text_editor(content)
-            .on_action(Message::ReaderAction)
-            .size(14)
-            .line_height(1.55)
-            .padding(0)
-            .height(Fill)
-            .wrapping(Wrapping::WordOrGlyph)
-            .style(theme::bare_editor)
-            .into(),
-    };
+        Body::Ready { content, .. } => {
+            let editor = text_editor(content)
+                .on_action(move |action| Message::ReaderAction(index, action))
+                .size(14)
+                .line_height(1.55)
+                .padding(0)
+                .wrapping(Wrapping::WordOrGlyph)
+                .style(theme::bare_editor);
+            if fill {
+                editor.height(Fill).into()
+            } else {
+                editor.into()
+            }
+        }
+    }
+}
+
+/// A single message, as before conversations: its text fills the pane.
+fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Element<'a, Message> {
+    let index = reading.focus;
+    let entry = reading.focused();
+    let parsed = parsed_of(entry);
 
     let mut page = Column::new()
         .spacing(18)
         .max_width(MAX_WIDTH)
-        .push(headers(app, item, parsed));
+        .push(text(item.subject.clone()).size(22).font(SEMIBOLD))
+        .push(headers(app, &entry.item, parsed, 40.0));
     if let Some(parsed) = parsed
         && !parsed.attachments.is_empty()
     {
-        page = page.push(attachments(parsed));
+        page = page.push(attachments(index, parsed));
     }
-    page = page.push(hr()).push(body);
+    page = page.push(hr()).push(body_text(entry, index, true));
 
     column![
         action_bar(app, item, reading),
@@ -96,20 +120,159 @@ fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Ele
     .into()
 }
 
+/// A conversation: its messages one under the other, in a scrolling page.
+fn conversation<'a>(
+    app: &'a App,
+    item: &'a UnifiedItem,
+    reading: &'a Reading,
+) -> Element<'a, Message> {
+    let mut page = Column::new().spacing(10).max_width(MAX_WIDTH).push(
+        column![
+            text(item.subject.clone()).size(22).font(SEMIBOLD),
+            text(format!("{} messages", reading.entries.len()))
+                .size(12)
+                .style(theme::muted),
+        ]
+        .spacing(4)
+        .padding(Padding::new(0.0).bottom(8)),
+    );
+    for (index, entry) in reading.entries.iter().enumerate() {
+        page = page.push(if entry.expanded {
+            unfolded(
+                app,
+                index,
+                entry,
+                reading.is_thread() && index == reading.focus,
+            )
+        } else {
+            folded(app, index, entry)
+        });
+    }
+
+    column![
+        action_bar(app, item, reading),
+        hr(),
+        scrollable(
+            container(page)
+                .padding(Padding {
+                    top: 24.0,
+                    bottom: 24.0,
+                    left: 32.0,
+                    right: 32.0,
+                })
+                .center_x(Fill),
+        )
+        .height(Fill)
+        .style(theme::scrollbar),
+    ]
+    .into()
+}
+
+/// Colour of the first account that holds the message.
+fn entry_color(app: &App, item: &UnifiedItem) -> Color {
+    item.accounts
+        .first()
+        .and_then(|id| find_account(&app.accounts, *id))
+        .map(|a| to_color(a.color))
+        .unwrap_or(app.tokens().accent)
+}
+
+/// A folded message: sender, start of the text and date on one line.
+fn folded<'a>(app: &'a App, index: usize, entry: &'a Entry) -> Element<'a, Message> {
+    let item = &entry.item;
+    let unread = !item.seen;
+    let preview = if item.snippet.is_empty() {
+        String::new()
+    } else {
+        super::ellipsize(&item.snippet, 60)
+    };
+    let line = row![
+        avatar(&item.from_display, entry_color(app, item), 28.0),
+        text(super::ellipsize(&item.from_display, 24))
+            .size(13)
+            .font(if unread { SEMIBOLD } else { MEDIUM })
+            .wrapping(Wrapping::None),
+        container(
+            text(preview)
+                .size(12)
+                .style(theme::muted)
+                .wrapping(Wrapping::None)
+        )
+        .width(Fill)
+        .clip(true),
+        text(super::format_date(item.date, Local::now()))
+            .size(12)
+            .style(theme::muted),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    tip(
+        button(line)
+            .width(Fill)
+            .padding([10, 14])
+            .on_press(Message::EntryToggled(index))
+            .style(theme::list_row(false)),
+        "Afficher ce message",
+        tooltip::Position::Top,
+    )
+}
+
+/// An unfolded message of a conversation: its headers (a click folds it),
+/// attachments and text. `focused` marks the one Reply answers.
+fn unfolded<'a>(
+    app: &'a App,
+    index: usize,
+    entry: &'a Entry,
+    focused: bool,
+) -> Element<'a, Message> {
+    let parsed = parsed_of(entry);
+    let header = button(headers(app, &entry.item, parsed, 32.0))
+        .width(Fill)
+        .padding(0)
+        .on_press(Message::EntryToggled(index))
+        .style(theme::ghost);
+    let mut card = Column::new().spacing(14).push(header);
+    if let Some(parsed) = parsed
+        && !parsed.attachments.is_empty()
+    {
+        card = card.push(attachments(index, parsed));
+    }
+    card = card.push(body_text(entry, index, false));
+    if focused {
+        card = card.push(
+            text("Répondre et Transférer partent de ce message.")
+                .size(11)
+                .style(theme::muted),
+        );
+    }
+    container(card)
+        .width(Fill)
+        .padding([16, 18])
+        .style(theme::panel)
+        .into()
+}
+
 fn action_bar<'a>(
     app: &'a App,
     item: &'a UnifiedItem,
     reading: &'a Reading,
 ) -> Element<'a, Message> {
-    let ready = matches!(reading.body, Body::Ready { .. });
+    let ready = matches!(reading.body(), Body::Ready { .. });
     let when_ready = |message: Message| ready.then_some(message);
+    let whole = if reading.is_thread() {
+        " la conversation"
+    } else {
+        ""
+    };
     let archive_label = match app.archive_problem() {
-        None => "Archiver".to_string(),
+        None => format!("Archiver{whole}"),
         Some(why) => format!("Archiver ({})", why.to_lowercase()),
     };
     let delete_label = match app.delete_problem() {
-        None if app.selection_in_trash() => "Supprimer définitivement (Suppr)".to_string(),
-        None => "Supprimer (Suppr)".to_string(),
+        None if app.selection_in_trash() => {
+            format!("Supprimer définitivement{whole} (Suppr)")
+        }
+        None => format!("Supprimer{whole} (Suppr)"),
         Some(why) => format!("Supprimer ({})", why.to_lowercase()),
     };
     let mut accounts = Row::new().spacing(6).align_y(Alignment::Center);
@@ -176,17 +339,13 @@ fn separator<'a>() -> Element<'a, Message> {
     container(super::vr()).height(20).padding([0, 6]).into()
 }
 
+/// Sender (avatar, name, address), recipients and date of a message.
 fn headers<'a>(
     app: &'a App,
     item: &'a UnifiedItem,
     parsed: Option<&'a ParsedBody>,
+    avatar_size: f32,
 ) -> Element<'a, Message> {
-    let color = item
-        .accounts
-        .first()
-        .and_then(|id| find_account(&app.accounts, *id))
-        .map(|a| to_color(a.color))
-        .unwrap_or(app.tokens().accent);
     let (name, address) = match parsed.and_then(|p| p.from.as_ref()) {
         Some(Address {
             name: Some(name),
@@ -224,17 +383,13 @@ fn headers<'a>(
         .map(|p| p.date)
         .filter(|&d| d > 0)
         .unwrap_or(item.date);
-    column![
-        text(item.subject.clone()).size(22).font(SEMIBOLD),
-        row![
-            avatar(&name, color, 40.0),
-            who,
-            text(format_full_date(date)).size(12).style(theme::muted),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
+    row![
+        avatar(&name, entry_color(app, item), avatar_size),
+        who,
+        text(format_full_date(date)).size(12).style(theme::muted),
     ]
-    .spacing(18)
+    .spacing(12)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -257,7 +412,8 @@ fn names(list: &[Address]) -> String {
     }
 }
 
-fn attachments<'a>(parsed: &'a ParsedBody) -> Element<'a, Message> {
+/// The attachments of reader entry `entry`, each saved on a click.
+fn attachments<'a>(entry: usize, parsed: &'a ParsedBody) -> Element<'a, Message> {
     let chips: Vec<Element<'a, Message>> = parsed
         .attachments
         .iter()
@@ -282,7 +438,7 @@ fn attachments<'a>(parsed: &'a ParsedBody) -> Element<'a, Message> {
                 .align_y(Alignment::Center),
             )
             .padding([8, 12])
-            .on_press(Message::SaveAttachment(index))
+            .on_press(Message::SaveAttachment(entry, index))
             .style(theme::secondary);
             tip(chip, "Enregistrer sous…", tooltip::Position::Bottom)
         })

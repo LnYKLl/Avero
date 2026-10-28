@@ -67,7 +67,7 @@ fn ids(app: &App) -> (AccountId, AccountId) {
 /// parsing task would.
 fn open_parsed(app: &mut App, index: usize) {
     let _ = app.update(Message::MessageSelected(index));
-    let row = app.items[index].row_ids[0];
+    let row = app.reading.as_ref().unwrap().focused().item.row_ids[0];
     let (raw, _) = app.store.body(row).unwrap().expect("a cached body");
     let opened = crate::background::OpenedBody::parse(&raw);
     let _ = app.update(Message::BodyParsed(row, Ok(Arc::new(opened))));
@@ -113,7 +113,10 @@ fn opening_marks_read_locally_and_keeps_selection() {
     assert_eq!(app.selected.as_ref(), Some(&rows));
     assert_eq!(app.unread[&a] + app.unread[&ids(&app).1], 4);
     // No cached body: the reader waits for the worker.
-    assert!(matches!(app.reading.as_ref().unwrap().body, Body::Loading));
+    assert!(matches!(
+        app.reading.as_ref().unwrap().body(),
+        Body::Loading
+    ));
     let _ = app.update(Message::MarkUnread);
     assert!(!app.items[0].seen);
 }
@@ -131,7 +134,7 @@ fn body_failure_is_shown() {
             result: Err("hors ligne".into()),
         },
     ));
-    assert!(matches!(&app.reading.as_ref().unwrap().body, Body::Failed(e) if e == "hors ligne"));
+    assert!(matches!(&app.reading.as_ref().unwrap().body(), Body::Failed(e) if e == "hors ligne"));
 }
 
 #[test]
@@ -368,7 +371,7 @@ fn lost_worker_ends_sync_and_loading() {
     let _ = app.update(Message::Worker(a, Event::Gone));
     assert!(!app.status[&a].syncing);
     assert!(matches!(
-        app.reading.as_ref().unwrap().body,
+        app.reading.as_ref().unwrap().body(),
         Body::Failed(_)
     ));
 }
@@ -383,7 +386,7 @@ fn parse_failure_is_shown_in_the_reader() {
         Err("Ce message n'a pas pu être analysé".into()),
     ));
     assert!(matches!(
-        &app.reading.as_ref().unwrap().body,
+        &app.reading.as_ref().unwrap().body(),
         Body::Failed(e) if e.contains("analysé")
     ));
 }
@@ -520,12 +523,15 @@ fn reply_needs_a_loaded_body() {
         crate::demo::seed(s);
     });
     let _ = app.update(Message::MessageSelected(0));
-    assert!(matches!(app.reading.as_ref().unwrap().body, Body::Loading));
+    assert!(matches!(
+        app.reading.as_ref().unwrap().body(),
+        Body::Loading
+    ));
     let _ = app.update(Message::Answer(Mode::Reply));
     assert!(app.composer.is_none());
     open_parsed(&mut app, 0);
     assert!(matches!(
-        app.reading.as_ref().unwrap().body,
+        app.reading.as_ref().unwrap().body(),
         Body::Ready { .. }
     ));
     let _ = app.update(Message::Answer(Mode::Reply));
@@ -1089,10 +1095,24 @@ fn merged_accounts_secrets_are_erased() {
         add_account_with_mail(&store, "a@x.fr", 1);
     }
     {
-        // Rebuild what an old version could leave: a second "A@x.fr".
+        // Rebuild what an old version could leave: a second "A@x.fr",
+        // in a version 3 database (without what versions 4 and 5 added).
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP INDEX accounts_email_unique;
+            "DROP INDEX messages_thread;
+             DROP TABLE thread_links;
+             ALTER TABLE messages DROP COLUMN in_reply_to;
+             ALTER TABLE messages DROP COLUMN refs;
+             ALTER TABLE messages DROP COLUMN to_addrs;
+             ALTER TABLE messages DROP COLUMN delivered_to;
+             ALTER TABLE messages DROP COLUMN list_unsubscribe;
+             ALTER TABLE messages DROP COLUMN list_unsubscribe_post;
+             ALTER TABLE messages DROP COLUMN list_id;
+             ALTER TABLE messages DROP COLUMN precedence;
+             ALTER TABLE messages DROP COLUMN auto_submitted;
+             ALTER TABLE messages DROP COLUMN headers_v2;
+             ALTER TABLE messages DROP COLUMN thread_id;
+             DROP INDEX accounts_email_unique;
              INSERT INTO accounts (id, name, email, color_r, color_g, color_b,
                                    imap_host, imap_port, imap_user)
              VALUES (2, 'A', 'A@x.fr', 1, 2, 3, 'imap.x.fr', 993, 'A@x.fr');
@@ -1152,4 +1172,270 @@ fn events_of_a_removed_account_are_ignored() {
     let gone = AccountId(9999);
     let _ = app.update(Message::Background(gone, Event::Synced(Ok(true))));
     assert!(!app.status.contains_key(&gone));
+}
+
+/// One account whose inbox holds "Sujet 1" to "Sujet 3", with a
+/// conversation on "Sujet 1": the user's answer in Sent (read), then an
+/// unread reply in the inbox, the newest message.
+fn with_conversation() -> App {
+    app_with(|s| {
+        let a = add_account_with_mail(s, "a@x.fr", 3);
+        let inbox = s.folder_by_role(a, FolderRole::Inbox).unwrap().unwrap();
+        let sent = s.upsert_folder(a, "Sent", FolderRole::Sent).unwrap();
+        let root = "<1@a@x.fr>".to_string();
+        let mut answer = NewMessage {
+            uid: 1,
+            message_id: Some("<answer@a>".into()),
+            subject: "Re: Sujet 1".into(),
+            from_addr: "a@x.fr".into(),
+            date: 1_800_000_000,
+            seen: true,
+            ..Default::default()
+        };
+        answer.headers.in_reply_to = Some(root.clone());
+        answer.headers.references = vec![root.clone()];
+        s.insert_messages(sent.id, &[answer]).unwrap();
+        let mut back = NewMessage {
+            uid: 10,
+            message_id: Some("<back@x>".into()),
+            subject: "Re: Sujet 1".into(),
+            from_addr: "x@y.z".into(),
+            date: 1_800_000_100,
+            ..Default::default()
+        };
+        back.headers.in_reply_to = Some("<answer@a>".into());
+        back.headers.references = vec![root, "<answer@a>".into()];
+        s.insert_messages(inbox.id, &[back]).unwrap();
+    })
+}
+
+/// A cached raw message for `row`, so that the reader can parse it.
+fn cache_body(app: &App, row: i64, subject: &str) {
+    let raw = format!(
+        "From: x@y.z\r\nTo: a@x.fr\r\nSubject: {subject}\r\nMessage-ID: <{row}@cached>\r\n\r\nTexte {row}\r\n"
+    );
+    app.store
+        .put_body(row, raw.as_bytes(), &format!("Texte {row}"), false)
+        .unwrap();
+}
+
+/// Delivers the parsed body of reader entry `index`, as the background
+/// parsing task would.
+fn parse_entry(app: &mut App, index: usize) {
+    let row = app.reading.as_ref().unwrap().entries[index].item.row_ids[0];
+    let (raw, _) = app.store.body(row).unwrap().expect("a cached body");
+    let opened = crate::background::OpenedBody::parse(&raw);
+    let _ = app.update(Message::BodyParsed(row, Ok(Arc::new(opened))));
+}
+
+#[test]
+fn a_conversation_is_one_line_with_its_count_and_senders() {
+    let app = with_conversation();
+    let a = app.accounts[0].id;
+    assert_eq!(app.items.len(), 3);
+    let line = &app.items[0];
+    assert_eq!(line.subject, "Re: Sujet 1");
+    assert_eq!(line.count, 3);
+    assert_eq!(line.row_ids.len(), 2, "the two messages in the inbox");
+    assert!(!line.seen);
+    assert_eq!(line.senders, vec!["x@y.z", "moi"]);
+    assert_eq!(crate::view::list::sender_line(line), "x, moi");
+    // One unread conversation and two unread messages.
+    assert_eq!(app.unread[&a], 3);
+}
+
+#[test]
+fn sender_line_shortens_long_conversations() {
+    let mut item = with_conversation().items[0].clone();
+    item.senders = vec![
+        "Marie Durand".into(),
+        "moi".into(),
+        "paul@ex.fr".into(),
+        "Zoé Martin".into(),
+    ];
+    assert_eq!(crate::view::list::sender_line(&item), "Marie … paul, Zoé");
+    item.senders.truncate(1);
+    assert_eq!(crate::view::list::sender_line(&item), "Marie Durand");
+    item.thread_id = None;
+    assert_eq!(crate::view::list::sender_line(&item), "Marie Durand");
+}
+
+#[test]
+fn opening_a_conversation_unfolds_the_newest_message() {
+    let mut app = with_conversation();
+    let rows = app.items[0].row_ids.clone();
+    let _ = app.update(Message::MessageSelected(0));
+    let reading = app.reading.as_ref().unwrap();
+    assert!(reading.is_thread());
+    let subjects: Vec<&str> = reading
+        .entries
+        .iter()
+        .map(|e| e.item.subject.as_str())
+        .collect();
+    assert_eq!(subjects, vec!["Sujet 1", "Re: Sujet 1", "Re: Sujet 1"]);
+    assert_eq!(reading.focus, 2);
+    let unfolded: Vec<bool> = reading.entries.iter().map(|e| e.expanded).collect();
+    assert_eq!(unfolded, vec![false, false, true]);
+    assert!(matches!(reading.entries[0].body, Body::NotLoaded));
+    assert!(matches!(reading.body(), Body::Loading));
+    // Every message of the conversation in the inbox is now read.
+    assert!(app.items[0].seen);
+    assert_eq!(app.items[0].row_ids, rows);
+    assert_eq!(app.selected_index(), Some(0));
+}
+
+#[test]
+fn unfolding_loads_on_demand_and_moves_the_reply_target() {
+    let mut app = with_conversation();
+    let _ = app.update(Message::MessageSelected(0));
+    let first = app.reading.as_ref().unwrap().entries[0].item.row_ids[0];
+    cache_body(&app, first, "Sujet 1");
+
+    let _ = app.update(Message::EntryToggled(0));
+    let reading = app.reading.as_ref().unwrap();
+    assert!(reading.entries[0].expanded);
+    assert_eq!(reading.focus, 0);
+    assert!(matches!(reading.entries[0].body, Body::Loading));
+    parse_entry(&mut app, 0);
+    assert!(matches!(
+        app.reading.as_ref().unwrap().body(),
+        Body::Ready { .. }
+    ));
+
+    // Reply answers the message unfolded last.
+    let _ = app.update(Message::Answer(Mode::Reply));
+    let composer = app.composer.as_ref().unwrap();
+    assert_eq!(composer.subject, "Re: Sujet 1");
+    assert_eq!(
+        composer.in_reply_to.as_deref(),
+        Some(format!("<{first}@cached>").as_str())
+    );
+    let _ = app.update(Message::Compose(ComposeMsg::Cancel));
+
+    // Folding it back: the newest one is the target again.
+    let _ = app.update(Message::EntryToggled(0));
+    let reading = app.reading.as_ref().unwrap();
+    assert!(!reading.entries[0].expanded);
+    assert_eq!(reading.focus, 2);
+    // The last unfolded message stays unfolded.
+    let _ = app.update(Message::EntryToggled(2));
+    assert!(app.reading.as_ref().unwrap().entries[2].expanded);
+}
+
+#[test]
+fn delete_and_mark_unread_act_on_the_whole_conversation_in_the_folder() {
+    let mut app = with_conversation();
+    synced(&mut app, true);
+    let a = app.accounts[0].id;
+    let rows = app.items[0].row_ids.clone();
+    let _ = app.update(Message::MessageSelected(0));
+    assert_eq!(app.unread[&a], 2);
+    let _ = app.update(Message::MarkUnread);
+    assert!(!app.items[0].seen);
+    assert_eq!(app.unread[&a], 3);
+
+    let _ = app.update(Message::MessageSelected(0));
+    let _ = app.update(Message::Delete);
+    assert_eq!(app.items.len(), 2);
+    assert!(app.items.iter().all(|i| i.row_ids != rows));
+    let _ = app.update(Message::Moved(rows.clone(), Event::Done(Ok(()))));
+    assert!(app.store.message_refs(&rows).unwrap().is_empty());
+    // The answer in Sent stays where it is.
+    let _ = app.update(Message::FolderSelected(FolderRole::Sent));
+    assert_eq!(app.items.len(), 1);
+}
+
+#[test]
+fn turning_conversations_off_lists_every_message() {
+    let mut app = with_conversation();
+    let a = app.accounts[0].id;
+    let _ = app.update(Message::ThreadsToggled(false));
+    assert!(!app.settings.group_threads);
+    assert_eq!(app.items.len(), 4);
+    assert!(
+        app.items
+            .iter()
+            .all(|i| i.thread_id.is_none() && i.count == 1)
+    );
+    assert_eq!(app.unread[&a], 4);
+    let _ = app.update(Message::MessageSelected(0));
+    let reading = app.reading.as_ref().unwrap();
+    assert!(!reading.is_thread());
+    assert_eq!(reading.entries.len(), 1);
+
+    let _ = app.update(Message::ThreadsToggled(true));
+    assert_eq!(app.items.len(), 3);
+    assert!(app.reading.is_none(), "the list starts again");
+}
+
+#[test]
+fn search_stays_one_line_per_message() {
+    let mut app = with_conversation();
+    let _ = app.update(Message::SearchChanged("Sujet".into()));
+    let _ = app.update(Message::SearchSubmitted);
+    // The three inbox subjects, the reply and the answer in Sent.
+    assert_eq!(app.items.len(), 5);
+    let _ = app.update(Message::MessageSelected(0));
+    assert!(!app.reading.as_ref().unwrap().is_thread());
+}
+
+#[test]
+fn a_reply_arriving_keeps_the_conversation_selected() {
+    let mut app = with_conversation();
+    let a = app.accounts[0].id;
+    let _ = app.update(Message::MessageSelected(0));
+    let inbox = app
+        .store
+        .folder_by_role(a, FolderRole::Inbox)
+        .unwrap()
+        .unwrap();
+    let mut late = NewMessage {
+        uid: 11,
+        message_id: Some("<late@x>".into()),
+        subject: "Re: Sujet 1".into(),
+        from_addr: "x@y.z".into(),
+        date: 1_800_000_200,
+        ..Default::default()
+    };
+    late.headers.in_reply_to = Some("<back@x>".into());
+    app.store.insert_messages(inbox.id, &[late]).unwrap();
+    let _ = app.update(Message::Worker(a, Event::Progress));
+    assert_eq!(app.selected_index(), Some(0));
+    assert_eq!(app.items[0].row_ids.len(), 3);
+    assert_eq!(app.selected.as_ref(), Some(&app.items[0].row_ids));
+}
+
+#[test]
+fn demo_conversation_can_be_drawn_unfolded() {
+    let mut app = app_with(crate::demo::seed);
+    let index = app
+        .items
+        .iter()
+        .position(|i| i.subject.starts_with("Re: Point budget"))
+        .unwrap();
+    assert_eq!(app.items[index].count, 3);
+    let _ = app.update(Message::MessageSelected(index));
+    // The newest one is unfolded already.
+    for entry in 0..3 {
+        if entry < 2 {
+            let _ = app.update(Message::EntryToggled(entry));
+        }
+        parse_entry(&mut app, entry);
+    }
+    let reading = app.reading.as_ref().unwrap();
+    assert!(reading.entries.iter().all(|e| e.expanded));
+    assert!(
+        reading
+            .entries
+            .iter()
+            .all(|e| matches!(e.body, Body::Ready { .. }))
+    );
+    let _ = app.view();
+    // Settings and the per-message view draw too.
+    let _ = app.update(Message::ShowSettings);
+    let _ = app.view();
+    let _ = app.update(Message::ThreadsToggled(false));
+    let _ = app.update(Message::ShowMail);
+    open_parsed(&mut app, 0);
+    let _ = app.view();
 }
