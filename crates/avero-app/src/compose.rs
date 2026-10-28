@@ -1,6 +1,7 @@
 //! Building messages: reply and forward drafts, quoting, address lists,
 //! attachment limits and the final `Outgoing` sent by SMTP.
 
+use avero_core::DraftFields;
 use avero_sync::parse::{Address, ParsedBody};
 use avero_sync::smtp::{Outgoing, OutgoingAttachment, Recipient};
 use chrono::{Local, TimeZone};
@@ -302,6 +303,51 @@ pub fn with_signature(body: &str, signature: &str) -> String {
         "" => format!("\n\n{block}"),
         rest => format!("\n\n{block}\n\n{rest}"),
     }
+}
+
+/// Whether a saved draft is a reply or a forward nobody wrote in: its
+/// body is still what "Répondre" or "Transférer" put there (the blank
+/// lines to write in, the signature `signature`, then the quote or the
+/// forwarded message), a forward has no recipient yet, and a reply has
+/// no Bcc and no file. Older versions of Avero kept such a draft when its
+/// composer was closed untouched (and saved it on the server at the next
+/// start): they are thrown away at start.
+pub fn untouched_answer(fields: &DraftFields, signature: &str, has_files: bool) -> bool {
+    let block = signature_block(signature);
+    let rest = if block.is_empty() {
+        fields.body.strip_prefix(
+            "
+
+",
+        )
+    } else {
+        fields.body.strip_prefix(&format!(
+            "
+
+{block}
+
+"
+        ))
+    };
+    let Some(rest) = rest else {
+        return false;
+    };
+    let subject = fields.subject.trim();
+    if rest.starts_with(
+        "---------- Message transféré ----------
+",
+    ) {
+        return fields.to.trim().is_empty()
+            && fields.cc.trim().is_empty()
+            && fields.bcc.trim().is_empty()
+            && forward_subject(subject) == subject;
+    }
+    let mut lines = rest.lines();
+    let quote_only = lines
+        .next()
+        .is_some_and(|first| first.starts_with("Le ") && first.ends_with(" a écrit :"))
+        && lines.all(|line| line.starts_with('>'));
+    quote_only && !has_files && fields.bcc.trim().is_empty() && reply_subject(subject) == subject
 }
 
 /// The body once the sending account changed from one with signature
@@ -642,6 +688,51 @@ mod tests {
         assert!(fields.body.contains("Message transféré"));
         assert!(fields.body.contains("De : Marie Durand <marie@ex.com>"));
         assert!(fields.body.ends_with("À jeudi."));
+    }
+
+    /// The draft a composer opened with `fields` and signed with
+    /// `signature` keeps, untouched.
+    fn kept(fields: &Fields, signature: &str) -> DraftFields {
+        DraftFields {
+            account: avero_core::AccountId(1),
+            to: fields.to.clone(),
+            cc: fields.cc.clone(),
+            bcc: String::new(),
+            subject: fields.subject.clone(),
+            body: with_signature(&fields.body, signature),
+            in_reply_to: fields.in_reply_to.clone(),
+            references: fields.references.clone(),
+            message_id: "<d@ex.com>".to_string(),
+        }
+    }
+
+    #[test]
+    fn untouched_replies_and_forwards_are_recognised() {
+        let own = ["moi@ex.com".to_string()];
+        for signature in ["", "Camille"] {
+            let reply = kept(&answer(&original(), Mode::ReplyAll, &own), signature);
+            assert!(untouched_answer(&reply, signature, false));
+            let forward = kept(&answer(&original(), Mode::Forward, &own), signature);
+            assert!(untouched_answer(&forward, signature, true));
+
+            // Anything written keeps the draft.
+            let mut typed = reply.clone();
+            typed.body = format!("Bonjour,{}", reply.body);
+            assert!(!untouched_answer(&typed, signature, false));
+            let mut sent_to = forward.clone();
+            sent_to.to = "paul@ex.com".into();
+            assert!(!untouched_answer(&sent_to, signature, true));
+            let mut subject = reply.clone();
+            subject.subject = "Compte rendu".into();
+            assert!(!untouched_answer(&subject, signature, false));
+            assert!(!untouched_answer(&reply, signature, true));
+        }
+        // A new message, even empty, is not an answer.
+        let new = kept(&Fields::default(), "Camille");
+        assert!(!untouched_answer(&new, "Camille", false));
+        // Signed with a signature changed since: kept, to be safe.
+        let reply = kept(&answer(&original(), Mode::Reply, &own), "Camille");
+        assert!(!untouched_answer(&reply, "C. Martin", false));
     }
 
     #[test]

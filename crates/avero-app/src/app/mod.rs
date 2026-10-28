@@ -795,13 +795,15 @@ impl App {
             eprintln!("Impossible de relire les envois programmés : {e}");
         }
         app.refresh_outbox();
-        let drafts = app.restore_drafts();
         let watching: Vec<Task<Message>> = app
             .accounts
             .clone()
             .iter()
             .map(|account| app.start_worker(account))
             .collect();
+        // After the workers start: it asks them to save or drop drafts on
+        // their servers.
+        let drafts = app.restore_drafts();
         app.load_first_page();
         let system = iced::system::theme().map(Message::SystemTheme);
         let complete = app.complete_smtp_settings();

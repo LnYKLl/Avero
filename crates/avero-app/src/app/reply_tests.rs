@@ -293,3 +293,72 @@ fn server_search_needs_words() {
     let _ = app.update(Message::SearchServer);
     assert!(matches!(app.server_search, ServerSearch::Idle));
 }
+
+// ------------------------------------------- answers closed untouched
+
+fn compose(app: &mut App, message: ComposeMsg) {
+    let _ = app.update(Message::Compose(message));
+}
+
+#[test]
+fn reply_or_forward_closed_untouched_leaves_no_draft() {
+    for mode in [Mode::Reply, Mode::Forward] {
+        let mut app = reading_marie();
+        let _ = app.update(Message::Answer(mode));
+        assert!(app.composer.is_some());
+        compose(&mut app, ComposeMsg::Cancel);
+        assert!(app.composer.is_none());
+        assert!(app.store.closed_drafts().unwrap().is_empty(), "{mode:?}");
+        assert!(app.store.open_drafts().unwrap().is_empty(), "{mode:?}");
+    }
+    // Written in: kept.
+    let mut app = reading_marie();
+    let _ = app.update(Message::Answer(Mode::Reply));
+    compose(&mut app, ComposeMsg::Subject("Re: Réunion de jeudi".into()));
+    compose(&mut app, ComposeMsg::Cancel);
+    assert_eq!(app.store.closed_drafts().unwrap().len(), 1);
+}
+
+#[test]
+fn reply_scheduled_untouched_is_kept() {
+    let mut app = reading_marie();
+    let _ = app.update(Message::Answer(Mode::Reply));
+    let _ = app.update(Message::Later(LaterMsg::SendLater));
+    let _ = app.update(Message::Later(LaterMsg::Pick(crate::later::When::Tomorrow)));
+    assert!(app.composer.is_none());
+    assert_eq!(app.outbox.len(), 1);
+}
+
+#[test]
+fn untouched_answers_kept_by_an_older_version_go_at_start() {
+    let app = app_with(|s| {
+        let me = add_account_with_mail(s, "moi@x.fr", 0);
+        s.set_signature(me, "Camille").unwrap();
+        let fields = |subject: &str, to: &str, body: &str| avero_core::DraftFields {
+            account: me,
+            to: to.into(),
+            cc: String::new(),
+            bcc: String::new(),
+            subject: subject.into(),
+            body: body.into(),
+            in_reply_to: Some("<m1@ex.fr>".into()),
+            references: Some("<m1@ex.fr>".into()),
+            message_id: format!("<{subject}@x.fr>"),
+        };
+        let quote =
+            "\n\n-- \nCamille\n\nLe 14/11/2023 à 23:13, Marie a écrit :\n> Bonjour à tous\n";
+        let drafts = [
+            // What closing an untouched reply kept.
+            fields("Re: Réunion", "Marie <marie@ex.fr>", quote),
+            // A reply with a line written: it stays.
+            fields("Re: Réunion", "marie@ex.fr", &format!("J'y serai.{quote}")),
+        ];
+        for draft in drafts {
+            let id = s.save_draft(None, &draft, None, 10).unwrap();
+            s.set_draft_open(id, false).unwrap();
+        }
+    });
+    let left = app.store.closed_drafts().unwrap();
+    assert_eq!(left.len(), 1);
+    assert!(left[0].fields.body.starts_with("J'y serai."));
+}

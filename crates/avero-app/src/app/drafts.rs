@@ -35,7 +35,15 @@ impl App {
 
     /// Saves what the composer holds on this computer, if it changed.
     /// Returns the draft's id (`None`: nothing written, nothing kept).
+    /// A reply or a forward the user has not touched yet is not kept
+    /// either: closing it must leave no draft.
     pub(super) fn save_composer(&mut self) -> Result<Option<i64>, String> {
+        self.store_composer(false)
+    }
+
+    /// `save_composer`; with `untouched`, a composer the user has not
+    /// changed is kept too (it is being scheduled as it is).
+    pub(super) fn store_composer(&mut self, untouched: bool) -> Result<Option<i64>, String> {
         let now = self.clock.now();
         let Some(composer) = &self.composer else {
             return Ok(None);
@@ -47,7 +55,8 @@ impl App {
         let Some(composer) = &mut self.composer else {
             return Ok(None);
         };
-        if composer.draft_id.is_none() && composer.is_blank() {
+        if composer.draft_id.is_none() && (composer.is_blank() || (!composer.edited && !untouched))
+        {
             return Ok(None);
         }
         if composer.draft_id.is_some() && !composer.dirty {
@@ -257,8 +266,10 @@ impl App {
 
     /// At start: the draft whose composer was still open when Avero
     /// stopped opens again; the drafts not yet saved on their server are
-    /// saved now. A scheduled mail left open goes back to waiting.
+    /// saved now. A scheduled mail left open goes back to waiting. The
+    /// untouched replies and forwards an older version kept go first.
     pub(super) fn restore_drafts(&mut self) -> Task<Message> {
+        let cleanup = self.forget_untouched_answers();
         for record in self.store.scheduled().unwrap_or_default() {
             if record.open {
                 let _ = self.store.set_draft_open(record.id, false);
@@ -283,6 +294,30 @@ impl App {
             let files = self.store.draft_files(record.id).unwrap_or_default();
             self.composer = Some(Composer::from_draft(&record, files));
             tasks.push(self.toast("Brouillon récupéré : Avero s'était arrêté", false));
+        }
+        tasks.push(cleanup);
+        Task::batch(tasks)
+    }
+
+    /// Throws away the closed drafts that are replies or forwards nobody
+    /// wrote in (see `compose::untouched_answer`), here and on the
+    /// server: older versions kept one each time such a composer closed.
+    fn forget_untouched_answers(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for record in self.store.closed_drafts().unwrap_or_default() {
+            let signature = self.signature_of(record.fields.account);
+            let has_files = self
+                .store
+                .draft_file_count(record.id)
+                .map_or(true, |count| count > 0);
+            if !compose::untouched_answer(&record.fields, &signature, has_files) {
+                continue;
+            }
+            if self.store.delete_draft(record.id).is_ok()
+                && let Some(copy) = record.server
+            {
+                tasks.push(self.drop_server_draft(copy));
+            }
         }
         Task::batch(tasks)
     }

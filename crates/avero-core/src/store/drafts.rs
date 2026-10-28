@@ -151,6 +151,22 @@ impl Store {
         )
     }
 
+    /// The closed drafts that are not scheduled (saved or not on their
+    /// server), oldest first.
+    pub fn closed_drafts(&self) -> Result<Vec<DraftRecord>, StoreError> {
+        self.drafts_where("open = 0 AND send_at IS NULL ORDER BY updated_at, id")
+    }
+
+    /// How many files a draft holds (without reading them).
+    pub fn draft_file_count(&self, id: i64) -> Result<usize, StoreError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM draft_files WHERE draft_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     fn drafts_where(&self, condition: &str) -> Result<Vec<DraftRecord>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {DRAFT_COLUMNS} FROM drafts WHERE {condition}"

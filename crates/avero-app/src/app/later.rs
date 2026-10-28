@@ -353,7 +353,7 @@ impl App {
     /// Keeps the composer's message to send at `at`: saved here, closed,
     /// listed in "Programmés". A copy of it in the drafts folder goes.
     fn schedule_composer(&mut self, at: i64) -> Task<Message> {
-        let id = match self.save_composer() {
+        let id = match self.store_composer(true) {
             Ok(Some(id)) => id,
             Ok(None) => return Task::none(),
             Err(e) => return self.toast(e, true),
