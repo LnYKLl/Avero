@@ -297,8 +297,13 @@ fn waiting<'a>(app: &'a App, email: &'a str, label: &'a str) -> Element<'a, Mess
     column![
         text(email.trim().to_string()).size(14).font(SEMIBOLD),
         spinner_line(app, label),
+        button(container(text("Annuler").size(14).font(MEDIUM)).center_x(Fill))
+            .width(Fill)
+            .padding([10, 16])
+            .on_press(Message::Add(AddMsg::CancelWait))
+            .style(theme::secondary),
     ]
-    .spacing(14)
+    .spacing(16)
     .into()
 }
 

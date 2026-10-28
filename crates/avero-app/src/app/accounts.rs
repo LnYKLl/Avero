@@ -160,12 +160,7 @@ impl App {
             AddMsg::CancelWait => {
                 self.oauth_cancel = None;
                 if let Some(form) = self.form() {
-                    form.next_generation();
-                    form.stage = if form.email.trim().is_empty() {
-                        Stage::Email
-                    } else {
-                        Stage::Credentials
-                    };
+                    form.cancel_wait();
                 }
                 Task::none()
             }

@@ -113,6 +113,19 @@ impl AccountForm {
         self.generation
     }
 
+    /// Stops waiting (detection, login test or browser) and goes back to
+    /// the step the user came from. Late answers are then ignored.
+    pub fn cancel_wait(&mut self) {
+        self.next_generation();
+        self.stage = match self.stage {
+            Stage::Detecting => Stage::Email,
+            Stage::Checking => Stage::Credentials,
+            Stage::Authorizing(_) if self.provider.is_some() => Stage::Credentials,
+            Stage::Authorizing(_) => Stage::Email,
+            other => other,
+        };
+    }
+
     /// Applies the detection result and moves to the credentials step.
     /// `None` switches to manual mode with the advanced settings open.
     pub fn apply_detection(&mut self, config: Option<ProviderConfig>, oauth_configured: bool) {
@@ -408,6 +421,26 @@ mod tests {
         assert_eq!(account.auth, AuthKind::OAuthMicrosoft);
         assert_eq!(account.imap.host, "outlook.office365.com");
         assert_eq!(account.name, "a");
+    }
+
+    #[test]
+    fn cancel_goes_back_one_step_and_bumps_generation() {
+        let mut form = AccountForm::new();
+        form.stage = Stage::Detecting;
+        form.cancel_wait();
+        assert_eq!(form.stage, Stage::Email);
+        assert_eq!(form.generation, 1);
+        let mut form = gmail_form(true);
+        form.stage = Stage::Checking;
+        form.cancel_wait();
+        assert_eq!(form.stage, Stage::Credentials);
+        form.stage = Stage::Authorizing(Provider::Google);
+        form.cancel_wait();
+        assert_eq!(form.stage, Stage::Credentials);
+        let mut fresh = AccountForm::new();
+        fresh.stage = Stage::Authorizing(Provider::Google);
+        fresh.cancel_wait();
+        assert_eq!(fresh.stage, Stage::Email);
     }
 
     #[test]
