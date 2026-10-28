@@ -67,6 +67,12 @@ impl ImapSource {
         let caps = read_caps(&mut session).await?;
         Ok(ImapSource { session, caps })
     }
+
+    /// Creates the folder `path` on the server (CREATE). Fails with a
+    /// protocol error if the server refuses (for example, it exists).
+    pub async fn create_folder(&mut self, path: &str) -> Result<(), SyncError> {
+        create_mailbox(&mut self.session, path).await
+    }
 }
 
 /// TCP + TLS handshake + reading the server greeting.
@@ -77,6 +83,9 @@ async fn open_client(cfg: &ServerConfig) -> Result<Client<TlsStream<TcpStream>>,
     let native = rustls_native_certs::load_native_certs();
     // Some certificates may be unreadable; we keep the ones that are fine.
     roots.add_parsable_certificates(native.certs);
+    // Local end-to-end tests only: see `test_ca`.
+    #[cfg(feature = "test-ca")]
+    crate::test_ca::add_to(&mut roots);
 
     let tls_config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
         .with_safe_default_protocol_versions()
@@ -542,6 +551,15 @@ where
             .map_err(command_error)
     };
     with_timeout(TRANSFER_TIMEOUT, "APPEND", appending).await
+}
+
+/// Sends CREATE for `path`, quoted.
+async fn create_mailbox<T>(session: &mut Session<T>, path: &str) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("CREATE {}", quote_mailbox(path)?);
+    run_checked(session, &command).await
 }
 
 /// A mailbox name as an IMAP quoted string. Line breaks cannot be quoted.
@@ -1090,6 +1108,24 @@ mod tests {
         let sent = commands(session, server).await;
         assert_eq!(sent[0], "APPEND \"Sent\" (\\Seen) {5}");
         assert_eq!(sent[1], "hello");
+    }
+
+    #[tokio::test]
+    async fn create_sends_a_quoted_name() {
+        let (mut session, server) = session_recording(vec![OK]).await;
+        create_mailbox(&mut session, "Mes \"dossiers\"")
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["CREATE \"Mes \\\"dossiers\\\"\""]);
+    }
+
+    #[tokio::test]
+    async fn refused_create_is_a_protocol_error() {
+        let (mut session, _server) =
+            session_recording(vec!["{tag} NO [ALREADYEXISTS] exists\r\n"]).await;
+        let result = create_mailbox(&mut session, "Trash").await;
+        assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
     }
 
     #[test]
