@@ -97,6 +97,12 @@ pub fn needs_reconnect(error: &OAuthError) -> bool {
     matches!(error, OAuthError::Server(code) if RECONNECT_CODES.contains(&code.as_str()))
 }
 
+/// Whether the provider refused the OAuth client itself (unknown id or
+/// wrong secret): only fixing the client in the settings helps.
+pub fn is_client_error(error: &OAuthError) -> bool {
+    matches!(error, OAuthError::Server(code) if code == "invalid_client")
+}
+
 /// Checks that a reconnection signed in to the same mailbox: the
 /// provider may let the user pick another account in the browser.
 pub fn check_grant_email(account_email: &str, grant_email: Option<&str>) -> Result<(), String> {

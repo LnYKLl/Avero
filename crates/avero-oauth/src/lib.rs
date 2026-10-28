@@ -20,7 +20,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
-pub use config::{ClientConfig, client_config};
+pub use config::{
+    ClientConfig, GOOGLE_CLIENT_SUFFIX, check_client_id, check_client_secret, client_config,
+    has_compiled_client, mask_client_id, remove_client_config, save_client_config,
+    saved_client_config,
+};
 
 /// How long we wait for the user to finish in the browser.
 const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -136,13 +140,25 @@ pub async fn authorize(
     webbrowser::open(&url).map_err(|e| OAuthError::Browser(e.to_string()))?;
 
     let code = loopback::wait_for_code(listener, &state, AUTHORIZE_TIMEOUT).await?;
+    exchange_code(provider, client, &code, &redirect_uri, &verifier).await
+}
 
+/// Exchanges an authorization code for tokens (the second half of
+/// [`authorize`]). Public for the live endpoint tests.
+#[doc(hidden)]
+pub async fn exchange_code(
+    provider: Provider,
+    client: &ClientConfig,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<Tokens, OAuthError> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
-        ("redirect_uri", redirect_uri.as_str()),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
         ("client_id", client.client_id.as_str()),
-        ("code_verifier", verifier.as_str()),
+        ("code_verifier", verifier),
     ];
     if let Some(secret) = &client.client_secret {
         form.push(("client_secret", secret));
@@ -190,8 +206,10 @@ async fn post_token(provider: Provider, form: &[(&str, &str)]) -> Result<Tokens,
     token::parse_token_response(provider, status, &body, now())
 }
 
-/// Builds the authorization URL opened in the browser.
-pub(crate) fn build_auth_url(
+/// Builds the authorization URL opened in the browser. Public for the
+/// live endpoint tests.
+#[doc(hidden)]
+pub fn build_auth_url(
     provider: Provider,
     client_id: &str,
     redirect_uri: &str,
@@ -221,7 +239,8 @@ pub(crate) fn build_auth_url(
 }
 
 /// PKCE S256 challenge: base64url(sha256(verifier)) without padding.
-pub(crate) fn challenge_for(verifier: &str) -> String {
+#[doc(hidden)]
+pub fn challenge_for(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 

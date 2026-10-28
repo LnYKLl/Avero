@@ -60,6 +60,25 @@ impl AccountError {
     }
 }
 
+/// How a failed token refresh shows on the account. A wrong OAuth client
+/// (`invalid_client`, what Google answers for an unknown id or a wrong
+/// secret) is a settings problem, not a network one: retrying or
+/// signing in again cannot fix it.
+pub fn refresh_error(
+    provider: avero_oauth::Provider,
+    error: &avero_oauth::OAuthError,
+) -> AccountError {
+    if auth::needs_reconnect(error) {
+        return AccountError::new(ErrorKind::Reconnect, "Reconnexion nécessaire");
+    }
+    let kind = if auth::is_client_error(error) {
+        ErrorKind::Other
+    } else {
+        ErrorKind::Network
+    };
+    AccountError::new(kind, oauth_message(provider, error))
+}
+
 /// Where archived or deleted messages go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
@@ -479,8 +498,7 @@ impl Worker {
                 });
                 Ok(tokens.access_token)
             }
-            Err(e) if auth::needs_reconnect(&e) => Err(reconnect()),
-            Err(e) => Err(AccountError::new(ErrorKind::Network, oauth_message(&e))),
+            Err(e) => Err(refresh_error(provider, &e)),
         }
     }
 
@@ -866,6 +884,29 @@ mod tests {
     use avero_core::{AccountColor, AccountId, AuthKind, FolderId, NewAccount, ServerConfig};
     use iced::futures::StreamExt;
     use std::path::Path;
+
+    #[test]
+    fn refresh_errors_are_classified() {
+        use avero_oauth::{OAuthError, Provider};
+        let wrong_client = refresh_error(
+            Provider::Google,
+            &OAuthError::Server("invalid_client".into()),
+        );
+        assert_eq!(wrong_client.kind, ErrorKind::Other);
+        assert!(wrong_client.message.contains("Réglages"));
+        assert_eq!(
+            refresh_error(
+                Provider::Google,
+                &OAuthError::Server("invalid_grant".into())
+            )
+            .kind,
+            ErrorKind::Reconnect
+        );
+        assert_eq!(
+            refresh_error(Provider::Microsoft, &OAuthError::Network("dns".into())).kind,
+            ErrorKind::Network
+        );
+    }
 
     fn temp_db(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("avero-worker-{}-{tag}.db", std::process::id()))

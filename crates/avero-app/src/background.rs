@@ -171,7 +171,7 @@ pub async fn sign_in(
             tokens = avero_oauth::authorize(provider, &client, login_hint.as_deref()) => tokens,
             _ = cancel => return Err(String::new()),
         };
-        let tokens = tokens.map_err(|e| oauth_message(&e))?;
+        let tokens = tokens.map_err(|e| oauth_message(provider, &e))?;
         let email = tokens.email.clone().or(login_hint);
         let Some(user) = email.clone() else {
             return Err("Le fournisseur n'a pas indiqué l'adresse du compte.".to_string());
@@ -205,8 +205,15 @@ pub async fn sign_in(
     result.unwrap_or_else(|| Err(CRASHED.to_string()))
 }
 
-/// French text for a sign-in failure (never contains a token).
-pub fn oauth_message(error: &OAuthError) -> String {
+/// French text for a sign-in or refresh failure (never contains a token).
+///
+/// The codes explained here are the ones Google and Microsoft really send
+/// when the client registered in Avero is wrong (see
+/// `crates/avero-oauth/tests/live_endpoints.rs`): Google answers
+/// `invalid_client` for an unknown id or a wrong secret, Microsoft
+/// `unauthorized_client` (AADSTS700016) for an unknown application.
+pub fn oauth_message(provider: Provider, error: &OAuthError) -> String {
+    let name = crate::auth::provider_name(provider);
     match error {
         OAuthError::Cancelled => "Connexion annulée dans le navigateur.".to_string(),
         OAuthError::Timeout => {
@@ -214,7 +221,29 @@ pub fn oauth_message(error: &OAuthError) -> String {
         }
         OAuthError::Browser(detail) => format!("Impossible d'ouvrir le navigateur : {detail}"),
         OAuthError::Network(detail) => format!("Erreur réseau : {detail}"),
-        OAuthError::Server(code) => format!("Le fournisseur a refusé la connexion ({code})."),
+        OAuthError::Server(code) => match (provider, code.as_str()) {
+            (Provider::Google, "invalid_client") => format!(
+                "{name} ne reconnaît pas l'ID client ou le code secret enregistrés dans Avero. \
+                 Vérifiez-les dans Réglages → Connexion Google / Microsoft."
+            ),
+            (Provider::Microsoft, "invalid_client" | "unauthorized_client") => format!(
+                "{name} ne reconnaît pas l'application enregistrée dans Avero. Vérifiez l'ID \
+                 d'application et que « Autoriser les flux de clients publics » est activé \
+                 (Réglages → Connexion Google / Microsoft)."
+            ),
+            (Provider::Google, "unauthorized_client") => format!(
+                "{name} refuse cet ID client pour ce compte. Reconnectez-vous ; si cela \
+                 persiste, vérifiez que le client est de type « Application de bureau »."
+            ),
+            (_, "invalid_grant") => {
+                "L'autorisation a expiré ou a été retirée : reconnectez-vous.".to_string()
+            }
+            (_, "invalid_scope") => format!(
+                "{name} refuse l'accès demandé : ajoutez l'accès à la messagerie dans la \
+                 configuration de l'application."
+            ),
+            _ => format!("{name} a refusé la connexion ({code})."),
+        },
         OAuthError::InvalidResponse(detail) => {
             format!("Réponse inattendue du fournisseur : {detail}")
         }
@@ -295,8 +324,34 @@ mod tests {
 
     #[test]
     fn oauth_messages_are_french_and_carry_codes() {
-        let text = oauth_message(&OAuthError::Server("invalid_grant".into()));
-        assert!(text.contains("invalid_grant"));
-        assert!(oauth_message(&OAuthError::Timeout).starts_with("Délai"));
+        let text = oauth_message(
+            Provider::Google,
+            &OAuthError::Server("temporarily_unavailable".into()),
+        );
+        assert!(text.contains("temporarily_unavailable"), "{text}");
+        assert!(text.starts_with("Google"), "{text}");
+        assert!(oauth_message(Provider::Google, &OAuthError::Timeout).starts_with("Délai"));
+    }
+
+    #[test]
+    fn wrong_client_errors_point_to_the_settings() {
+        // The codes observed against the real endpoints with an unknown client.
+        let google = oauth_message(
+            Provider::Google,
+            &OAuthError::Server("invalid_client".into()),
+        );
+        assert!(google.contains("ID client"), "{google}");
+        assert!(google.contains("Réglages"), "{google}");
+        assert!(!google.contains("invalid_client"), "{google}");
+        let microsoft = oauth_message(
+            Provider::Microsoft,
+            &OAuthError::Server("unauthorized_client".into()),
+        );
+        assert!(microsoft.contains("flux de clients publics"), "{microsoft}");
+        let expired = oauth_message(
+            Provider::Google,
+            &OAuthError::Server("invalid_grant".into()),
+        );
+        assert!(expired.contains("reconnectez-vous"), "{expired}");
     }
 }
