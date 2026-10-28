@@ -13,6 +13,7 @@ mod oauth_setup;
 mod paths;
 mod settings;
 mod theme;
+mod unsubscribe;
 mod view;
 mod worker;
 

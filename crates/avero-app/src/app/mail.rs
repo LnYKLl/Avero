@@ -4,7 +4,11 @@ use super::{App, Body, Entry, Message, Overlay, PAGE, RELOAD_EVERY, Reading};
 use crate::background::{self, OpenedBody};
 use crate::compose::Mode;
 use crate::worker::{Destination, Event, Job};
-use avero_core::{AccountFilter, AccountId, FolderRole, MessageRef, UnifiedItem};
+use avero_core::category::sender_key;
+use avero_core::{
+    AccountFilter, AccountId, Category, FolderRole, Listing, MessageRef, UnifiedItem,
+};
+
 use iced::Task;
 use iced::widget::text_editor;
 use std::collections::BTreeMap;
@@ -19,6 +23,9 @@ impl App {
         match message {
             Message::FolderSelected(folder) => {
                 self.folder = folder;
+                self.starred = false;
+                self.sender = None;
+                self.tab = avero_core::Category::Important;
                 self.search_text.clear();
                 self.search_query = None;
                 self.screen = super::Screen::Mail;
@@ -93,9 +100,13 @@ impl App {
         }
     }
 
+    /// A search replaces "Mails de X" (it looks everywhere anyway).
     fn apply_search(&mut self) {
         let query = self.search_text.trim();
         self.search_query = (!query.is_empty()).then(|| query.to_string());
+        if self.search_query.is_some() {
+            self.sender = None;
+        }
         self.load_first_page();
     }
 
@@ -169,14 +180,17 @@ impl App {
     /// logs it and returns nothing so the window keeps working.
     ///
     /// With "Regrouper les conversations" on, one item per conversation;
-    /// search results stay one item per message.
+    /// search results and a sender's mail stay one item per message.
     fn fetch(&self, limit: usize) -> Vec<UnifiedItem> {
         let result = match &self.search_query {
             Some(query) => self.store.search(query, None, self.filter, limit),
-            None if self.settings.group_threads => {
-                self.store.threads(self.folder, self.filter, limit, 0)
-            }
-            None => self.store.unified(self.folder, self.filter, limit, 0),
+            None => self.store.list(
+                &self.listing(),
+                self.filter,
+                self.lines_are_threads(),
+                limit,
+                0,
+            ),
         };
         result.unwrap_or_else(|e| {
             eprintln!("Impossible de lire la liste : {e}");
@@ -215,6 +229,21 @@ impl App {
                 (a.id, count.unwrap_or(0))
             })
             .collect();
+        self.tab_unread = if self.settings.inbox_tabs {
+            Category::ALL
+                .into_iter()
+                .map(|category| {
+                    let count = self.store.list_unread(
+                        &Listing::Tab(category),
+                        self.filter,
+                        self.settings.group_threads,
+                    );
+                    (category, count.unwrap_or(0))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
     }
 
     /// Index of the selected item in the list.
@@ -267,7 +296,7 @@ impl App {
         let mut messages = match item.thread_id {
             Some(thread) if item.count > 1 => self
                 .store
-                .thread_messages(thread, self.folder, self.filter)
+                .thread_messages(thread, self.reading_role(), self.filter)
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
@@ -275,6 +304,20 @@ impl App {
             messages.push(item.clone());
         }
         let newest = messages.len() - 1;
+        // Who the conversation is from: its newest message by someone
+        // else (the user's own answers say nothing about the list).
+        let own: Vec<String> = self.accounts.iter().map(|a| sender_key(&a.email)).collect();
+        let from = messages
+            .iter()
+            .rev()
+            .find(|m| !own.contains(&sender_key(&m.from_addr)))
+            .unwrap_or(&messages[newest]);
+        let from_row = from.row_ids.first().copied();
+        let sender = from.from_addr.clone();
+        let account = from.accounts.first().or(item.accounts.first()).copied();
+        let category = from_row.and_then(|row| self.store.category(row).ok().flatten());
+        let unsubscribe = from_row
+            .and_then(|row| self.unsubscribe_offer(row, &sender, &from.from_display, account));
         self.reading = Some(Reading {
             rows: item.row_ids.clone(),
             accounts: item.accounts.clone(),
@@ -288,6 +331,9 @@ impl App {
                 })
                 .collect(),
             focus: newest,
+            sender,
+            category,
+            unsubscribe,
         });
         let mut tasks = vec![self.unfold(newest)];
         if !item.seen {
@@ -400,7 +446,7 @@ impl App {
         }
     }
 
-    fn refs(&self, rows: &[i64]) -> Vec<MessageRef> {
+    pub(super) fn refs(&self, rows: &[i64]) -> Vec<MessageRef> {
         self.store.message_refs(rows).unwrap_or_default()
     }
 
@@ -440,7 +486,7 @@ impl App {
         if accounts.is_empty() {
             return None;
         }
-        if self.folder == FolderRole::Archive && self.search_query.is_none() {
+        if self.folder == FolderRole::Archive && self.in_folder() {
             return Some("Déjà dans les archives");
         }
         let known: Vec<Option<bool>> = accounts

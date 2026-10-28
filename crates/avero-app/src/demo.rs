@@ -1,6 +1,7 @@
 //! Demo mode (`AVERO_DEMO=1`): an in-memory database with three made-up
 //! accounts and about forty French messages, a few of them answers that
-//! make conversations, and no network at all.
+//! make conversations, some newsletters and notifications (for the tabs
+//! and "Se désinscrire"), a few starred ones, and no network at all.
 //! `AVERO_DEMO=empty` starts with no account (welcome screen);
 //! `AVERO_DEMO=google-setup` (or `microsoft-setup`) also opens the
 //! connection assistant, as after a click on "Continuer avec Google".
@@ -210,8 +211,59 @@ fn samples() -> Vec<Sample> {
         s(0, Inbox, ("Maman", "francoise.martin@orange.fr"), "Re: Repas de dimanche",
           "Parfait, je fais le gratin ! Ton frère demande si tu peux apporter du pain.\n\nBisous\nMaman",
           70, false, None),
+        s(2, Inbox, ("Vélo Mag", "lettre@velomag.fr"), "Les 10 plus beaux cols des Alpes",
+          "Cette semaine dans Vélo Mag : les dix cols à grimper au moins une fois, l'entretien de la chaîne en hiver et nos tests de lampes.\n\nBonne route !",
+          6 * H, false, None),
+        s(1, Inbox, ("Behance", "newsletter@behance.net"), "Les projets de la semaine",
+          "Découvrez la sélection de la semaine : identités visuelles, typographies et illustrations.",
+          D + H, false, None),
     ]
 }
+
+/// The list headers of a demo sender: `(List-Unsubscribe,
+/// List-Unsubscribe-Post, List-Id)`. Newsletters get one way or another
+/// to unsubscribe (one-click, mail only, web page only).
+fn list_headers(
+    from: &str,
+) -> (
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
+    let one_click = Some("List-Unsubscribe=One-Click");
+    match from {
+        "newsletter@lemonde.fr" => (
+            Some(
+                "<mailto:desinscription@lemonde.fr?subject=unsubscribe>, <https://lemonde.fr/desinscription?u=demo>",
+            ),
+            one_click,
+            Some("La lettre du matin <matin.lemonde.fr>"),
+        ),
+        "no-reply@spotify.com" => (
+            Some("<https://spotify.com/unsubscribe?u=demo>"),
+            one_click,
+            None,
+        ),
+        "lettre@velomag.fr" => (
+            Some("<mailto:desabonnement@velomag.fr?subject=STOP>"),
+            None,
+            Some("<lettre.velomag.fr>"),
+        ),
+        "team@malt.fr" | "newsletter@behance.net" => {
+            (Some("<https://example.org/preferences?u=demo>"), None, None)
+        }
+        "contact@helloasso.com" => (None, None, Some("<asso.helloasso.com>")),
+        _ => (None, None, None),
+    }
+}
+
+/// The demo messages shown in "Favoris".
+const STARRED: [&str; 4] = [
+    "Maquettes v3 pour le client Orsay",
+    "Subvention 2027 : dossier à déposer avant le 30 novembre",
+    "Contrat Orsay signé 🎉",
+    "Bienvenue à l'Atelier Lumen",
+];
 
 /// The message a sample answers: for "Re: X", the closest older sample
 /// called "X" or "Re: X". Only the demo threads by subject; real mail is
@@ -290,6 +342,7 @@ pub fn seed(store: &Store) {
         let uid = index as u32 + 1;
         let date = now - sample.minutes_ago * 60;
         let references = ancestors(&samples, index);
+        let (unsubscribe, unsubscribe_post, list_id) = list_headers(sample.from.1);
         let message = NewMessage {
             uid,
             message_id: Some(demo_id(index)),
@@ -298,11 +351,15 @@ pub fn seed(store: &Store) {
             from_addr: sample.from.1.to_string(),
             date,
             seen: sample.seen,
+            flagged: STARRED.contains(&sample.subject),
             has_attachments: sample.attachment.is_some(),
             headers: MessageHeaders {
                 in_reply_to: references.last().cloned(),
                 references: references.clone(),
                 to: vec![ACCOUNTS[sample.account].1.to_string()],
+                list_unsubscribe: unsubscribe.map(str::to_string),
+                list_unsubscribe_post: unsubscribe_post.map(str::to_string),
+                list_id: list_id.map(str::to_string),
                 ..Default::default()
             },
         };
@@ -476,6 +533,42 @@ mod tests {
         let parsed = avero_sync::parse::parse_body(&raw);
         let references = parsed.references.unwrap_or_default();
         assert_eq!(references.split(' ').count(), 2, "{references}");
+    }
+
+    #[test]
+    fn demo_fills_every_tab_and_favourites() {
+        use avero_core::{Category, Listing};
+        let store = seeded_store();
+        for category in Category::ALL {
+            let tab = store
+                .list(&Listing::Tab(category), AccountFilter::All, true, 200, 0)
+                .unwrap();
+            assert!(tab.len() >= 3, "{category:?}: {}", tab.len());
+        }
+        let newsletters = store
+            .list(
+                &Listing::Tab(Category::Newsletter),
+                AccountFilter::All,
+                true,
+                200,
+                0,
+            )
+            .unwrap();
+        assert!(
+            newsletters
+                .iter()
+                .any(|i| i.from_addr == "newsletter@lemonde.fr")
+        );
+        let starred = store
+            .list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+            .unwrap();
+        assert_eq!(starred.len(), STARRED.len());
+        // The archived one too.
+        assert!(
+            starred
+                .iter()
+                .any(|i| i.subject == "Bienvenue à l'Atelier Lumen")
+        );
     }
 
     #[test]

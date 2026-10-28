@@ -22,6 +22,10 @@ resvg = "0.45"
 # zbus then brings its own executor, so a notification can be shown from
 # a plain thread. 4.18 needs rustc 1.89.
 notify-rust = "4.18"
+# One-click unsubscribe (RFC 8058): same reqwest and rustls set-up as
+# avero-oauth and avero-autoconfig (ring, no default TLS), so no new crate.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # Native "Open" / "Save as" dialogs (xdg-portal on Linux, no GTK).
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }

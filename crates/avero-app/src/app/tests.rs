@@ -1096,10 +1096,16 @@ fn merged_accounts_secrets_are_erased() {
     }
     {
         // Rebuild what an old version could leave: a second "A@x.fr",
-        // in a version 3 database (without what versions 4 to 6 added).
+        // in a version 3 database (without what versions 4 to 7 added).
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "ALTER TABLE accounts DROP COLUMN signature;
+            "DROP TABLE senders;
+             DROP INDEX messages_sender;
+             DROP INDEX messages_flagged;
+             ALTER TABLE messages DROP COLUMN flagged;
+             ALTER TABLE messages DROP COLUMN flag_pending;
+             ALTER TABLE messages DROP COLUMN category;
+             ALTER TABLE accounts DROP COLUMN signature;
              DROP INDEX messages_thread;
              DROP TABLE thread_links;
              ALTER TABLE messages DROP COLUMN in_reply_to;
@@ -1733,4 +1739,263 @@ fn grouped_delete_with_the_delete_key() {
     press_named(&mut app, keyboard::key::Named::Delete);
     assert_eq!(app.items.len(), 3);
     assert!(app.checked.is_empty());
+}
+
+// ------------------------------------------- tabs, favourites, senders
+
+/// Two accounts; a's inbox also holds a newsletter (unsubscribe by mail),
+/// a promotion (one-click) and a notification, b's the same newsletter.
+fn with_lists() -> App {
+    app_with(|s| {
+        let a = add_account_with_mail(s, "a@x.fr", 2);
+        let b = add_account_with_mail(s, "b@x.fr", 1);
+        let list = |uid: u32, from: &str, date: i64| {
+            let mut m = NewMessage {
+                uid,
+                message_id: Some(format!("<{uid}.{from}>")),
+                subject: format!("Lettre {uid}"),
+                from_name: Some("La Lettre".into()),
+                from_addr: from.into(),
+                date,
+                ..Default::default()
+            };
+            m.headers.list_unsubscribe =
+                Some("<mailto:stop@news.fr?subject=STOP>, <https://news.fr/u?id=1>".into());
+            m
+        };
+        let inbox_a = s.folder_by_role(a, FolderRole::Inbox).unwrap().unwrap();
+        let mut one_click = list(20, "promo@shop.fr", 1_700_000_050);
+        one_click.headers.list_unsubscribe_post = Some("List-Unsubscribe=One-Click".into());
+        let notification = NewMessage {
+            uid: 30,
+            message_id: Some("<30@robot>".into()),
+            subject: "Alerte".into(),
+            from_addr: "noreply@robot.fr".into(),
+            date: 1_700_000_060,
+            seen: true,
+            ..Default::default()
+        };
+        s.insert_messages(
+            inbox_a.id,
+            &[
+                list(10, "lettre@news.fr", 1_700_000_040),
+                one_click,
+                notification,
+            ],
+        )
+        .unwrap();
+        let inbox_b = s.folder_by_role(b, FolderRole::Inbox).unwrap().unwrap();
+        s.insert_messages(inbox_b.id, &[list(11, "lettre@news.fr", 1_700_000_070)])
+            .unwrap();
+    })
+}
+
+fn subjects(app: &App) -> Vec<String> {
+    app.items.iter().map(|i| i.subject.clone()).collect()
+}
+
+fn line_of(app: &App, subject: &str) -> usize {
+    subjects(app).iter().position(|s| s == subject).unwrap()
+}
+
+fn offer(app: &App) -> Option<&UnsubscribeOffer> {
+    app.reading.as_ref().unwrap().unsubscribe.as_ref()
+}
+
+#[test]
+fn inbox_tabs_split_the_inbox_and_count_unread() {
+    let mut app = with_lists();
+    assert!(app.tabs_shown());
+    assert_eq!(app.tab, Category::Important);
+    assert_eq!(app.items.len(), 3, "{:?}", subjects(&app));
+    assert_eq!(app.tab_unread[&Category::Important], 3);
+    assert_eq!(app.tab_unread[&Category::Newsletter], 3);
+    assert_eq!(app.tab_unread[&Category::Notification], 0);
+
+    let _ = app.update(Message::TabSelected(Category::Newsletter));
+    assert_eq!(subjects(&app), vec!["Lettre 11", "Lettre 20", "Lettre 10"]);
+    // The account filter applies to the tabs and their counts.
+    let (a, _) = ids(&app);
+    let _ = app.update(Message::FilterSelected(AccountFilter::Only(a)));
+    assert_eq!(app.items.len(), 2);
+    assert_eq!(app.tab_unread[&Category::Newsletter], 2);
+    let _ = app.update(Message::TabSelected(Category::Notification));
+    assert_eq!(subjects(&app), vec!["Alerte"]);
+
+    // Another folder has no tabs; coming back starts on Important.
+    let _ = app.update(Message::FolderSelected(FolderRole::Sent));
+    assert!(!app.tabs_shown());
+    let _ = app.update(Message::FolderSelected(FolderRole::Inbox));
+    assert_eq!(app.tab, Category::Important);
+
+    // Turned off: one list again.
+    let _ = app.update(Message::FilterSelected(AccountFilter::All));
+    let _ = app.update(Message::TabsToggled(false));
+    assert!(!app.tabs_shown());
+    assert_eq!(app.items.len(), 7);
+}
+
+#[test]
+fn reclassifying_a_conversation_remembers_the_sender() {
+    let mut app = with_lists();
+    let _ = app.update(Message::TabSelected(Category::Newsletter));
+    let _ = app.update(Message::MessageSelected(line_of(&app, "Lettre 10")));
+    let reading = app.reading.as_ref().unwrap();
+    assert_eq!(reading.sender, "lettre@news.fr");
+    assert_eq!(reading.category, Some(Category::Newsletter));
+
+    let _ = app.update(Message::Reclassify(Category::Important));
+    // Both mails of that sender left the tab (b's too); the other stays.
+    assert_eq!(subjects(&app), vec!["Lettre 20"]);
+    let _ = app.update(Message::TabSelected(Category::Important));
+    assert!(subjects(&app).contains(&"Lettre 11".to_string()));
+    // Remembered for the next mail of that sender.
+    let (a, _) = ids(&app);
+    let inbox = app
+        .store
+        .folder_by_role(a, FolderRole::Inbox)
+        .unwrap()
+        .unwrap();
+    let mut next = NewMessage {
+        uid: 99,
+        message_id: Some("<99@news>".into()),
+        subject: "Lettre 99".into(),
+        from_addr: "Lettre@News.fr".into(),
+        date: 1_700_000_100,
+        ..Default::default()
+    };
+    next.headers.list_id = Some("<news.fr>".into());
+    app.store.insert_messages(inbox.id, &[next]).unwrap();
+    app.reload();
+    assert_eq!(app.items[0].subject, "Lettre 99");
+}
+
+#[test]
+fn sender_view_lists_every_account_then_goes_back() {
+    let mut app = with_lists();
+    let _ = app.update(Message::TabSelected(Category::Newsletter));
+    let _ = app.update(Message::ShowSender(
+        "LETTRE@news.fr".into(),
+        "La Lettre".into(),
+    ));
+    assert!(!app.tabs_shown());
+    assert!(!app.lines_are_threads());
+    assert_eq!(subjects(&app), vec!["Lettre 11", "Lettre 10"]);
+    let accounts: Vec<AccountId> = app.items.iter().flat_map(|i| i.accounts.clone()).collect();
+    assert_eq!(accounts.len(), 2, "both accounts");
+    // Échap (or "Retour") goes back to the tab that was shown.
+    press_named(&mut app, keyboard::key::Named::Escape);
+    assert!(app.sender.is_none());
+    assert_eq!(app.tab, Category::Newsletter);
+    assert_eq!(app.items.len(), 3);
+    // Without a name, the address is the title; a search replaces the view.
+    let _ = app.update(Message::ShowSender("lettre@news.fr".into(), String::new()));
+    assert_eq!(app.sender.as_ref().unwrap().name, "lettre@news.fr");
+    let _ = app.update(Message::SearchChanged("Alerte".into()));
+    let _ = app.update(Message::SearchSubmitted);
+    assert!(app.sender.is_none());
+    assert_eq!(subjects(&app), vec!["Alerte"]);
+}
+
+#[test]
+fn star_key_and_favourites() {
+    let mut app = two_accounts();
+    let _ = app.update(Message::MessageSelected(0));
+    let start = Instant::now();
+    press(&mut app, "s", start);
+    assert!(app.items[0].flagged);
+    // `g` then `s` still goes to Envoyés, without starring.
+    press(&mut app, "g", start);
+    press(&mut app, "s", start);
+    assert_eq!(app.folder, FolderRole::Sent);
+
+    let _ = app.update(Message::StarredSelected);
+    assert!(app.starred);
+    assert_eq!(app.items.len(), 1);
+    assert!(app.items[0].flagged);
+    // The star of the line takes it off: the line leaves "Favoris".
+    let _ = app.update(Message::StarLine(0));
+    assert!(app.items.is_empty());
+    // Back in a folder, "Favoris" is left.
+    let _ = app.update(Message::FolderSelected(FolderRole::Inbox));
+    assert!(!app.starred);
+    assert!(app.items.iter().all(|i| !i.flagged));
+}
+
+#[test]
+fn starring_checked_lines_and_unstarring_them_all() {
+    let mut app = two_accounts();
+    click(&mut app, 0, keyboard::Modifiers::COMMAND);
+    click(&mut app, 3, keyboard::Modifiers::COMMAND);
+    let _ = app.update(Message::ToggleStar);
+    let flagged: Vec<bool> = app.items.iter().map(|i| i.flagged).collect();
+    assert_eq!(flagged, vec![true, false, false, true, false]);
+    // All of them starred: the same action takes the stars off.
+    let _ = app.update(Message::ToggleStar);
+    assert!(app.items.iter().all(|i| !i.flagged));
+}
+
+#[test]
+fn unsubscribe_asks_then_is_remembered_for_the_sender() {
+    use crate::unsubscribe::Method;
+    let mut app = with_lists();
+    let _ = app.update(Message::TabSelected(Category::Newsletter));
+    let _ = app.update(Message::MessageSelected(line_of(&app, "Lettre 10")));
+    let found = offer(&app).unwrap().clone();
+    // No one-click: the mail wins over the web page.
+    assert!(matches!(
+        &found.method,
+        Method::Mail { to, subject, .. } if to == "stop@news.fr" && subject == "STOP"
+    ));
+    assert_eq!(found.account, ids(&app).0);
+    assert!(!found.requested);
+
+    let _ = app.update(Message::Unsubscribe);
+    assert!(matches!(app.overlay, Some(Overlay::ConfirmUnsubscribe(_))));
+    // Demo mode: nothing is sent, the request is remembered.
+    let _ = app.update(Message::ConfirmUnsubscribe);
+    assert!(app.overlay.is_none());
+    assert!(offer(&app).unwrap().requested);
+    // The other mail of that sender (b's account) knows it too.
+    let _ = app.update(Message::MessageSelected(line_of(&app, "Lettre 11")));
+    assert!(offer(&app).unwrap().requested);
+
+    // One-click when offered over HTTPS.
+    let _ = app.update(Message::MessageSelected(line_of(&app, "Lettre 20")));
+    assert!(matches!(offer(&app).unwrap().method, Method::OneClick(_)));
+    // A failure is reported and nothing is remembered.
+    let _ = app.update(Message::Unsubscribed(
+        "promo@shop.fr".into(),
+        Err("refusé".into()),
+    ));
+    assert!(!offer(&app).unwrap().requested);
+    assert!(app.toast.as_ref().unwrap().error);
+    let _ = app.update(Message::Unsubscribed("promo@shop.fr".into(), Ok(())));
+    assert!(offer(&app).unwrap().requested);
+    // Plain mail has nothing to offer.
+    let _ = app.update(Message::TabSelected(Category::Important));
+    let _ = app.update(Message::MessageSelected(0));
+    assert!(offer(&app).is_none());
+}
+
+#[test]
+fn demo_has_tabs_favourites_and_unsubscribe() {
+    let store = crate::demo::seeded_store();
+    let (mut app, _task) = App::new(store, Backend::Demo, Settings::default(), None);
+    for category in Category::ALL {
+        assert!(app.tab_unread.contains_key(&category));
+    }
+    let _ = app.update(Message::TabSelected(Category::Newsletter));
+    let monde = app
+        .items
+        .iter()
+        .position(|i| i.from_addr == "newsletter@lemonde.fr")
+        .unwrap();
+    let _ = app.update(Message::MessageSelected(monde));
+    assert!(matches!(
+        offer(&app).unwrap().method,
+        crate::unsubscribe::Method::OneClick(_)
+    ));
+    let _ = app.update(Message::StarredSelected);
+    assert!(app.items.len() >= 3);
 }

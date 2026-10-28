@@ -1,12 +1,12 @@
-//! The list column: title, search, account chips, folders, account
-//! problems, then the messages.
+//! The list column: title, search, account chips, folders, the tabs of
+//! the inbox, account problems, then the messages.
 
 use super::{dot, ellipsize, find_account, format_date, hr, shared_avatar, tip, to_color};
-use crate::app::{AccountMsg, App, Message, PAGE, SEARCH_ID};
+use crate::app::{AccountMsg, App, Message, PAGE, SEARCH_ID, tab_name};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use crate::worker::ErrorKind;
-use avero_core::{Account, AccountFilter, AuthKind, FolderRole, UnifiedItem};
+use avero_core::{Account, AccountFilter, AuthKind, Category, FolderRole, UnifiedItem};
 use chrono::{DateTime, Local};
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -44,6 +44,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .push(folders(app))
         .spacing(14)
         .padding(Padding::new(20.0).bottom(14));
+    if app.tabs_shown() {
+        header = header.push(tabs(app));
+    }
     for banner in banners(app) {
         header = header.push(banner);
     }
@@ -64,9 +67,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn title_row(app: &App) -> Element<'_, Message> {
-    let title = match &app.search_query {
-        Some(_) => "Recherche".to_string(),
-        None => folder_name(app.folder).to_string(),
+    let title = match (&app.search_query, &app.sender) {
+        (Some(_), _) => "Recherche".to_string(),
+        (None, Some(sender)) => format!("Mails de {}", ellipsize(&sender.name, 24)),
+        (None, None) if app.starred => "Favoris".to_string(),
+        (None, None) => folder_name(app.folder).to_string(),
     };
     let scope = match app.filter {
         AccountFilter::All => "Tous les comptes".to_string(),
@@ -93,16 +98,33 @@ fn title_row(app: &App) -> Element<'_, Message> {
         refresh_label,
         tooltip::Position::Bottom,
     );
-    row![
+    let mut line = Row::new().spacing(4).align_y(Alignment::Center);
+    // "Mails de X" goes back to what was shown before.
+    if app.sender.is_some() && app.search_query.is_none() {
+        line = line.push(tip(
+            button(icons::icon(Icon::ChevronLeft, 20.0, Tone::Text))
+                .padding(6)
+                .on_press(Message::SenderBack)
+                .style(theme::ghost),
+            "Retour (Échap)",
+            tooltip::Position::Bottom,
+        ));
+    }
+    let scope = match &app.sender {
+        Some(sender) if app.search_query.is_none() && sender.addr != sender.name => {
+            format!("{} · {scope}", sender.addr)
+        }
+        _ => scope,
+    };
+    line.push(
         column![
-            text(title).size(22).font(SEMIBOLD),
+            text(title).size(22).font(SEMIBOLD).wrapping(Wrapping::None),
             text(scope).size(12).style(theme::muted),
         ]
         .spacing(2)
         .width(Fill),
-        refresh,
-    ]
-    .align_y(Alignment::Center)
+    )
+    .push(refresh)
     .into()
 }
 
@@ -199,7 +221,7 @@ fn folders(app: &App) -> Element<'_, Message> {
         if role == FolderRole::Archive && !app.archive_view && app.folder != role {
             continue;
         }
-        let selected = app.search_query.is_none() && app.folder == role;
+        let selected = app.in_folder() && app.folder == role;
         let tone = if selected { Tone::Accent } else { Tone::Muted };
         let mut content = Row::new()
             .spacing(6)
@@ -217,7 +239,7 @@ fn folders(app: &App) -> Element<'_, Message> {
             }
         }
         let tab = button(content)
-            .padding([6, 9])
+            .padding(if selected { [6, 9] } else { [6, 7] })
             .on_press(Message::FolderSelected(role))
             .style(theme::chip(selected));
         if selected {
@@ -225,8 +247,68 @@ fn folders(app: &App) -> Element<'_, Message> {
         } else {
             tabs = tabs.push(tip(tab, name, tooltip::Position::Bottom));
         }
+        // "Favoris" right after the inbox.
+        if role == FolderRole::Inbox {
+            tabs = tabs.push(starred_button(app));
+        }
     }
     tabs.into()
+}
+
+/// "Favoris": the starred mail of every folder.
+fn starred_button(app: &App) -> Element<'_, Message> {
+    let selected = app.starred && app.sender.is_none() && app.search_query.is_none();
+    let mut content = Row::new()
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .push(icons::icon(
+            if selected {
+                Icon::StarFilled
+            } else {
+                Icon::Star
+            },
+            16.0,
+            if selected {
+                Tone::Fixed(theme::STAR)
+            } else {
+                Tone::Muted
+            },
+        ));
+    if selected {
+        content = content.push(text("Favoris").size(13).font(MEDIUM));
+    }
+    let tab = button(content)
+        .padding(if selected { [6, 9] } else { [6, 7] })
+        .on_press(Message::StarredSelected)
+        .style(theme::chip(selected));
+    if selected {
+        tab.into()
+    } else {
+        tip(tab, "Favoris", tooltip::Position::Bottom)
+    }
+}
+
+/// The tabs of the inbox, each with its unread lines.
+fn tabs(app: &App) -> Element<'_, Message> {
+    let mut row = Row::new().spacing(5).align_y(Alignment::Center);
+    for category in Category::ALL {
+        let selected = app.tab == category;
+        let mut content = Row::new()
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .push(text(tab_name(category)).size(13).font(MEDIUM));
+        let unread = app.tab_unread.get(&category).copied().unwrap_or(0);
+        if unread > 0 {
+            content = content.push(text(unread.to_string()).size(12).style(theme::muted));
+        }
+        row = row.push(
+            button(content)
+                .padding([5, 10])
+                .on_press(Message::TabSelected(category))
+                .style(theme::chip(selected)),
+        );
+    }
+    row.into()
 }
 
 /// One banner per account in trouble, with the action that fixes it.
@@ -355,10 +437,19 @@ fn empty(app: &App) -> Element<'_, Message> {
             format!("Aucun résultat pour « {query} »"),
             "La recherche porte sur l'objet, l'expéditeur et le texte des messages déjà téléchargés.",
         ),
+        None if app.sender.is_some() => (
+            "Aucun message".to_string(),
+            "Aucun message de cet expéditeur n'est enregistré sur cet ordinateur.",
+        ),
+        None if app.starred => (
+            "Aucun favori".to_string(),
+            "Ajoutez une étoile à un message (S) pour le retrouver ici.",
+        ),
         None if app.is_syncing() => (
             "Synchronisation…".to_string(),
             "Les messages apparaissent dès qu'ils arrivent.",
         ),
+        None if app.tabs_shown() => ("Aucun message".to_string(), "Cet onglet est vide."),
         None => ("Aucun message".to_string(), "Ce dossier est vide."),
     };
     container(
@@ -436,9 +527,25 @@ fn message_row<'a>(
         who = who.push(text(item.count.to_string()).size(12).style(theme::muted));
     }
     let mut meta = Row::new().spacing(6).align_y(Alignment::Center);
+    if item.flagged {
+        // A click on the star takes it off.
+        meta = meta.push(tip(
+            button(icons::icon(
+                Icon::StarFilled,
+                13.0,
+                Tone::Fixed(theme::STAR),
+            ))
+            .padding(0)
+            .on_press(Message::StarLine(index))
+            .style(theme::ghost),
+            "Retirer des favoris",
+            tooltip::Position::Bottom,
+        ));
+    }
     if item.has_attachments {
         meta = meta.push(icons::icon(Icon::Paperclip, 13.0, Tone::Muted));
     }
+
     let date_style = if unread { theme::accent } else { theme::muted };
     meta = meta.push(
         text(format_date(item.date, now))

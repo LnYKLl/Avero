@@ -2,18 +2,24 @@
 //!
 //! `mod.rs` holds the state, the message list and the dispatch; the
 //! details live in `mail` (list, reader, actions), `selection` (lines
-//! picked with Ctrl, Maj or `x`), `keys` (keyboard shortcuts), `accounts`
-//! (adding, fixing and removing accounts, worker events) and `composer`.
+//! picked with Ctrl, Maj or `x`), `places` (tabs, favourites, one
+//! sender's mail, the star), `unsubscribe` ("Se désinscrire"), `keys`
+//! (keyboard shortcuts), `accounts` (adding, fixing and removing
+//! accounts, worker events) and `composer`.
 
 mod accounts;
 mod composer;
 mod keys;
 mod mail;
+mod places;
 mod selection;
+mod unsubscribe;
 
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
 pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
 pub use keys::SHORTCUTS;
+pub use places::{SenderView, tab_name};
+pub use unsubscribe::UnsubscribeOffer;
 
 use crate::account_form::{AccountForm, Field};
 use crate::auth::OAuthGrant;
@@ -27,7 +33,7 @@ use avero_autoconfig::ProviderConfig;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
-    Account, AccountFilter, AccountId, FolderRole, Security, ServerConfig, UnifiedItem,
+    Account, AccountFilter, AccountId, Category, FolderRole, Security, ServerConfig, UnifiedItem,
 };
 use avero_oauth::Provider;
 use iced::widget::text_editor;
@@ -92,6 +98,8 @@ pub enum Overlay {
     },
     /// The list of keyboard shortcuts (`?`).
     Shortcuts,
+    /// "Se désinscrire", waiting for a confirmation.
+    ConfirmUnsubscribe(UnsubscribeOffer),
 }
 
 /// "Changer le mot de passe".
@@ -216,6 +224,13 @@ pub struct Reading {
     /// The entry Reply and Forward answer: the last one unfolded (the
     /// newest at first).
     pub focus: usize,
+    /// Who the conversation is from: the address of its newest message
+    /// written by someone else than the user (for "Classer dans").
+    pub sender: String,
+    /// The tab of that message.
+    pub category: Option<Category>,
+    /// How to unsubscribe from that message's list, if it offers it.
+    pub unsubscribe: Option<UnsubscribeOffer>,
 }
 
 impl Reading {
@@ -287,10 +302,20 @@ pub enum Message {
     NotificationsToggled(bool),
     /// "Regrouper les conversations" in the settings.
     ThreadsToggled(bool),
+    /// "Trier la réception en onglets" in the settings.
+    TabsToggled(bool),
 
     ShowMail,
     ShowSettings,
     FolderSelected(FolderRole),
+    /// "Favoris": the starred mail of every folder.
+    StarredSelected,
+    /// A tab above the inbox.
+    TabSelected(Category),
+    /// "Mails de X" (address, name).
+    ShowSender(String, String),
+    /// Leaves "Mails de X".
+    SenderBack,
     FilterSelected(AccountFilter),
     SearchChanged(String),
     SearchDebounced(u64),
@@ -323,6 +348,17 @@ pub enum Message {
     Delete,
     MarkRead,
     MarkUnread,
+    /// Stars the lines acted on (or unstars them, all starred).
+    ToggleStar,
+    /// The star of line `.0` of the list.
+    StarLine(usize),
+    /// "Classer dans" for the conversation being read.
+    Reclassify(Category),
+    /// "Se désinscrire" (asks for a confirmation).
+    Unsubscribe,
+    ConfirmUnsubscribe,
+    /// Unsubscribing from a sender was done (or failed).
+    Unsubscribed(String, Result<(), String>),
     /// Attachment `.1` of reader entry `.0`.
     SaveAttachment(usize, usize),
     AttachmentSaved(Result<Option<String>, String>),
@@ -472,6 +508,14 @@ pub struct App {
 
     pub(crate) screen: Screen,
     pub(crate) folder: FolderRole,
+    /// "Favoris" is shown instead of `folder`.
+    pub(crate) starred: bool,
+    /// The tab of the inbox shown (see `App::tabs_shown`).
+    pub(crate) tab: Category,
+    /// "Mails de X", shown over the rest.
+    pub(crate) sender: Option<SenderView>,
+    /// Unread lines of each tab of the inbox.
+    pub(crate) tab_unread: HashMap<Category, usize>,
     pub(crate) filter: AccountFilter,
     pub(crate) search_text: String,
     pub(crate) search_query: Option<String>,
@@ -557,6 +601,10 @@ impl App {
             unread: HashMap::new(),
             screen: Screen::Mail,
             folder: FolderRole::Inbox,
+            starred: false,
+            tab: Category::Important,
+            sender: None,
+            tab_unread: HashMap::new(),
             filter: AccountFilter::All,
             search_text: String::new(),
             search_query: None,
@@ -715,6 +763,18 @@ impl App {
             | Message::MarkUnread
             | Message::SaveAttachment(..)
             | Message::AttachmentSaved(_) => self.update_mail(message),
+            Message::StarredSelected
+            | Message::TabSelected(_)
+            | Message::TabsToggled(_)
+            | Message::ShowSender(..)
+            | Message::SenderBack
+            | Message::ToggleStar
+            | Message::StarLine(_)
+            | Message::Reclassify(_) => self.update_places(message),
+            Message::Unsubscribe | Message::ConfirmUnsubscribe | Message::Unsubscribed(..) => {
+                self.update_unsubscribe(message)
+            }
+
             Message::Worker(account, event) => self.on_worker_event(account, event),
             Message::Background(account, event) => self.on_background_event(account, event),
             Message::ReloadDue => {
@@ -897,6 +957,7 @@ fn demo_answer(job: Job) {
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
+        | Job::SetFlagged { reply, .. }
         | Job::Move { reply, .. }
         | Job::DeleteForever { reply, .. } => {
             let _ = reply.send(Event::Done(Ok(())));

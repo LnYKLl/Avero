@@ -161,6 +161,12 @@ pub enum Job {
         seen: bool,
         reply: Reply,
     },
+    /// Stars or unstars messages (`\Flagged`), already changed locally.
+    SetFlagged {
+        targets: Vec<MessageRef>,
+        flagged: bool,
+        reply: Reply,
+    },
     /// Moves messages (already hidden in the list) to the archive or the
     /// trash; their rows are deleted once the server confirms, shown
     /// again otherwise.
@@ -344,6 +350,7 @@ fn refuse(job: Job, message: &str) {
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
+        | Job::SetFlagged { reply, .. }
         | Job::Move { reply, .. }
         | Job::DeleteForever { reply, .. } => {
             let _ = reply.send(Event::Done(Err(error())));
@@ -961,6 +968,14 @@ impl<C: Connector> Worker<C> {
                 let result = self.set_seen(&targets, seen).await;
                 let _ = reply.send(Event::Done(result));
             }
+            Job::SetFlagged {
+                targets,
+                flagged,
+                reply,
+            } => {
+                let result = self.set_flagged(&targets, flagged).await;
+                let _ = reply.send(Event::Done(result));
+            }
             Job::Move { targets, to, reply } => {
                 let result = self.move_to(&targets, to).await;
                 let _ = reply.send(Event::Done(result));
@@ -1260,6 +1275,30 @@ impl<C: Connector> Worker<C> {
         result
     }
 
+    /// Sends the star, then lets the server's flags apply to these rows
+    /// again (like `set_seen`).
+    async fn set_flagged(
+        &mut self,
+        targets: &[MessageRef],
+        flagged: bool,
+    ) -> Result<(), AccountError> {
+        let mut result = Ok(());
+        for (folder, (uids, _rows)) in by_folder(targets) {
+            result = self
+                .with_session(async |session, _store| {
+                    session.select(&folder).await?;
+                    session.set_flagged(&uids, flagged).await
+                })
+                .await;
+            if result.is_err() {
+                break;
+            }
+        }
+        let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
+        let _ = self.store.confirm_flagged(&rows);
+        result
+    }
+
     /// Shows rows hidden for a move that did not happen.
     fn show(&self, rows: &[i64]) {
         let _ = self.store.set_hidden(rows, false);
@@ -1469,7 +1508,9 @@ fn send_message(error: &SendError, account: &Account) -> String {
 mod tests {
     use super::*;
     use avero_core::secrets::MemorySecrets;
-    use avero_core::{AccountColor, AccountId, AuthKind, FolderId, NewAccount, ServerConfig};
+    use avero_core::{
+        AccountColor, AccountId, AuthKind, FolderId, Listing, NewAccount, ServerConfig, ServerFlags,
+    };
     use avero_sync::source::{FetchedHeader, FolderStatus, RemoteFolder};
     use iced::futures::StreamExt;
     use std::path::Path;
@@ -1821,8 +1862,53 @@ mod tests {
             })
             .collect()
             .await;
-        store.apply_flags(inbox.id, 1, 1, &[(1, false)]).unwrap();
+        let unread = ServerFlags {
+            uid: 1,
+            seen: false,
+            flagged: false,
+        };
+        store.apply_flags(inbox.id, 1, 1, &[unread]).unwrap();
         assert_eq!(store.inbox_uids(inbox.id).unwrap(), vec![(1, false)]);
+    }
+
+    #[tokio::test]
+    async fn star_goes_to_the_server_then_its_flag_applies_again() {
+        let fake = fake_worker("star");
+        let row = fake.target.row_id;
+        fake.store.set_flagged(&[row], true).unwrap();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetFlagged {
+                targets: vec![fake.target.clone()],
+                flagged: true,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Done(Ok(())))),
+            "{events:?}"
+        );
+        assert_eq!(*fake.server.stars.lock().unwrap(), vec![(1, true)]);
+        // Confirmed: what the server says counts again.
+        let starred = |store: &Store| {
+            store
+                .list(&Listing::Starred, AccountFilter::All, false, 10, 0)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(starred(&fake.store), 1);
+        let inbox = fake.target.folder_id;
+        let plain = ServerFlags {
+            uid: 1,
+            seen: false,
+            flagged: false,
+        };
+        fake.store.apply_flags(inbox, 1, 1, &[plain]).unwrap();
+        assert_eq!(starred(&fake.store), 0);
+        fake.worker.send(Job::Shutdown {
+            delete_secret: false,
+        });
     }
 
     /// A fake IMAP server whose folder list waits until `open` turns
@@ -1847,6 +1933,8 @@ mod tests {
         watch_failures: AtomicUsize,
         /// The watcher's login is refused.
         watch_refused: std::sync::atomic::AtomicBool,
+        /// Every `(uid, starred)` sent by `set_flagged`.
+        stars: std::sync::Mutex<Vec<(u32, bool)>>,
     }
 
     struct FakeConnector(Arc<FakeServer>);
@@ -1946,13 +2034,18 @@ mod tests {
             &mut self,
             _from_uid: u32,
             _to_uid: u32,
-        ) -> Result<Vec<(u32, bool)>, SyncError> {
+        ) -> Result<Vec<ServerFlags>, SyncError> {
             Ok(Vec::new())
         }
         async fn fetch_body(&mut self, _uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
             Ok(Some(b"Subject: s\r\n\r\nBonjour".to_vec()))
         }
         async fn set_seen(&mut self, _uids: &[u32], _seen: bool) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<(), SyncError> {
+            let mut stars = self.0.stars.lock().unwrap();
+            stars.extend(uids.iter().map(|&uid| (uid, flagged)));
             Ok(())
         }
         async fn move_to(&mut self, _uids: &[u32], _dest: &str) -> Result<(), SyncError> {
@@ -2030,7 +2123,9 @@ mod tests {
             watch_dropped: AtomicUsize::new(0),
             watch_failures: AtomicUsize::new(0),
             watch_refused: std::sync::atomic::AtomicBool::new(false),
+            stars: std::sync::Mutex::new(Vec::new()),
         });
+
         let worker = WorkerHandle::spawn_with(
             WorkerSetup {
                 account: account.clone(),

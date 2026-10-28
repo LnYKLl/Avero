@@ -28,6 +28,7 @@ pub enum Icon {
     LogOut,
     MailOpen,
     Mail,
+    MailX,
     Moon,
     Paperclip,
     Pencil,
@@ -40,6 +41,9 @@ pub enum Icon {
     Settings,
     Shield,
     Compose,
+    Star,
+    /// The star, filled: a starred message.
+    StarFilled,
     Sun,
     Trash,
     User,
@@ -56,7 +60,7 @@ pub enum Icon {
 }
 
 /// All icons, in the order of `bytes`; used to build the handle cache.
-const ALL: [Icon; 39] = [
+const ALL: [Icon; 42] = [
     Icon::Archive,
     Icon::Check,
     Icon::ChevronDown,
@@ -73,6 +77,7 @@ const ALL: [Icon; 39] = [
     Icon::LogOut,
     Icon::MailOpen,
     Icon::Mail,
+    Icon::MailX,
     Icon::Moon,
     Icon::Paperclip,
     Icon::Pencil,
@@ -85,6 +90,8 @@ const ALL: [Icon; 39] = [
     Icon::Settings,
     Icon::Shield,
     Icon::Compose,
+    Icon::Star,
+    Icon::StarFilled,
     Icon::Sun,
     Icon::Trash,
     Icon::User,
@@ -117,6 +124,7 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::LogOut => include_bytes!("../assets/icons/log-out.svg"),
         Icon::MailOpen => include_bytes!("../assets/icons/mail-open.svg"),
         Icon::Mail => include_bytes!("../assets/icons/mail.svg"),
+        Icon::MailX => include_bytes!("../assets/icons/mail-x.svg"),
         Icon::Moon => include_bytes!("../assets/icons/moon.svg"),
         Icon::Paperclip => include_bytes!("../assets/icons/paperclip.svg"),
         Icon::Pencil => include_bytes!("../assets/icons/pencil.svg"),
@@ -129,6 +137,8 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Settings => include_bytes!("../assets/icons/settings.svg"),
         Icon::Shield => include_bytes!("../assets/icons/shield-alert.svg"),
         Icon::Compose => include_bytes!("../assets/icons/square-pen.svg"),
+        Icon::Star => include_bytes!("../assets/icons/star.svg"),
+        Icon::StarFilled => include_bytes!("../assets/icons/star-filled.svg"),
         Icon::Sun => include_bytes!("../assets/icons/sun.svg"),
         Icon::Trash => include_bytes!("../assets/icons/trash-2.svg"),
         Icon::User => include_bytes!("../assets/icons/user.svg"),

@@ -1,15 +1,15 @@
-//! The reading pane: actions, headers, attachments and the text. A
-//! conversation shows its messages one under the other, oldest first; the
-//! folded ones take one line each.
+//! The reading pane: actions, the sorting bar (tab, unsubscribe),
+//! headers, attachments and the text. A conversation shows its messages
+//! one under the other, oldest first; the folded ones take one line each.
 
 use super::{
     avatar, find_account, format_full_date, hr, icon_button, icon_label_button, tip, to_color,
 };
-use crate::app::{App, Body, Entry, Message, Reading};
+use crate::app::{App, Body, Entry, Message, Reading, tab_name};
 use crate::compose::{Mode, human_size};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
-use avero_core::UnifiedItem;
+use avero_core::{Category, UnifiedItem};
 use avero_sync::parse::{Address, ParsedBody};
 use chrono::Local;
 use iced::widget::text::Wrapping;
@@ -100,8 +100,22 @@ fn checked(app: &App) -> Element<'_, Message> {
         ),
         action(Icon::MailOpen, "Marquer lu", Some(Message::MarkRead)),
         action(Icon::Mail, "Marquer non lu", Some(Message::MarkUnread)),
+        action(
+            if all_starred(app) {
+                Icon::StarFilled
+            } else {
+                Icon::Star
+            },
+            if all_starred(app) {
+                "Retirer des favoris"
+            } else {
+                "Favoris"
+            },
+            Some(Message::ToggleStar)
+        ),
     ]
-    .spacing(8);
+    .spacing(8)
+    .wrap();
     let mut page = column![
         icons::icon(Icon::Check, 40.0, Tone::Accent),
         text(super::list::selection_label(count, app.lines_are_threads()))
@@ -186,9 +200,11 @@ fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Ele
     }
     page = page.push(hr()).push(body_text(entry, index, true));
 
-    column![
-        action_bar(app, item, reading),
-        hr(),
+    let mut pane = column![action_bar(app, item, reading), hr()];
+    if let Some(bar) = sorting_bar(app, reading) {
+        pane = pane.push(bar).push(hr());
+    }
+    pane.push(
         container(page)
             .padding(Padding {
                 top: 24.0,
@@ -198,7 +214,7 @@ fn message<'a>(app: &'a App, item: &'a UnifiedItem, reading: &'a Reading) -> Ele
             })
             .height(Fill)
             .center_x(Fill),
-    ]
+    )
     .into()
 }
 
@@ -231,9 +247,11 @@ fn conversation<'a>(
         });
     }
 
-    column![
-        action_bar(app, item, reading),
-        hr(),
+    let mut pane = column![action_bar(app, item, reading), hr()];
+    if let Some(bar) = sorting_bar(app, reading) {
+        pane = pane.push(bar).push(hr());
+    }
+    pane.push(
         scrollable(
             container(page)
                 .padding(Padding {
@@ -246,8 +264,66 @@ fn conversation<'a>(
         )
         .height(Fill)
         .style(theme::scrollbar),
-    ]
+    )
     .into()
+}
+
+/// Whether every line acted on is starred.
+fn all_starred(app: &App) -> bool {
+    let items = app.action_items();
+    !items.is_empty() && items.iter().all(|item| item.flagged)
+}
+
+/// Under the actions: the tab of the conversation ("Classer dans", when
+/// the inbox is sorted in tabs) and "Se désinscrire" when the mail offers
+/// it. `None` when there is nothing to show.
+fn sorting_bar<'a>(app: &'a App, reading: &'a Reading) -> Option<Element<'a, Message>> {
+    let tabs = app.settings.inbox_tabs && !reading.sender.is_empty();
+    if !tabs && reading.unsubscribe.is_none() {
+        return None;
+    }
+    let mut bar = Row::new().spacing(6).align_y(Alignment::Center);
+    if tabs {
+        bar = bar.push(text("Classer dans").size(12).style(theme::muted));
+        for category in Category::ALL {
+            let selected = reading.category == Some(category);
+            bar = bar.push(
+                button(text(tab_name(category)).size(12).font(MEDIUM))
+                    .padding([3, 9])
+                    .on_press_maybe((!selected).then_some(Message::Reclassify(category)))
+                    .style(theme::chip(selected)),
+            );
+        }
+    }
+    bar = bar.push(space().width(Fill));
+    if let Some(offer) = &reading.unsubscribe {
+        bar = bar.push(if offer.requested {
+            container(
+                row![
+                    icons::icon(Icon::Check, 14.0, Tone::Muted),
+                    text("Désinscription demandée").size(12).style(theme::muted),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([4, 6])
+            .into()
+        } else {
+            tip(
+                icon_label_button(
+                    Icon::MailX,
+                    "Se désinscrire",
+                    Tone::Text,
+                    Some(Message::Unsubscribe),
+                    theme::secondary,
+                )
+                .padding([4, 10]),
+                format!("Ne plus recevoir les messages de {}", offer.sender_name),
+                tooltip::Position::Bottom,
+            )
+        });
+    }
+    Some(container(bar).padding([6, 20]).into())
 }
 
 /// Colour of the first account that holds the message.
@@ -408,6 +484,7 @@ fn action_bar<'a>(
             "Marquer comme non lu (U)",
             Some(Message::MarkUnread)
         ),
+        star_button(app),
         space().width(Fill),
         accounts,
     ]
@@ -415,6 +492,28 @@ fn action_bar<'a>(
     .padding([10, 20])
     .align_y(Alignment::Center)
     .into()
+}
+
+/// The star of the action bar: filled (and coloured) when starred.
+fn star_button(app: &App) -> Element<'_, Message> {
+    let starred = all_starred(app);
+    let (icon, tone, label) = if starred {
+        (
+            Icon::StarFilled,
+            Tone::Fixed(theme::STAR),
+            "Retirer des favoris (S)",
+        )
+    } else {
+        (Icon::Star, Tone::Text, "Ajouter aux favoris (S)")
+    };
+    tip(
+        button(icons::icon(icon, 18.0, tone))
+            .padding(8)
+            .on_press(Message::ToggleStar)
+            .style(theme::ghost),
+        label,
+        tooltip::Position::Bottom,
+    )
 }
 
 fn separator<'a>() -> Element<'a, Message> {
@@ -450,14 +549,29 @@ fn headers<'a>(
             recipients.push(format!("cc {}", names(&parsed.cc)));
         }
     }
-    let mut who = Column::new().spacing(3).width(Fill).push(
-        row![
-            text(name.clone()).size(14).font(SEMIBOLD),
-            text(address).size(12).style(theme::muted),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
+    // A click on the sender shows all their mail.
+    let sender_addr = if address.is_empty() {
+        item.from_addr.clone()
+    } else {
+        address.clone()
+    };
+    let sender = tip(
+        button(
+            row![
+                text(name.clone()).size(14).font(SEMIBOLD),
+                text(address).size(12).style(theme::muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding(0)
+        .on_press(Message::ShowSender(sender_addr, name.clone()))
+        .style(theme::link_plain),
+        format!("Tous les mails de {name}"),
+        tooltip::Position::Bottom,
     );
+    let mut who = Column::new().spacing(3).width(Fill).push(sender);
+
     if !recipients.is_empty() {
         who = who.push(text(recipients.join(" · ")).size(12).style(theme::muted));
     }

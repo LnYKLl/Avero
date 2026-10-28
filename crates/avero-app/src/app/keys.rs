@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 pub const G_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Every shortcut, as the help (`?`) lists them: keys, then what they do.
-pub const SHORTCUTS: [(&str, &str); 16] = [
+pub const SHORTCUTS: [(&str, &str); 17] = [
     ("J  ou  ↓", "Ligne suivante"),
     ("K  ou  ↑", "Ligne précédente"),
     ("Entrée", "Ouvrir"),
@@ -27,6 +27,7 @@ pub const SHORTCUTS: [(&str, &str); 16] = [
     ("E", "Archiver"),
     ("#  ou  Suppr", "Supprimer"),
     ("U", "Marquer comme non lu"),
+    ("S", "Ajouter aux favoris ou les retirer"),
     ("X", "Sélectionner la ligne"),
     ("Ctrl+clic, Maj+clic", "Sélectionner plusieurs lignes"),
     ("/  ou  Ctrl+F", "Rechercher"),
@@ -35,7 +36,7 @@ pub const SHORTCUTS: [(&str, &str); 16] = [
         "Réception, Envoyés, Brouillons, Archives, Corbeille",
     ),
     ("?", "Cette aide"),
-    ("Échap", "Fermer, vider la sélection"),
+    ("Échap", "Fermer, vider la sélection, revenir"),
 ];
 
 impl App {
@@ -106,6 +107,7 @@ impl App {
             Character("e") => self.update_mail(Message::Archive),
             Character("#") | Named(N::Delete) => self.update_mail(Message::Delete),
             Character("u") => self.update_mail(Message::MarkUnread),
+            Character("s") => self.update_places(Message::ToggleStar),
             Character("x") => {
                 self.toggle_current();
                 Task::none()
@@ -120,7 +122,7 @@ impl App {
     }
 
     /// Échap closes the top-most thing: dialog, composer, selection,
-    /// search.
+    /// search, "Mails de X".
     pub(super) fn escape(&mut self) -> Task<Message> {
         if self.overlay.is_some() {
             return match self.overlay {
@@ -137,6 +139,9 @@ impl App {
         }
         if self.search_query.is_some() || !self.search_text.is_empty() {
             return self.update_mail(Message::SearchCleared);
+        }
+        if self.sender.is_some() {
+            return self.update_places(Message::SenderBack);
         }
         Task::none()
     }

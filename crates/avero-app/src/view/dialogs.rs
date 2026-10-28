@@ -1,9 +1,11 @@
 //! Small dialogs: password, rename, signature, delete confirmation,
-//! reconnection, keyboard shortcuts.
+//! reconnection, unsubscribe confirmation, keyboard shortcuts.
 
 use super::add_account::{error_line, spinner_line};
 use super::{field_label, icon_button};
-use crate::app::{AccountMsg, App, Message, Overlay, PasswordDialog, ServerField, ServersForm};
+use crate::app::{
+    AccountMsg, App, Message, Overlay, PasswordDialog, ServerField, ServersForm, UnsubscribeOffer,
+};
 use crate::icons::Icon;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::Security;
@@ -24,6 +26,7 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::ConfirmDeleteForever(rows) => confirm_delete_forever(rows.len()),
         Overlay::Signature { account, content } => signature(app, *account, content),
         Overlay::Shortcuts => shortcuts(),
+        Overlay::ConfirmUnsubscribe(offer) => confirm_unsubscribe(app, offer),
     }
 }
 
@@ -247,6 +250,57 @@ fn confirm_delete_forever<'a>(count: usize) -> Element<'a, Message> {
     .spacing(14);
     card("Supprimer définitivement", body.into())
 }
+
+/// "Se désinscrire": says what will happen (and to whom) before it does.
+fn confirm_unsubscribe<'a>(app: &'a App, offer: &'a UnsubscribeOffer) -> Element<'a, Message> {
+    use crate::unsubscribe::Method;
+    let host = |url: &reqwest::Url| url.host_str().unwrap_or_default().to_string();
+    let from = app
+        .account(offer.account)
+        .map(|a| a.email.clone())
+        .unwrap_or_default();
+    let (what, detail, confirm, style): (String, String, &str, ButtonStyle) = match &offer.method {
+        Method::OneClick(url) => (
+            format!("Avero va demander à {} de ne plus vous écrire.", host(url)),
+            "Une seule requête chiffrée (HTTPS) est envoyée à l'adresse de désinscription,              sans rien d'autre de ce message."
+                .to_string(),
+            "Se désinscrire",
+            theme::primary,
+        ),
+        Method::Mail { to, subject, .. } => (
+            format!("Avero va envoyer un mail de désinscription à {to}."),
+            format!("Envoyé depuis {from}, avec l'objet « {subject} » ; rien d'autre de ce message."),
+            "Envoyer",
+            theme::primary,
+        ),
+        Method::Web(url) => (
+            format!("La désinscription se fait sur le site {}.", host(url)),
+            "La page s'ouvrira dans votre navigateur ; suivez ses instructions.".to_string(),
+            "Ouvrir la page",
+            theme::primary,
+        ),
+        Method::InsecureWeb(url) => (
+            format!("La désinscription se fait sur le site {}.", host(url)),
+            "Attention : ce lien n'est pas chiffré (http). Ce que vous enverrez sur cette page              pourra être lu en chemin."
+                .to_string(),
+            "Ouvrir quand même",
+            theme::danger,
+        ),
+    };
+    let body = column![
+        text(format!("Expéditeur : {}", offer.sender_name))
+            .size(13)
+            .style(theme::muted),
+        text(what).size(14).font(MEDIUM),
+        text(detail).size(13).style(theme::muted),
+        buttons(confirm, Some(Message::ConfirmUnsubscribe), style),
+    ]
+    .spacing(14);
+    card("Se désinscrire", body.into())
+}
+
+/// The style of a dialog's confirm button.
+type ButtonStyle = fn(&iced::Theme, button::Status) -> button::Style;
 
 fn reconnect(app: &App, account: avero_core::AccountId) -> Element<'_, Message> {
     let email = app

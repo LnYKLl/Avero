@@ -44,6 +44,9 @@ pub struct Settings {
     pub notifications: bool,
     /// One line per conversation in the list (off: one per message).
     pub group_threads: bool,
+    /// The inbox is sorted in tabs: Important, Newsletters,
+    /// Notifications (off: one list).
+    pub inbox_tabs: bool,
 }
 
 impl Default for Settings {
@@ -52,6 +55,7 @@ impl Default for Settings {
             theme: ThemeChoice::default(),
             notifications: true,
             group_threads: true,
+            inbox_tabs: true,
         }
     }
 }
@@ -107,6 +111,7 @@ mod tests {
             theme: ThemeChoice::Dark,
             notifications: false,
             group_threads: false,
+            inbox_tabs: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
@@ -114,6 +119,7 @@ mod tests {
         assert!(text.contains("\"dark\""), "{text}");
         assert!(text.contains("\"notifications\": false"), "{text}");
         assert!(text.contains("\"group_threads\": false"), "{text}");
+        assert!(text.contains("\"inbox_tabs\": false"), "{text}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -127,6 +133,7 @@ mod tests {
         assert_eq!(settings.theme, ThemeChoice::Light);
         assert!(settings.notifications);
         assert!(settings.group_threads);
+        assert!(settings.inbox_tabs);
         let _ = std::fs::remove_dir_all(dir);
     }
 

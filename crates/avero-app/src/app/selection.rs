@@ -124,7 +124,7 @@ impl App {
 
     /// Whether a line of the list is a conversation (else a message).
     pub fn lines_are_threads(&self) -> bool {
-        self.settings.group_threads && self.search_query.is_none()
+        self.settings.group_threads && self.search_query.is_none() && self.sender.is_none()
     }
 
     /// Whether every loaded line is checked.

@@ -283,7 +283,7 @@ fn notifications(app: &App) -> Element<'_, Message> {
 }
 
 fn reading(app: &App) -> Element<'_, Message> {
-    row![
+    let threads = row![
         column![
             text("Regrouper les conversations").size(14).font(MEDIUM),
             text("Une ligne par échange, avec les réponses ; désactivé, une ligne par message.")
@@ -296,8 +296,24 @@ fn reading(app: &App) -> Element<'_, Message> {
     ]
     .spacing(12)
     .padding(18)
-    .align_y(Alignment::Center)
-    .into()
+    .align_y(Alignment::Center);
+    let tabs = row![
+        column![
+            text("Trier la réception en onglets").size(14).font(MEDIUM),
+            text(
+                "Important, Newsletters et Notifications, d'après les en-têtes des messages                  (tri local, rien n'est envoyé)."
+            )
+            .size(12)
+            .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.inbox_tabs).on_toggle(Message::TabsToggled),
+    ]
+    .spacing(12)
+    .padding(18)
+    .align_y(Alignment::Center);
+    column![threads, hr(), tabs].into()
 }
 
 fn appearance(app: &App) -> Element<'_, Message> {

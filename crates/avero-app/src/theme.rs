@@ -37,6 +37,9 @@ pub const FONT_FILES: [&[u8]; 4] = [
 ];
 
 /// Corner radii: cards and controls.
+/// The star of a starred message (same in both modes).
+pub const STAR: Color = color!(0xE8A317);
+
 pub const CARD_RADIUS: f32 = 10.0;
 pub const CONTROL_RADIUS: f32 = 8.0;
 
@@ -208,6 +211,16 @@ pub fn link(theme: &Theme, status: button::Status) -> button::Style {
     let text_color = match status {
         button::Status::Hovered | button::Status::Pressed => mix(t.accent, t.text, 0.25),
         _ => t.accent,
+    };
+    plain_button(None, text_color, Border::default())
+}
+
+/// Text that is a link only when hovered (a sender's name).
+pub fn link_plain(theme: &Theme, status: button::Status) -> button::Style {
+    let t = tokens(theme);
+    let text_color = match status {
+        button::Status::Hovered | button::Status::Pressed => t.accent,
+        _ => t.text,
     };
     plain_button(None, text_color, Border::default())
 }
