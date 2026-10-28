@@ -15,7 +15,7 @@ directories = "6"
 # iced's default features minus `wgpu`: software rendering (tiny-skia) by
 # default, which uses far less memory. See docs/memory.md.
 # `svg` draws the Lucide icons, `tokio` gives `time::every` (auto sync).
-iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "web-colors", "linux-theme-detection", "x11", "wayland", "svg", "tokio"] }
+iced = { version = "0.14", default-features = false, features = ["advanced", "tiny-skia", "crisp", "web-colors", "linux-theme-detection", "x11", "wayland", "svg", "tokio"] }
 # Same version as the one iced uses for SVG: rasterises the window icon.
 resvg = "0.45"
 # System notifications for new mail: WinRT toasts on Windows, the

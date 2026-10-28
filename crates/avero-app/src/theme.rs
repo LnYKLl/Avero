@@ -255,11 +255,16 @@ pub fn build(color: ColorTheme, dark: bool) -> Theme {
 
 /// The window's gradient as an iced background.
 pub fn frame_background(t: &Tokens) -> Background {
-    let mut linear = gradient::Linear::new(Degrees(t.frame.angle));
-    for &(offset, color) in t.frame.stops {
+    Background::Gradient(frame_gradient(&t.frame).into())
+}
+
+/// The window's gradient.
+pub fn frame_gradient(frame: &Frame) -> gradient::Linear {
+    let mut linear = gradient::Linear::new(Degrees(frame.angle));
+    for &(offset, color) in frame.stops {
         linear = linear.add_stop(offset, color);
     }
-    Background::Gradient(linear.into())
+    linear
 }
 
 /// `color` with its alpha multiplied by `alpha`.
@@ -488,6 +493,15 @@ pub fn provider_button(theme: &Theme, status: button::Status) -> button::Style {
 
 // ------------------------------------------------------------- containers
 
+/// The window around the card: white text on the gradient, which
+/// `view::frame` paints.
+pub fn on_frame(_theme: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(Color::WHITE),
+        ..container::Style::default()
+    }
+}
+
 /// The window: the theme's gradient, white text on it.
 pub fn frame(theme: &Theme) -> container::Style {
     container::Style {
@@ -513,10 +527,15 @@ pub fn window_card(theme: &Theme) -> container::Style {
 /// renderer on every redraw; a few faint rings look the same for free.
 pub fn shadow_ring(depth: usize) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
-        background: Some(Color::from_rgba(0.08, 0.02, 0.0, 0.07 - 0.015 * depth as f32).into()),
+        background: Some(shadow_color(depth).into()),
         border: rounded(WINDOW_RADIUS + 1.0 + depth as f32),
         ..container::Style::default()
     }
+}
+
+/// The colour of one ring of the card's shadow.
+pub fn shadow_color(depth: usize) -> Color {
+    Color::from_rgba(0.08, 0.02, 0.0, 0.07 - 0.015 * depth as f32)
 }
 
 /// The message list column (on the card).
@@ -546,7 +565,17 @@ pub fn page(theme: &Theme) -> container::Style {
     }
 }
 
-/// A page that fills the card (settings, "Grand nettoyage").
+/// A page that fills the card (settings, "Grand nettoyage"): the card
+/// under it already has its colour, painting it twice would only slow
+/// down every redraw.
+pub fn page_on_card(theme: &Theme) -> container::Style {
+    container::Style {
+        background: None,
+        ..paper(theme)
+    }
+}
+
+/// The welcome screen's card.
 pub fn paper(theme: &Theme) -> container::Style {
     let t = tokens(theme);
     container::Style {

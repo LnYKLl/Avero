@@ -42,7 +42,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     )
     .width(Fill)
     .height(Fill)
-    .style(theme::paper)
+    .style(theme::page_on_card)
     .into()
 }
 

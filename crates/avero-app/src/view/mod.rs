@@ -6,6 +6,7 @@ pub mod add_account;
 pub mod cleanup;
 pub mod composer;
 pub mod dialogs;
+mod frame;
 pub mod list;
 pub mod oauth_setup;
 pub mod reader;
@@ -64,17 +65,10 @@ pub fn app(app: &App) -> Element<'_, Message> {
             .width(Fill)
             .height(Fill)
             .style(theme::window_card);
-        let rings = SHADOW_RINGS as f32;
-        container(row![sidebar::view(app), shadowed(card.into())].height(Fill))
-            .padding(Padding {
-                top: MARGIN,
-                right: MARGIN - rings,
-                bottom: MARGIN - 2.0 * rings,
-                left: 0.0,
-            })
+        container(frame::frame(sidebar::view(app), card.into()))
             .width(Fill)
             .height(Fill)
-            .style(theme::frame)
+            .style(theme::on_frame)
             .into()
     };
 
@@ -88,7 +82,8 @@ pub fn app(app: &App) -> Element<'_, Message> {
     stack(layers).width(Fill).height(Fill).into()
 }
 
-/// `card` with a soft shadow below it: faint rings, one pixel wider on the
+/// `card` with a soft shadow below it (the welcome screen; `frame` draws
+/// the main card's): faint rings, one pixel wider on the
 /// sides and two lower at each step.
 pub fn shadowed(card: Element<'_, Message>) -> Element<'_, Message> {
     let mut element = card;
