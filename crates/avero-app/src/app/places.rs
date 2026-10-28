@@ -32,6 +32,8 @@ impl App {
     pub fn listing(&self) -> Listing {
         if let Some(sender) = &self.sender {
             Listing::Sender(sender.addr.clone())
+        } else if self.snoozed {
+            Listing::Snoozed
         } else if self.starred {
             Listing::Starred
         } else if self.tabs_shown() {
@@ -42,9 +44,18 @@ impl App {
     }
 
     /// Whether the list shows a folder as it is (not a search, the
-    /// favourites or a sender's mail).
+    /// favourites, "Plus tard", "Programmés" or a sender's mail).
     pub fn in_folder(&self) -> bool {
-        self.search_query.is_none() && !self.starred && self.sender.is_none()
+        self.search_query.is_none()
+            && !self.starred
+            && !self.snoozed
+            && !self.scheduled
+            && self.sender.is_none()
+    }
+
+    /// Whether the list shows "Programmés" (the mail to send later).
+    pub fn scheduled_shown(&self) -> bool {
+        self.scheduled && self.search_query.is_none() && self.sender.is_none()
     }
 
     /// Whether the tabs are above the list: the inbox, with the setting
@@ -56,7 +67,7 @@ impl App {
     /// The folder role a conversation opened from the list is read in:
     /// outside a folder, every folder but the trash and spam ones.
     pub(super) fn reading_role(&self) -> FolderRole {
-        if self.starred || self.sender.is_some() {
+        if self.starred || self.snoozed || self.sender.is_some() {
             FolderRole::Inbox
         } else {
             self.folder
@@ -67,6 +78,8 @@ impl App {
         match message {
             Message::StarredSelected => {
                 self.starred = true;
+                self.snoozed = false;
+                self.scheduled = false;
                 self.sender = None;
                 self.search_text.clear();
                 self.search_query = None;

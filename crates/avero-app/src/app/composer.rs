@@ -1,9 +1,10 @@
-//! The composer: writing a new message, a reply or a forward.
+//! The composer: writing a new message, a reply or a forward. What it
+//! holds is saved as a draft as it goes (see `drafts`).
 
 use super::{App, Message};
 use crate::compose::{self, Attached, Draft, Fields, MAX_ATTACHMENTS};
 use crate::worker::Job;
-use avero_core::AccountId;
+use avero_core::{AccountId, DraftCopy, DraftFile, DraftRecord};
 use iced::Task;
 use iced::widget::text_editor;
 use std::sync::Arc;
@@ -28,7 +29,12 @@ pub enum ComposeMsg {
     Attached(Vec<(String, Arc<Vec<u8>>)>),
     RemoveAttachment(usize),
     Send,
+    /// Closes the composer: the message is kept as a draft.
     Cancel,
+    /// "Supprimer le brouillon": closes and throws the draft away.
+    Discard,
+    /// The few seconds after a change are over: save the draft here.
+    Autosave,
 }
 
 /// A draft being written.
@@ -51,6 +57,28 @@ pub struct Composer {
     signature: String,
     pub sending: bool,
     pub error: Option<String>,
+
+    /// The draft it is saved to on this computer (`None` until the first
+    /// save).
+    pub draft_id: Option<i64>,
+    /// The Message-ID of its copies in the drafts folder (set at the
+    /// first save, from the sender's domain).
+    pub message_id: String,
+    /// Its copy in a drafts folder, replaced at the next save.
+    pub server_copy: Option<DraftCopy>,
+    /// Changed since the last save on this computer.
+    pub dirty: bool,
+    /// The attachments changed since the last save on this computer.
+    pub files_dirty: bool,
+    /// Changed since it was opened (its server copy is out of date).
+    pub edited: bool,
+    /// A save is planned in a few seconds.
+    pub autosave_pending: bool,
+    /// Opened from "Programmés": its sending time, kept when it closes.
+    pub send_at: Option<i64>,
+    /// The body came from a saved draft: changing the sender leaves it
+    /// as it is (its signature is whatever the user wrote).
+    keep_body: bool,
 }
 
 impl Composer {
@@ -85,13 +113,57 @@ impl Composer {
             signature: signature.to_string(),
             sending: false,
             error: None,
+            draft_id: None,
+            message_id: String::new(),
+            server_copy: None,
+            dirty: false,
+            files_dirty: false,
+            edited: false,
+            autosave_pending: false,
+            send_at: None,
+            keep_body: false,
         }
+    }
+
+    /// A composer for a saved draft (or a scheduled mail), as it was left.
+    pub fn from_draft(record: &DraftRecord, files: Vec<DraftFile>) -> Composer {
+        let f = &record.fields;
+        let fields = Fields {
+            to: f.to.clone(),
+            cc: f.cc.clone(),
+            subject: f.subject.clone(),
+            body: f.body.clone(),
+            in_reply_to: f.in_reply_to.clone(),
+            references: f.references.clone(),
+        };
+        let attachments = files
+            .into_iter()
+            .map(|file| Attached {
+                name: file.name,
+                mime: file.mime,
+                data: Arc::new(file.data),
+            })
+            .collect();
+        let mut composer = Composer::from_fields(f.account, fields, attachments, "");
+        composer.bcc = f.bcc.clone();
+        composer.show_copies = !f.cc.is_empty() || !f.bcc.is_empty();
+        composer.draft_id = Some(record.id);
+        composer.message_id = f.message_id.clone();
+        composer.server_copy = record.server.clone();
+        composer.send_at = record.send_at;
+        composer.keep_body = true;
+        // Not on the server yet (Avero stopped before): saved at close.
+        composer.edited = record.server_dirty;
+        composer
     }
 
     /// Sends the draft from another account: its signature replaces the
     /// current one, unless the user edited the signature.
     pub fn change_sender(&mut self, from: AccountId, signature: &str) {
         self.from = from;
+        if self.keep_body {
+            return;
+        }
         if let Some(body) =
             compose::swap_signature(&self.body.text(), &self.base, &self.signature, signature)
         {
@@ -114,8 +186,23 @@ impl Composer {
                 name,
                 data,
             });
+            self.files_dirty = true;
         }
         refused
+    }
+
+    /// Whether nothing was written: no recipient, no subject, no file,
+    /// and the body as it started (empty, or just the signature and the
+    /// quote). Closing it keeps no draft.
+    pub fn is_blank(&self) -> bool {
+        let body = self.body.text();
+        self.to.trim().is_empty()
+            && self.cc.trim().is_empty()
+            && self.bcc.trim().is_empty()
+            && self.subject.trim().is_empty()
+            && self.attachments.is_empty()
+            && (body.trim().is_empty()
+                || body == compose::with_signature(&self.base, &self.signature))
     }
 }
 
@@ -139,10 +226,35 @@ impl App {
         let Some(composer) = &mut self.composer else {
             return Task::none();
         };
-        if composer.sending && !matches!(message, ComposeMsg::Edit(_)) {
+        if composer.sending && !matches!(message, ComposeMsg::Edit(_) | ComposeMsg::Autosave) {
             return Task::none();
         }
         composer.error = None;
+        let changes = match &message {
+            ComposeMsg::Edit(action) => action.is_edit() && !composer.sending,
+            ComposeMsg::From(_)
+            | ComposeMsg::To(_)
+            | ComposeMsg::Cc(_)
+            | ComposeMsg::Bcc(_)
+            | ComposeMsg::Subject(_)
+            | ComposeMsg::Attached(_)
+            | ComposeMsg::RemoveAttachment(_) => true,
+            _ => false,
+        };
+        let autosave = if changes {
+            composer.dirty = true;
+            composer.edited = true;
+            if composer.autosave_pending {
+                Task::none()
+            } else {
+                composer.autosave_pending = true;
+                Task::perform(super::sleep(super::drafts::AUTOSAVE), |()| {
+                    Message::Compose(ComposeMsg::Autosave)
+                })
+            }
+        } else {
+            Task::none()
+        };
         match message {
             ComposeMsg::New => {}
             ComposeMsg::From(id) => composer.change_sender(id, &new_signature),
@@ -171,12 +283,18 @@ impl App {
             ComposeMsg::RemoveAttachment(index) => {
                 if index < composer.attachments.len() {
                     composer.attachments.remove(index);
+                    composer.files_dirty = true;
                 }
             }
             ComposeMsg::Send => return self.send_draft(),
-            ComposeMsg::Cancel => self.composer = None,
+            ComposeMsg::Cancel => return self.close_composer(),
+            ComposeMsg::Discard => return self.discard_composer(),
+            ComposeMsg::Autosave => {
+                composer.autosave_pending = false;
+                return self.autosave();
+            }
         }
-        Task::none()
+        autosave
     }
 
     /// The signature of an account (empty when it has none).
@@ -236,9 +354,12 @@ impl App {
     pub(super) fn sent(&mut self, result: Result<Option<String>, String>) -> Task<Message> {
         match result {
             Ok(warning) => {
-                self.composer = None;
+                let cleanup = match self.composer.take() {
+                    Some(composer) => self.forget_draft(composer),
+                    None => Task::none(),
+                };
                 let text = warning.unwrap_or_else(|| "Message envoyé".to_string());
-                self.toast(text, false)
+                Task::batch([cleanup, self.toast(text, false)])
             }
             Err(error) => {
                 if let Some(composer) = &mut self.composer {

@@ -1,15 +1,18 @@
 //! Small dialogs: password, rename, signature, delete confirmation,
 //! reconnection, unsubscribe confirmation, keyboard shortcuts, the rule
-//! editor and the confirmations of "Appliquer maintenant" and "Tout
-//! mettre à la corbeille".
+//! editor, the confirmations of "Appliquer maintenant" and "Tout
+//! mettre à la corbeille", and the times of "Plus tard" and "Envoyer plus
+//! tard".
 
 use super::add_account::{error_line, spinner_line};
 use super::{field_label, icon_button};
 use crate::app::{
-    AccountMsg, App, CleanupMsg, Message, Overlay, PasswordDialog, RuleForm, RuleMsg, ServerField,
-    ServersForm, UnsubscribeOffer, field_name, move_name,
+    AccountMsg, App, CleanupMsg, LaterMsg, LaterPicker, LaterPurpose, Message, Overlay,
+    PasswordDialog, RuleForm, RuleMsg, ServerField, ServersForm, UnsubscribeOffer, field_name,
+    move_name,
 };
 use crate::icons::Icon;
+use crate::later;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::Security;
 use avero_core::rules::{RuleField, RuleMove};
@@ -36,7 +39,76 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::RuleEditor(form) => rule_editor(app, form),
         Overlay::ConfirmApplyRule { name, count, .. } => confirm_apply_rule(name, *count),
         Overlay::ConfirmTrashSender { name, rows, .. } => confirm_trash_sender(name, rows.len()),
+        Overlay::Later(picker) => later_picker(app, picker),
     }
+}
+
+/// "Plus tard" and "Envoyer plus tard": the ready-made times, each with
+/// the date it stands for, then a date typed by hand.
+fn later_picker<'a>(app: &'a App, picker: &'a LaterPicker) -> Element<'a, Message> {
+    let now = app.clock.local();
+    let (title, intro) = match picker.purpose {
+        LaterPurpose::Snooze(_) => (
+            "Plus tard",
+            "La conversation quitte vos dossiers et revient en haut, non lue, au moment choisi. \
+             Avero doit être ouvert à ce moment-là (sinon, elle revient au lancement suivant).",
+        ),
+        LaterPurpose::Send => (
+            "Envoyer plus tard",
+            "Le message reste sur cet ordinateur jusqu'à l'heure choisie, puis Avero l'envoie. \
+             S'il est fermé à ce moment-là, l'envoi se fait au lancement suivant.",
+        ),
+    };
+    let mut choices = Column::new().spacing(6);
+    for &when in picker.choices() {
+        let at = later::resolve(when, &now);
+        choices = choices.push(
+            button(
+                row![
+                    text(later::label(when, &now))
+                        .size(14)
+                        .font(MEDIUM)
+                        .width(Fill),
+                    text(later::describe(&at, &now))
+                        .size(12)
+                        .style(theme::muted),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .width(Fill)
+            .padding([10, 12])
+            .on_press(Message::Later(LaterMsg::Pick(when)))
+            .style(theme::secondary),
+        );
+    }
+    let input = text_input("31/12/2026 18:30", &picker.custom)
+        .on_input(|v| Message::Later(LaterMsg::CustomText(v)))
+        .on_submit(Message::Later(LaterMsg::PickCustom))
+        .padding([10, 12])
+        .size(14)
+        .style(theme::input);
+    let custom = row![
+        input,
+        button(text("Valider").size(13).font(MEDIUM))
+            .padding([10, 14])
+            .on_press_maybe(
+                (!picker.custom.trim().is_empty()).then_some(Message::Later(LaterMsg::PickCustom))
+            )
+            .style(theme::primary),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let mut body = column![
+        text(intro).size(13).style(theme::muted),
+        choices,
+        column![field_label("Date et heure choisies"), custom].spacing(6),
+    ]
+    .spacing(14);
+    if let Some(error) = &picker.error {
+        body = body.push(error_line(error));
+    }
+    card(title, body.into())
 }
 
 fn card<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {

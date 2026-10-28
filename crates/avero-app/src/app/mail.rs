@@ -24,6 +24,8 @@ impl App {
             Message::FolderSelected(folder) => {
                 self.folder = folder;
                 self.starred = false;
+                self.snoozed = false;
+                self.scheduled = false;
                 self.sender = None;
                 self.tab = avero_core::Category::Important;
                 self.search_text.clear();
@@ -185,6 +187,9 @@ impl App {
     /// With "Regrouper les conversations" on, one item per conversation;
     /// search results and a sender's mail stay one item per message.
     fn fetch(&self, limit: usize) -> Vec<UnifiedItem> {
+        if self.scheduled_shown() {
+            return Vec::new();
+        }
         let result = match &self.search_query {
             Some(query) => self.store.search(query, None, self.filter, limit),
             None => self.store.list(
@@ -289,6 +294,9 @@ impl App {
     /// all its messages, the newest unfolded; the others are loaded when
     /// unfolded.
     pub(super) fn open(&mut self, index: usize) -> Task<Message> {
+        if self.folder == FolderRole::Drafts && self.in_folder() {
+            return self.open_draft_line(index);
+        }
         let Some(item) = self.items.get(index).cloned() else {
             return Task::none();
         };
@@ -391,7 +399,7 @@ impl App {
         }
     }
 
-    fn fetch_body(&self, row: i64) -> Task<Message> {
+    pub(super) fn fetch_body(&self, row: i64) -> Task<Message> {
         let Some(target) = self.refs(&[row]).into_iter().next() else {
             return Task::none();
         };
@@ -414,6 +422,20 @@ impl App {
             Ok(()) => self.store.body(row),
             Err(_) => Ok(None),
         };
+        // A draft waiting to open in the composer.
+        if self.pending_draft == Some(row) {
+            return match (result, cached) {
+                (Ok(()), Ok(Some((raw, _)))) => parse_task(row, raw),
+                (Err(e), _) => {
+                    self.pending_draft = None;
+                    self.toast(format!("Brouillon introuvable : {e}"), true)
+                }
+                _ => {
+                    self.pending_draft = None;
+                    Task::none()
+                }
+            };
+        }
         let Some(entry) = self.entry_for(row) else {
             return Task::none();
         };
@@ -427,14 +449,28 @@ impl App {
 
     /// A parsed body is ready: show it if its message is still in the
     /// reader.
-    pub(super) fn body_parsed(&mut self, row: i64, result: Result<Arc<OpenedBody>, String>) {
+    pub(super) fn body_parsed(
+        &mut self,
+        row: i64,
+        result: Result<Arc<OpenedBody>, String>,
+    ) -> Task<Message> {
+        if self.pending_draft == Some(row) {
+            return match result {
+                Ok(opened) => self.open_parsed_draft(row, &opened),
+                Err(e) => {
+                    self.pending_draft = None;
+                    self.toast(format!("Brouillon illisible : {e}"), true)
+                }
+            };
+        }
         let Some(entry) = self.entry_for(row) else {
-            return;
+            return Task::none();
         };
         entry.body = match result {
             Ok(opened) => ready_body(opened),
             Err(e) => Body::Failed(e),
         };
+        Task::none()
     }
 
     /// A worker lost the jobs of the messages being loaded.
@@ -733,6 +769,11 @@ impl App {
             Vec::new()
         };
         let signature = self.signature_of(from);
+        // A message being written is kept as a draft first.
+        let close = self.close_composer();
+        if self.composer.is_some() {
+            return close;
+        }
         self.composer = Some(super::Composer::from_fields(
             from,
             fields,
@@ -745,7 +786,7 @@ impl App {
         } else {
             super::composer::BODY_ID
         };
-        iced::widget::operation::focus(target)
+        Task::batch([close, iced::widget::operation::focus(target)])
     }
 
     /// The account a new message is sent from by default.
@@ -777,7 +818,7 @@ impl App {
 
 /// Parses a raw body off the UI thread; the result comes back as
 /// `Message::BodyParsed`.
-fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
+pub(super) fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
     Task::perform(background::parse_message(raw), move |result| {
         Message::BodyParsed(row, result.map(Arc::new))
     })

@@ -1,12 +1,16 @@
 //! The list column: title, search, account chips, folders, the tabs of
-//! the inbox, account problems, then the messages.
+//! the inbox, account problems, then the messages (or, in "Programmés",
+//! the mail waiting to be sent).
 
 use super::{dot, ellipsize, find_account, format_date, hr, shared_avatar, tip, to_color};
-use crate::app::{AccountMsg, App, Message, PAGE, SEARCH_ID, tab_name};
+use crate::app::{AccountMsg, App, LaterMsg, Message, PAGE, SEARCH_ID, scheduled_status, tab_name};
 use crate::icons::{self, Icon, Tone};
+use crate::later;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use crate::worker::ErrorKind;
-use avero_core::{Account, AccountFilter, AuthKind, Category, FolderRole, UnifiedItem};
+use avero_core::{
+    Account, AccountFilter, AuthKind, Category, DraftRecord, FolderRole, UnifiedItem,
+};
 use chrono::{DateTime, Local};
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -70,6 +74,8 @@ fn title_row(app: &App) -> Element<'_, Message> {
     let title = match (&app.search_query, &app.sender) {
         (Some(_), _) => "Recherche".to_string(),
         (None, Some(sender)) => format!("Mails de {}", ellipsize(&sender.name, 24)),
+        (None, None) if app.snoozed => "Plus tard".to_string(),
+        (None, None) if app.scheduled => "Programmés".to_string(),
         (None, None) if app.starred => "Favoris".to_string(),
         (None, None) => folder_name(app.folder).to_string(),
     };
@@ -247,12 +253,54 @@ fn folders(app: &App) -> Element<'_, Message> {
         } else {
             tabs = tabs.push(tip(tab, name, tooltip::Position::Bottom));
         }
-        // "Favoris" right after the inbox.
+        // "Favoris" and "Plus tard" right after the inbox, "Programmés"
+        // after the drafts.
         if role == FolderRole::Inbox {
             tabs = tabs.push(starred_button(app));
+            tabs = tabs.push(place_button(
+                Icon::AlarmClock,
+                "Plus tard",
+                app.snoozed && app.sender.is_none() && app.search_query.is_none(),
+                Message::Later(LaterMsg::ShowSnoozed),
+            ));
+        }
+        if role == FolderRole::Drafts {
+            tabs = tabs.push(place_button(
+                Icon::CalendarClock,
+                "Programmés",
+                app.scheduled_shown(),
+                Message::Later(LaterMsg::ShowScheduled),
+            ));
         }
     }
     tabs.into()
+}
+
+/// A place of the list that is not a folder ("Plus tard", "Programmés"):
+/// its icon, and its name once selected.
+fn place_button<'a>(
+    icon: Icon,
+    name: &'a str,
+    selected: bool,
+    on_press: Message,
+) -> Element<'a, Message> {
+    let tone = if selected { Tone::Accent } else { Tone::Muted };
+    let mut content = Row::new()
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .push(icons::icon(icon, 16.0, tone));
+    if selected {
+        content = content.push(text(name).size(13).font(MEDIUM));
+    }
+    let tab = button(content)
+        .padding(if selected { [6, 9] } else { [6, 7] })
+        .on_press(on_press)
+        .style(theme::chip(selected));
+    if selected {
+        tab.into()
+    } else {
+        tip(tab, name, tooltip::Position::Bottom)
+    }
 }
 
 /// "Favoris": the starred mail of every folder.
@@ -389,6 +437,9 @@ pub fn selection_label(count: usize, threads: bool) -> String {
 }
 
 fn messages(app: &App) -> Element<'_, Message> {
+    if app.scheduled_shown() {
+        return scheduled(app);
+    }
     if app.items.is_empty() {
         return empty(app);
     }
@@ -444,6 +495,10 @@ fn empty(app: &App) -> Element<'_, Message> {
         None if app.starred => (
             "Aucun favori".to_string(),
             "Ajoutez une étoile à un message (S) pour le retrouver ici.",
+        ),
+        None if app.snoozed => (
+            "Rien pour plus tard".to_string(),
+            "« Plus tard » (H) range une conversation jusqu'au moment choisi.",
         ),
         None if app.is_syncing() => (
             "Synchronisation…".to_string(),
@@ -547,12 +602,23 @@ fn message_row<'a>(
     }
 
     let date_style = if unread { theme::accent } else { theme::muted };
-    meta = meta.push(
-        text(format_date(item.date, now))
-            .size(12)
-            .font(if unread { SEMIBOLD } else { theme::INTER })
-            .style(date_style),
-    );
+    // In "Plus tard": when it comes back, instead of its date.
+    if let Some(until) = item.snoozed_until {
+        meta = meta.push(icons::icon(Icon::AlarmClock, 13.0, Tone::Accent));
+        meta = meta.push(
+            text(later::short_local(until, now.timestamp()))
+                .size(12)
+                .font(MEDIUM)
+                .style(theme::accent),
+        );
+    } else {
+        meta = meta.push(
+            text(format_date(item.date, now))
+                .size(12)
+                .font(if unread { SEMIBOLD } else { theme::INTER })
+                .style(date_style),
+        );
+    }
     let first = row![container(who).width(Fill).clip(true), meta]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -607,4 +673,125 @@ fn message_row<'a>(
         .on_press(Message::MessageSelected(index))
         .style(theme::list_row(is_selected))
         .into()
+}
+
+/// "Programmés": the mail waiting for its time, the next to leave
+/// first, then the mail that left late (Avero was closed at its time).
+fn scheduled(app: &App) -> Element<'_, Message> {
+    if app.outbox.is_empty() {
+        return container(
+            column![
+                icons::icon(Icon::CalendarClock, 32.0, Tone::Muted),
+                text("Aucun envoi programmé").size(15).font(SEMIBOLD),
+                text("Dans le composeur, « Envoyer plus tard » garde un message ici jusqu'à l'heure choisie.")
+                    .size(13)
+                    .style(theme::muted)
+                    .align_x(Alignment::Center),
+            ]
+            .spacing(10)
+            .align_x(Alignment::Center)
+            .max_width(280),
+        )
+        .center_x(Fill)
+        .padding(Padding::new(48.0).left(24).right(24))
+        .into();
+    }
+    let now = Local::now().timestamp();
+    let mut lines = Column::new().spacing(8).padding([10, 12]);
+    for record in &app.outbox {
+        lines = lines.push(scheduled_row(app, record, now));
+    }
+    scrollable(lines)
+        .height(Fill)
+        .style(theme::scrollbar)
+        .into()
+}
+
+/// One scheduled mail: to whom, its subject, how it is doing, and what
+/// can be done with it.
+fn scheduled_row<'a>(app: &'a App, record: &'a DraftRecord, now: i64) -> Element<'a, Message> {
+    let sending = app.sending.contains(&record.id);
+    let f = &record.fields;
+    let to = match f.to.trim() {
+        "" => "(sans destinataire)".to_string(),
+        to => format!("À : {to}"),
+    };
+    let subject = match f.subject.trim() {
+        "" => "(sans objet)",
+        subject => subject,
+    };
+    let color = find_account(&app.accounts, f.account).map(|a| to_color(a.color));
+    let mut head = Row::new().spacing(8).align_y(Alignment::Center);
+    if let Some(color) = color {
+        head = head.push(dot(color, 8.0));
+    }
+    head = head.push(
+        container(
+            text(ellipsize(&to, 40))
+                .size(13)
+                .font(SEMIBOLD)
+                .wrapping(Wrapping::None),
+        )
+        .width(Fill)
+        .clip(true),
+    );
+    let status = scheduled_status(record, now, sending);
+    let (icon, tone, style): (Icon, Tone, fn(&iced::Theme) -> text::Style) =
+        if record.error.is_some() {
+            (Icon::Alert, Tone::Danger, theme::danger_text)
+        } else if record.sent_at.is_some() {
+            (Icon::Alert, Tone::Accent, theme::accent)
+        } else {
+            (Icon::CalendarClock, Tone::Muted, theme::muted)
+        };
+    let status = row![
+        icons::icon(icon, 14.0, tone),
+        text(status).size(12).style(style),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Start);
+    let action = |label: &'a str, message: Option<Message>| {
+        button(text(label).size(12).font(MEDIUM))
+            .padding([5, 10])
+            .on_press_maybe(message)
+            .style(theme::secondary)
+    };
+    let idle = !sending;
+    let actions = if record.sent_at.is_some() {
+        row![action(
+            "Masquer",
+            Some(Message::Later(LaterMsg::Dismiss(record.id)))
+        )]
+    } else {
+        row![
+            action(
+                "Modifier",
+                idle.then_some(Message::Later(LaterMsg::Edit(record.id)))
+            ),
+            action(
+                "Envoyer maintenant",
+                idle.then_some(Message::Later(LaterMsg::SendNow(record.id)))
+            ),
+            action(
+                "Annuler l'envoi",
+                idle.then_some(Message::Later(LaterMsg::Cancel(record.id)))
+            ),
+        ]
+    }
+    .spacing(6);
+    container(
+        column![
+            head,
+            text(ellipsize(subject, 44))
+                .size(13)
+                .wrapping(Wrapping::None),
+            status,
+            actions,
+        ]
+        .spacing(6),
+    )
+    .width(Fill)
+    .padding([10, 12])
+    .style(theme::panel)
+    .into()
 }

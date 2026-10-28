@@ -2,15 +2,19 @@
 //! accounts and about forty French messages, a few of them answers that
 //! make conversations, some newsletters and notifications (for the tabs
 //! and "Se désinscrire"), a few starred ones, a few rules, spam (one of
-//! them caught by the local filter), and no network at all.
+//! them caught by the local filter), two conversations put away for
+//! later, a draft and a mail scheduled for tomorrow, and no network at
+//! all.
 //! `AVERO_DEMO=empty` starts with no account (welcome screen);
 //! `AVERO_DEMO=google-setup` (or `microsoft-setup`) also opens the
 //! connection assistant, as after a click on "Continuer avec Google".
 
+use crate::later::{self, When};
 use avero_core::rules::{Condition, RuleDef, RuleField, RuleMove, block_rule};
 use avero_core::store::Store;
 use avero_core::{
-    AccountId, AuthKind, FolderRole, MessageHeaders, NewAccount, NewMessage, Security, ServerConfig,
+    AccountFilter, AccountId, AuthKind, DraftFields, FolderRole, Listing, MessageHeaders,
+    NewAccount, NewMessage, Security, ServerConfig,
 };
 use chrono::{Local, TimeZone};
 
@@ -420,6 +424,86 @@ pub fn seed(store: &Store) {
     for rule in demo_rules(&ids) {
         let _ = store.add_rule(&rule);
     }
+    seed_later(store, &ids);
+}
+
+/// Conversations snoozed by the demo ("Plus tard"), and until when.
+const SNOOZED: [(&str, When); 2] = [
+    ("Sortie de dimanche : on part à 8 h 30", When::Tonight),
+    ("3 nouvelles adhésions au Vélo Club", When::Monday),
+];
+
+/// "Plus tard", a draft in the "Travail" drafts folder and a mail in
+/// "Programmés".
+fn seed_later(store: &Store, ids: &[AccountId]) {
+    let now = Local::now();
+    let inbox = store
+        .list(
+            &Listing::Folder(FolderRole::Inbox),
+            AccountFilter::All,
+            false,
+            500,
+            0,
+        )
+        .unwrap_or_default();
+    for (subject, when) in SNOOZED {
+        if let Some(item) = inbox.iter().find(|i| i.subject == subject) {
+            let until = later::resolve(when, &now).timestamp();
+            let _ = store.snooze(&item.row_ids, until);
+        }
+    }
+    let Some(&work) = ids.get(1) else {
+        return;
+    };
+    // A draft written "elsewhere": it is on the server only, and opens
+    // in the composer from "Brouillons".
+    if let Ok(drafts) =
+        store.upsert_folder(work, folder_for(FolderRole::Drafts), FolderRole::Drafts)
+    {
+        let date = now.timestamp() - 2 * H * 60;
+        let raw = format!(
+            "From: Camille Martin <{work_addr}>\r\nTo: Julien Roche <julien.roche@atelier-lumen.fr>\r\n\
+             Subject: Prévisionnel T4 (brouillon)\r\nDate: {}\r\nMessage-ID: <demo-draft@avero.demo>\r\n\
+             MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: 8bit\r\n\r\nJulien,\r\n\r\nVoici une première version des trois \
+             scénarios. Il me manque encore les chiffres de novembre.\r\n",
+            now.to_rfc2822(),
+            work_addr = ACCOUNTS[1].1,
+        );
+        let message = NewMessage {
+            uid: 1,
+            message_id: Some("<demo-draft@avero.demo>".to_string()),
+            subject: "Prévisionnel T4 (brouillon)".to_string(),
+            from_name: Some("Camille Martin".to_string()),
+            from_addr: ACCOUNTS[1].1.to_string(),
+            date,
+            seen: true,
+            size: Some(raw.len() as u32),
+            ..Default::default()
+        };
+        if store.insert_messages(drafts.id, &[message]).is_ok()
+            && let Ok(Some(row)) = store.message_row(drafts.id, 1)
+        {
+            let text = "Julien,\n\nVoici une première version des trois scénarios. \
+                        Il me manque encore les chiffres de novembre.";
+            let _ = store.put_body(row, raw.as_bytes(), text, false);
+        }
+    }
+    // A mail that leaves tomorrow morning.
+    let fields = DraftFields {
+        account: work,
+        to: "Léa Bernard <lea.bernard@atelier-lumen.fr>".to_string(),
+        subject: "Retours client Orsay".to_string(),
+        body: format!(
+            "Bonjour Léa,\n\nLe client valide la v3, avec deux petites retouches sur la page \
+             d'accueil. On en parle à 9 h ?\n\n-- \n{WORK_SIGNATURE}"
+        ),
+        message_id: "<demo-scheduled@avero.demo>".to_string(),
+        ..Default::default()
+    };
+    if let Ok(id) = store.save_draft(None, &fields, Some(&[]), now.timestamp()) {
+        let _ = store.schedule_draft(id, later::resolve(When::Tomorrow, &now).timestamp());
+    }
 }
 
 /// A few rules for the settings page.
@@ -632,6 +716,27 @@ mod tests {
                 .iter()
                 .any(|i| i.subject == "Bienvenue à l'Atelier Lumen")
         );
+    }
+
+    #[test]
+    fn demo_has_reminders_a_draft_and_a_scheduled_mail() {
+        let store = seeded_store();
+        let snoozed = store
+            .list(&Listing::Snoozed, AccountFilter::All, true, 200, 0)
+            .unwrap();
+        assert_eq!(snoozed.len(), SNOOZED.len());
+        assert!(snoozed.iter().all(|item| item.snoozed_until.is_some()));
+        let drafts = store
+            .unified(FolderRole::Drafts, AccountFilter::All, 200, 0)
+            .unwrap();
+        assert_eq!(drafts.len(), 1);
+        let (raw, _) = store.body(drafts[0].row_ids[0]).unwrap().unwrap();
+        let parsed = avero_sync::parse::parse_body(&raw);
+        assert_eq!(parsed.to[0].addr, "julien.roche@atelier-lumen.fr");
+        assert!(parsed.text.contains("trois scénarios"), "{}", parsed.text);
+        let scheduled = store.scheduled().unwrap();
+        assert_eq!(scheduled.len(), 1);
+        assert!(scheduled[0].send_at.unwrap() > Local::now().timestamp());
     }
 
     #[test]

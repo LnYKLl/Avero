@@ -12,7 +12,11 @@ use std::sync::{LazyLock, Mutex};
 /// Every icon the app draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
+    /// "Plus tard".
+    AlarmClock,
     Archive,
+    /// "Programmés".
+    CalendarClock,
     Check,
     ChevronDown,
     ChevronLeft,
@@ -63,8 +67,10 @@ pub enum Icon {
 }
 
 /// All icons, in the order of `bytes`; used to build the handle cache.
-const ALL: [Icon; 44] = [
+const ALL: [Icon; 46] = [
+    Icon::AlarmClock,
     Icon::Archive,
+    Icon::CalendarClock,
     Icon::Check,
     Icon::ChevronDown,
     Icon::ChevronLeft,
@@ -113,7 +119,9 @@ const ALL: [Icon; 44] = [
 /// The SVG source of an icon.
 pub fn bytes(icon: Icon) -> &'static [u8] {
     match icon {
+        Icon::AlarmClock => include_bytes!("../assets/icons/alarm-clock.svg"),
         Icon::Archive => include_bytes!("../assets/icons/archive.svg"),
+        Icon::CalendarClock => include_bytes!("../assets/icons/calendar-clock.svg"),
         Icon::Check => include_bytes!("../assets/icons/check.svg"),
         Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
         Icon::ChevronLeft => include_bytes!("../assets/icons/chevron-left.svg"),

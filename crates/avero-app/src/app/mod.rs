@@ -6,13 +6,16 @@
 //! sender's mail, the star), `unsubscribe` ("Se désinscrire"), `keys`
 //! (keyboard shortcuts), `accounts` (adding, fixing and removing
 //! accounts, worker events), `filters` (spam, the spam filter and the
-//! rules), `cleanup` ("Grand nettoyage") and `composer`.
+//! rules), `cleanup` ("Grand nettoyage"), `composer`, `drafts` (saving
+//! what is written) and `later` ("Plus tard" and "Programmés").
 
 mod accounts;
 mod cleanup;
 mod composer;
+mod drafts;
 mod filters;
 mod keys;
+mod later;
 mod mail;
 mod places;
 mod selection;
@@ -23,6 +26,7 @@ pub use cleanup::{Cleanup, CleanupMsg};
 pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
 pub use filters::{RuleForm, RuleMsg, field_name, move_name};
 pub use keys::SHORTCUTS;
+pub use later::{LaterMsg, LaterPicker, LaterPurpose, scheduled_status};
 pub use places::{SenderView, tab_name};
 pub use unsubscribe::UnsubscribeOffer;
 
@@ -39,7 +43,8 @@ use avero_core::rules::Rule;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
-    Account, AccountFilter, AccountId, Category, FolderRole, Security, ServerConfig, UnifiedItem,
+    Account, AccountFilter, AccountId, Category, DraftRecord, FolderRole, Security, ServerConfig,
+    UnifiedItem,
 };
 use avero_oauth::Provider;
 use iced::widget::text_editor;
@@ -122,6 +127,8 @@ pub enum Overlay {
         name: String,
         rows: Vec<i64>,
     },
+    /// "Plus tard" or "Envoyer plus tard": when.
+    Later(LaterPicker),
 }
 
 /// "Changer le mot de passe".
@@ -398,6 +405,7 @@ pub enum Message {
     Account(AccountMsg),
     Rule(RuleMsg),
     Cleanup(CleanupMsg),
+    Later(LaterMsg),
 }
 
 /// Messages of the add-account card. `Debug` hides a typed password.
@@ -542,6 +550,19 @@ pub struct App {
     pub(crate) folder: FolderRole,
     /// "Favoris" is shown instead of `folder`.
     pub(crate) starred: bool,
+    /// "Plus tard" (the snoozed conversations) is shown instead.
+    pub(crate) snoozed: bool,
+    /// "Programmés" (the mail to send later) is shown instead.
+    pub(crate) scheduled: bool,
+    /// The scheduled mail, for "Programmés".
+    pub(crate) outbox: Vec<DraftRecord>,
+    /// Scheduled mail being sent right now.
+    pub(crate) sending: HashSet<i64>,
+    /// The row of the drafts folder whose body is awaited to open it in
+    /// the composer.
+    pub(crate) pending_draft: Option<i64>,
+    /// Where the time comes from (tests set it by hand).
+    pub(crate) clock: crate::later::Clock,
     /// The tab of the inbox shown (see `App::tabs_shown`).
     pub(crate) tab: Category,
     /// "Mails de X", shown over the rest.
@@ -641,6 +662,12 @@ impl App {
             screen: Screen::Mail,
             folder: FolderRole::Inbox,
             starred: false,
+            snoozed: false,
+            scheduled: false,
+            outbox: Vec::new(),
+            sending: HashSet::new(),
+            pending_draft: None,
+            clock: crate::later::Clock::default(),
             tab: Category::Important,
             sender: None,
             tab_unread: HashMap::new(),
@@ -672,6 +699,12 @@ impl App {
         };
         app.read_oauth_clients();
         app.refresh_rules();
+        // Scheduled mail whose sending a stop cut short is not sent twice.
+        if let Err(e) = app.store.interrupted_sends(later::INTERRUPTED) {
+            eprintln!("Impossible de relire les envois programmés : {e}");
+        }
+        app.refresh_outbox();
+        let drafts = app.restore_drafts();
         let watching: Vec<Task<Message>> = app
             .accounts
             .clone()
@@ -694,6 +727,8 @@ impl App {
                 complete,
                 Task::batch(watching),
                 Task::batch(learning),
+                drafts,
+                Task::done(Message::Later(LaterMsg::Tick)),
             ]),
         )
     }
@@ -711,6 +746,7 @@ impl App {
         let mut subscriptions = vec![
             iced::system::theme_changes().map(Message::SystemTheme),
             iced::time::every(AUTO_SYNC).map(|_| Message::AutoSync),
+            iced::time::every(later::TICK).map(|_| Message::Later(LaterMsg::Tick)),
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed { key, modifiers, .. } => {
                     Some(Message::Key(key, modifiers))
@@ -806,6 +842,7 @@ impl App {
             Message::MarkSpam(spam) => self.mark_spam(spam),
             Message::Rule(message) => self.update_rules(message),
             Message::Cleanup(message) => self.update_cleanup(message),
+            Message::Later(message) => self.update_later(message),
             Message::FolderSelected(_)
             | Message::FilterSelected(_)
             | Message::SearchChanged(_)
@@ -843,10 +880,7 @@ impl App {
                 self.reload_now();
                 Task::none()
             }
-            Message::BodyParsed(row, result) => {
-                self.body_parsed(row, result);
-                Task::none()
-            }
+            Message::BodyParsed(row, result) => self.body_parsed(row, result),
             Message::Moved(rows, event) => self.moved(rows, event),
             Message::ConfirmDeleteForever => self.delete_forever(),
             Message::Compose(message) => self.update_composer(message),
@@ -1015,12 +1049,17 @@ fn demo_answer(job: Job) {
                 "Mode démo : le message n'a pas vraiment été envoyé".to_string(),
             ))));
         }
+        // Kept on this computer only.
+        Job::SaveDraft { reply, .. } => {
+            let _ = reply.send(Event::DraftSaved(Ok(None)));
+        }
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
         | Job::SetFlagged { reply, .. }
         | Job::Move { reply, .. }
-        | Job::DeleteForever { reply, .. } => {
+        | Job::DeleteForever { reply, .. }
+        | Job::DropDraft { reply, .. } => {
             let _ = reply.send(Event::Done(Ok(())));
         }
         // Never sent in demo mode: no inbox to watch.
@@ -1040,5 +1079,7 @@ pub fn destination_label(destination: Destination) -> &'static str {
 
 #[cfg(test)]
 mod filter_tests;
+#[cfg(test)]
+mod later_tests;
 #[cfg(test)]
 mod tests;

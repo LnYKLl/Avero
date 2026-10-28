@@ -5,7 +5,7 @@
 use super::{
     avatar, find_account, format_full_date, hr, icon_button, icon_label_button, tip, to_color,
 };
-use crate::app::{App, Body, Entry, Message, Reading, tab_name};
+use crate::app::{App, Body, Entry, LaterMsg, Message, Reading, tab_name};
 use crate::compose::{Mode, human_size};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
@@ -118,6 +118,11 @@ fn checked(app: &App) -> Element<'_, Message> {
             },
             Some(Message::ToggleStar)
         ),
+        later_action(app, |icon, label, message| action(
+            icon,
+            label,
+            Some(message)
+        )),
     ]
     .spacing(8)
     .wrap();
@@ -495,6 +500,11 @@ fn action_bar<'a>(
             Some(message)
         )),
         star_button(app),
+        later_action(app, |icon, label, message| icon_button(
+            icon,
+            format!("{label} (H)"),
+            Some(message)
+        )),
         space().width(Fill),
         accounts,
     ]
@@ -514,6 +524,27 @@ where
         draw(Icon::Inbox, "Pas spam", Message::MarkSpam(false))
     } else {
         draw(Icon::Shield, "Spam", Message::MarkSpam(true))
+    }
+}
+
+/// "Plus tard", or "Annuler le rappel" in the "Plus tard" list, drawn by
+/// `draw`.
+fn later_action<'a, E>(app: &App, draw: impl Fn(Icon, &'static str, Message) -> E) -> E
+where
+    E: Into<Element<'a, Message>>,
+{
+    if app.selection_snoozed() {
+        draw(
+            Icon::AlarmClock,
+            "Annuler le rappel",
+            Message::Later(LaterMsg::Unsnooze),
+        )
+    } else {
+        draw(
+            Icon::AlarmClock,
+            "Plus tard",
+            Message::Later(LaterMsg::Snooze),
+        )
     }
 }
 

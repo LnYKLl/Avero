@@ -56,6 +56,8 @@ impl App {
                 Task::batch([toast, self.sync_account(account)])
             }
             Event::Sent(result) => self.sent(result),
+            // Answered through `LaterMsg::DraftSaved`.
+            Event::DraftSaved(_) => Task::none(),
             Event::NewMail(arrivals) => self.new_mail(account, arrivals),
             Event::Gone => {
                 let status = self.status.entry(account).or_default();
@@ -101,7 +103,11 @@ impl App {
                 self.learn_from_folders(account)
             }
             Event::NewMail(arrivals) => self.new_mail(account, arrivals),
-            Event::Body { .. } | Event::Done(_) | Event::Sent(_) | Event::Gone => Task::none(),
+            Event::Body { .. }
+            | Event::Done(_)
+            | Event::Sent(_)
+            | Event::DraftSaved(_)
+            | Event::Gone => Task::none(),
         }
     }
 

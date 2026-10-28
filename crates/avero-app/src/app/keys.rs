@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 pub const G_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Every shortcut, as the help (`?`) lists them: keys, then what they do.
-pub const SHORTCUTS: [(&str, &str); 18] = [
+pub const SHORTCUTS: [(&str, &str); 19] = [
     ("J  ou  ↓", "Ligne suivante"),
     ("K  ou  ↑", "Ligne précédente"),
     ("Entrée", "Ouvrir"),
@@ -29,6 +29,7 @@ pub const SHORTCUTS: [(&str, &str); 18] = [
     ("U", "Marquer comme non lu"),
     ("!", "Spam, ou « Pas spam » dans le dossier Spam"),
     ("S", "Ajouter aux favoris ou les retirer"),
+    ("H", "Plus tard (rappel), ou l'annuler dans « Plus tard »"),
     ("X", "Sélectionner la ligne"),
     ("Ctrl+clic, Maj+clic", "Sélectionner plusieurs lignes"),
     ("/  ou  Ctrl+F", "Rechercher"),
@@ -113,6 +114,10 @@ impl App {
                 self.mark_spam(spam)
             }
             Character("s") => self.update_places(Message::ToggleStar),
+            Character("h") if self.selection_snoozed() => {
+                self.update_later(super::LaterMsg::Unsnooze)
+            }
+            Character("h") => self.update_later(super::LaterMsg::Snooze),
             Character("x") => {
                 self.toggle_current();
                 Task::none()
