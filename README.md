@@ -26,6 +26,21 @@ Supported platforms: Windows, macOS and Linux. The interface is in French.
 
 Passwords and OAuth refresh tokens are stored only in the operating system's keyring (Windows Credential Manager, macOS Keychain, Secret Service on Linux), never in the database or in logs. IMAP uses implicit TLS only; SMTP uses implicit TLS or mandatory STARTTLS.
 
+## Installation
+
+### Windows
+
+Download the files from the [Releases](https://github.com/LnYKLl/Avero/releases) page (Windows 10 or 11, 64-bit):
+
+- **Installer** (`Avero-<version>-windows-x64-setup.exe`): installs Avero for your user only, without administrator rights (in `%LOCALAPPDATA%\Programs\Avero`), with a Start menu shortcut, an optional desktop shortcut and an uninstaller ("Apps" in the Windows settings). Uninstalling keeps your mail, settings and passwords.
+- **Portable** (`Avero-<version>-windows-x64-portable.zip`): unzip it anywhere and run `avero.exe`, nothing to install. The data is still kept in your user folder (see "Where files are kept"). New-mail notifications appear under the name "Windows PowerShell" in this version, because Windows only shows an app's own name for apps that have a Start menu shortcut; the installer creates one.
+
+`SHA256SUMS.txt` lists the checksums of both files (`sha256sum -c SHA256SUMS.txt`, or `Get-FileHash` in PowerShell).
+
+The files are not signed yet, so Windows SmartScreen may show "Windows protected your PC" (« Windows a protégé votre ordinateur ») the first time. Click "More info" (« Informations complémentaires »), then "Run anyway" (« Exécuter quand même »).
+
+On macOS and Linux, build Avero from source for now (below).
+
 ## Build and run
 
 You need the stable Rust toolchain (https://rustup.rs). Then, from this folder:

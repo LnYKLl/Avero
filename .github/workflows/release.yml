@@ -1,0 +1,141 @@
+name: Release
+
+# A tag `v1.2.3` builds the Windows installer and the portable zip, then
+# puts them in a draft GitHub Release (published by hand after a check).
+# "Run workflow" (workflow_dispatch) builds the same files as a workflow
+# artifact, without a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Code signing is ready but off: it runs only once these secrets
+      # exist (a base64 .pfx certificate and its password). See the
+      # "Signature des binaires" section of the design spec.
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      TIMESTAMP_URL: http://timestamp.digicert.com
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Version
+        id: version
+        run: |
+          # The version of the workspace Cargo.toml ([workspace.package]).
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+            if ($version -ne $cargo) {
+              throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $cargo"
+            }
+          } else {
+            $version = "$cargo-dev"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $version"
+
+      - name: Build
+        run: cargo build --release --locked -p avero-app
+
+      - name: Prepare code signing
+        if: env.WINDOWS_CERTIFICATE != ''
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          $pfx = Join-Path $env:RUNNER_TEMP 'avero.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "CERTIFICATE_PATH=$pfx" >> $env:GITHUB_ENV
+
+      - name: Sign avero.exe
+        if: env.WINDOWS_CERTIFICATE != ''
+        run: |
+          & $env:SIGNTOOL sign /fd sha256 /tr $env:TIMESTAMP_URL /td sha256 `
+            /f $env:CERTIFICATE_PATH /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+            target\release\avero-app.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed" }
+
+      - name: Portable zip
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $stage = Join-Path $env:RUNNER_TEMP 'portable'
+          New-Item -ItemType Directory -Force $stage, dist | Out-Null
+          Copy-Item target\release\avero-app.exe (Join-Path $stage 'avero.exe')
+          Copy-Item LICENSE (Join-Path $stage 'LICENSE.txt')
+          Copy-Item packaging\windows\README-portable.txt (Join-Path $stage 'README.txt')
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\Avero-$version-windows-x64-portable.zip"
+
+      - name: Install Inno Setup
+        run: |
+          # Inno Setup 6 is on some runner images, not all: install it
+          # with Chocolatey when it is missing.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Installer
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          # The script writes to dist\ (its OutputDir).
+          $arguments = @("/DAppVersion=$version")
+          if ($env:WINDOWS_CERTIFICATE) {
+            # Inno Setup signs the installer and its uninstaller itself.
+            # In the command, it replaces $f with the quoted file to sign
+            # and $q with a double quote.
+            $sign = "`$q$env:SIGNTOOL`$q sign /fd sha256 /tr $env:TIMESTAMP_URL /td sha256 " +
+              "/f `$q$env:CERTIFICATE_PATH`$q /p $env:WINDOWS_CERTIFICATE_PASSWORD `$f"
+            $arguments += @('/DSign', "/Savero=$sign")
+          }
+          & $env:ISCC @arguments packaging\windows\avero.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: SHA-256 checksums
+        working-directory: dist
+        run: |
+          # Same format as `sha256sum`, so `sha256sum -c SHA256SUMS.txt`
+          # checks the downloads (LF line endings for the same reason).
+          $lines = Get-ChildItem -File | Where-Object Name -ne 'SHA256SUMS.txt' |
+            Sort-Object Name | ForEach-Object {
+              "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+            }
+          [IO.File]::WriteAllText("$PWD\SHA256SUMS.txt", ($lines -join "`n") + "`n")
+          Get-Content SHA256SUMS.txt
+
+      - name: Remove the certificate
+        if: always() && env.CERTIFICATE_PATH != ''
+        run: Remove-Item -Force $env:CERTIFICATE_PATH -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avero-windows-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Draft release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: Avero ${{ steps.version.outputs.version }}
+          files: |
+            dist/Avero-*-windows-x64-setup.exe
+            dist/Avero-*-windows-x64-portable.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
