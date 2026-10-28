@@ -124,6 +124,17 @@ pub trait MailSource {
     /// UID EXPUNGE when the server has UIDPLUS, else EXPUNGE).
     async fn delete_permanently(&mut self, uids: &[u32]) -> Result<(), SyncError>;
 
+    /// Deletes messages of the selected folder without ever touching
+    /// others: `\Deleted`, then UID EXPUNGE when the server has UIDPLUS;
+    /// without it, they stay marked `\Deleted` (the next EXPUNGE, by any
+    /// client, removes them), since a plain EXPUNGE would also remove
+    /// the messages another client marked `\Deleted` and meant to keep
+    /// a little longer. For what Avero deletes on its own, often (the
+    /// previous copies of a draft). By default, `delete_permanently`.
+    async fn discard(&mut self, uids: &[u32]) -> Result<(), SyncError> {
+        self.delete_permanently(uids).await
+    }
+
     /// Adds a raw message to `folder` (no selection needed).
     async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError>;
 

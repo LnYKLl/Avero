@@ -754,6 +754,30 @@ where
     }
 }
 
+/// Marks messages `\Deleted` and, with UIDPLUS only, expunges them (see
+/// `MailSource::discard`): never a plain EXPUNGE.
+async fn discard_uids<T>(
+    session: &mut Session<T>,
+    caps: ServerCaps,
+    uids: &[u32],
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if caps.uidplus {
+        return expunge_uids(session, caps, uids).await;
+    }
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let set = uid_set(uids);
+    run_checked(
+        session,
+        &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
+    )
+    .await
+}
+
 /// Adds a raw message to `folder`, flagged `\Seen` if asked.
 async fn append_to<T>(
     session: &mut Session<T>,
@@ -1122,6 +1146,10 @@ impl MailSource for ImapSource {
 
     async fn delete_permanently(&mut self, uids: &[u32]) -> Result<(), SyncError> {
         expunge_uids(&mut self.session, self.caps, uids).await
+    }
+
+    async fn discard(&mut self, uids: &[u32]) -> Result<(), SyncError> {
+        discard_uids(&mut self.session, self.caps, uids).await
     }
 
     async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError> {
@@ -1632,6 +1660,28 @@ mod tests {
             .unwrap();
         let sent = commands(session, server).await;
         assert_eq!(sent[2], "EXPUNGE");
+    }
+
+    #[tokio::test]
+    async fn discarding_never_expunges_other_messages() {
+        let (mut session, server) = session_recording(vec![OK]).await;
+        discard_uids(&mut session, ServerCaps::default(), &[3, 4])
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID STORE 3,4 +FLAGS.SILENT (\\Deleted)"]);
+
+        let (mut session, server) = session_recording(vec![OK, OK]).await;
+        let caps = ServerCaps {
+            uidplus: true,
+            ..ServerCaps::default()
+        };
+        discard_uids(&mut session, caps, &[3]).await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec!["UID STORE 3 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 3"]
+        );
     }
 
     #[tokio::test]

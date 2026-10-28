@@ -1745,11 +1745,12 @@ impl<C: Connector> Worker<C> {
         }))
     }
 
-    /// Deletes draft copies for good, and their rows in the list.
+    /// Deletes draft copies, and their rows in the list. Without UIDPLUS
+    /// they are only marked `\Deleted` (see `MailSource::discard`).
     async fn drop_draft(&mut self, folder: &str, uids: &[u32]) -> Result<(), AccountError> {
         self.with_session(async |session, _store| {
             session.select(folder).await?;
-            session.delete_permanently(uids).await
+            session.discard(uids).await
         })
         .await?;
         let known = self.store.folders(self.account.id).unwrap_or_default();
