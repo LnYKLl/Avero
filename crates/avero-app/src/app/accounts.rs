@@ -6,10 +6,12 @@ use super::{
 use crate::account_form::{self, AccountForm, Stage};
 use crate::auth::{self, OAuthGrant};
 use crate::background::{self, LoginError};
+use crate::notify::{self, Notice};
 use crate::worker::{AccountError, ErrorKind, Event, Job};
 use avero_core::store::StoreError;
 use avero_core::{AccountFilter, AccountId, Credentials, NewAccount, ServerConfig};
 use avero_oauth::Provider;
+use avero_sync::sync::Arrival;
 use iced::Task;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -54,6 +56,10 @@ impl App {
                 Task::batch([toast, self.sync_account(account)])
             }
             Event::Sent(result) => self.sent(result),
+            Event::NewMail(arrivals) => {
+                self.notify(account, &arrivals);
+                Task::none()
+            }
             Event::Gone => {
                 let status = self.status.entry(account).or_default();
                 status.syncing = false;
@@ -69,6 +75,54 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// What a worker did on its own. Unlike `on_worker_event`, a sync
+    /// ending here does not touch `syncing`: the user's own sync may
+    /// still be running.
+    pub(super) fn on_background_event(
+        &mut self,
+        account: AccountId,
+        event: Event,
+    ) -> Task<Message> {
+        if self.account(account).is_none() {
+            // Removed meanwhile.
+            return Task::none();
+        }
+        match event {
+            Event::Progress => self.reload_soon(),
+            Event::Synced(result) => {
+                let status = self.status.entry(account).or_default();
+                match result {
+                    Ok(archive) => {
+                        status.error = None;
+                        status.archive = Some(archive);
+                    }
+                    Err(error) => status.error = Some(error),
+                }
+                self.reload_now();
+                Task::none()
+            }
+            Event::NewMail(arrivals) => {
+                self.notify(account, &arrivals);
+                Task::none()
+            }
+            Event::Body { .. } | Event::Done(_) | Event::Sent(_) | Event::Gone => Task::none(),
+        }
+    }
+
+    /// The system notifications for new mail of `account`, unless the
+    /// user turned them off.
+    pub(super) fn notices(&self, account: AccountId, arrivals: &[Arrival]) -> Vec<Notice> {
+        if !self.settings.notifications {
+            return Vec::new();
+        }
+        let name = self.account(account).map_or("", |a| a.name.as_str());
+        notify::notices(arrivals, name)
+    }
+
+    fn notify(&self, account: AccountId, arrivals: &[Arrival]) {
+        notify::show(self.notices(account, arrivals));
     }
 
     // ------------------------------------------------------- add account
@@ -554,14 +608,14 @@ impl App {
         }
         self.overlay = None;
         self.accounts.push(account.clone());
-        self.start_worker(&account);
+        let watching = self.start_worker(&account);
         self.screen = super::Screen::Mail;
         self.reload();
         let id = account.id;
         let sync = self.sync_account(id);
         let toast = self.toast(format!("Compte ajouté : {}", account.email), false);
         let Some(access) = access else {
-            return Task::batch([sync, toast]);
+            return Task::batch([sync, toast, watching]);
         };
         // The access token only lives in the worker's memory.
         let hand_token = self.request(id, |reply| Job::SetOAuth {
@@ -569,7 +623,7 @@ impl App {
             access,
             reply,
         });
-        Task::batch([hand_token.chain(sync), toast])
+        Task::batch([hand_token.chain(sync), toast, watching])
     }
 
     // ---------------------------------------------------- manage accounts

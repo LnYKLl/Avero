@@ -36,10 +36,21 @@ impl ThemeChoice {
 
 /// Everything stored in `settings.json`. Unknown or missing fields fall
 /// back to their defaults, so old files keep working.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    /// A system notification for each new unread message of an inbox.
+    pub notifications: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            theme: ThemeChoice::default(),
+            notifications: true,
+        }
+    }
 }
 
 /// Name of the file inside the config folder.
@@ -82,6 +93,7 @@ mod tests {
         let path = temp_dir("missing").join(FILE);
         assert_eq!(Settings::load(&path), Settings::default());
         assert_eq!(Settings::default().theme, ThemeChoice::System);
+        assert!(Settings::default().notifications);
     }
 
     #[test]
@@ -90,11 +102,25 @@ mod tests {
         let path = path_in(&dir);
         let settings = Settings {
             theme: ThemeChoice::Dark,
+            notifications: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"dark\""), "{text}");
+        assert!(text.contains("\"notifications\": false"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn older_files_get_notifications_on() {
+        let dir = temp_dir("older");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        std::fs::write(&path, "{\"theme\": \"light\"}").unwrap();
+        let settings = Settings::load(&path);
+        assert_eq!(settings.theme, ThemeChoice::Light);
+        assert!(settings.notifications);
         let _ = std::fs::remove_dir_all(dir);
     }
 

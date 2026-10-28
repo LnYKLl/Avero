@@ -1107,3 +1107,44 @@ fn merged_accounts_secrets_are_erased() {
     drop(store);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn background_sync_updates_status_but_not_the_spinner() {
+    let mut app = two_accounts();
+    let (a, _) = ids(&app);
+    let _ = app.update(Message::Refresh);
+    let error = AccountError::new(ErrorKind::Network, "coupé");
+    let _ = app.update(Message::Background(a, Event::Synced(Err(error.clone()))));
+    assert_eq!(app.status[&a].error.as_ref(), Some(&error));
+    // The user's own sync is still running.
+    assert!(app.status[&a].syncing);
+    let _ = app.update(Message::Background(a, Event::Synced(Ok(true))));
+    assert!(app.status[&a].error.is_none());
+}
+
+#[test]
+fn new_mail_notices_follow_the_setting() {
+    let mut app = two_accounts();
+    let (a, _) = ids(&app);
+    let arrival = avero_sync::sync::Arrival {
+        uid: 9,
+        from_name: Some("Alice".to_string()),
+        from_addr: "alice@x.fr".to_string(),
+        subject: "Bonjour".to_string(),
+    };
+    let notices = app.notices(a, std::slice::from_ref(&arrival));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].title, "Alice");
+    assert_eq!(notices[0].body, "Bonjour");
+    let _ = app.update(Message::NotificationsToggled(false));
+    assert!(!app.settings.notifications);
+    assert!(app.notices(a, &[arrival]).is_empty());
+}
+
+#[test]
+fn events_of_a_removed_account_are_ignored() {
+    let mut app = two_accounts();
+    let gone = AccountId(9999);
+    let _ = app.update(Message::Background(gone, Event::Synced(Ok(true))));
+    assert!(!app.status.contains_key(&gone));
+}

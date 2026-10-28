@@ -8,6 +8,7 @@ mod background;
 mod compose;
 mod demo;
 mod icons;
+mod notify;
 mod oauth_setup;
 mod paths;
 mod settings;

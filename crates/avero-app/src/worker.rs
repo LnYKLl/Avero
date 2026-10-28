@@ -6,7 +6,9 @@
 //! the same account run one after the other; different accounts run in
 //! parallel. A sync runs beside them on a thread of its own, with its own
 //! IMAP session and `Store` connection, so opening a message never waits
-//! for a long first sync.
+//! for a long first sync. Once the UI subscribes ([`WorkerHandle::watch`]),
+//! a third connection, on a thread of its own too, watches the inbox
+//! (IMAP IDLE, or polling) and asks for a sync whenever it changes.
 //!
 //! The UI sends a [`Job`] holding a [`Reply`] sender and reads the
 //! [`Event`]s from the matching stream (see [`request`]).
@@ -18,22 +20,37 @@ use avero_core::store::Store;
 use avero_core::{
     Account, AccountFilter, AccountId, Credentials, FolderRole, MessageRef, ServerConfig,
 };
-use avero_sync::imap::ImapSource;
+use avero_sync::imap::{ImapSource, ImapWatch};
 use avero_sync::parse::{guarded, parse_body};
 use avero_sync::smtp::{self, Outgoing, SendError};
 use avero_sync::source::{MailSource, SyncError};
-use avero_sync::sync::sync_account;
+use avero_sync::sync::{Arrival, sync_account};
+use avero_sync::watch::{Change, InboxWatch};
 use iced::futures::stream::{self, BoxStream};
 use iced::futures::{Stream, StreamExt};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 /// How many of the newest inbox messages get their body downloaded in
 /// the background after a sync.
 pub const PREFETCH: usize = 30;
+
+/// How long the inbox watcher waits before connecting again after a
+/// failure: `first`, doubled after each new failure, at most `max`.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    first: Duration,
+    max: Duration,
+}
+
+const WATCH_RETRY: Retry = Retry {
+    first: Duration::from_secs(10),
+    max: Duration::from_secs(10 * 60),
+};
 
 /// Where the worker sends what happens to one job.
 pub type Reply = UnboundedSender<Event>;
@@ -108,6 +125,9 @@ pub enum Event {
     Done(Result<(), AccountError>),
     /// A message was sent; `Ok(Some(warning))` if the Sent copy failed.
     Sent(Result<Option<String>, String>),
+    /// Unread messages that just came into the inbox, to notify. Sent
+    /// once per sync, to the [`Job::Watch`] subscriber only.
+    NewMail(Vec<Arrival>),
     /// The worker is not running any more.
     Gone,
 }
@@ -158,6 +178,13 @@ pub enum Job {
         outgoing: Box<Outgoing>,
         reply: Reply,
     },
+    /// Starts watching the inbox. `reply` then gets what the worker does
+    /// on its own: the syncs it starts because the inbox changed (their
+    /// `Progress` and `Synced`), and `NewMail` after every sync that
+    /// found some. It stays open as long as the worker runs.
+    Watch {
+        reply: Reply,
+    },
     /// Stops the worker, deleting the account's secret if asked.
     Shutdown {
         delete_secret: bool,
@@ -181,22 +208,30 @@ pub struct WorkerSetup {
 impl WorkerHandle {
     /// Starts the worker thread of an account.
     pub fn spawn(setup: WorkerSetup) -> WorkerHandle {
-        WorkerHandle::spawn_with(setup, Imap)
+        WorkerHandle::spawn_with(setup, Imap, WATCH_RETRY)
     }
 
     /// Starts a worker that opens its IMAP sessions with `connector`.
-    fn spawn_with<C: Connector>(setup: WorkerSetup, connector: C) -> WorkerHandle {
+    fn spawn_with<C: Connector>(setup: WorkerSetup, connector: C, retry: Retry) -> WorkerHandle {
         let (jobs, receiver) = mpsc::unbounded_channel();
         let name = format!("avero-account-{}", setup.account.id.0);
         let _ = std::thread::Builder::new()
             .name(name)
-            .spawn(move || run_thread(setup, connector, receiver));
+            .spawn(move || run_thread(setup, connector, retry, receiver));
         WorkerHandle { jobs }
     }
 
     /// Sends a job that needs no answer.
     pub fn send(&self, job: Job) {
         let _ = self.jobs.send(job);
+    }
+
+    /// Starts watching the inbox; the stream gives what the worker does
+    /// on its own (see [`Job::Watch`]) and ends with the worker.
+    pub fn watch(&self) -> BoxStream<'static, Event> {
+        let (reply, events) = mpsc::unbounded_channel();
+        self.send(Job::Watch { reply });
+        drain(events).boxed()
     }
 
     /// A stream that sends the job when first polled, then yields its
@@ -217,9 +252,10 @@ enum Pending {
 }
 
 impl Event {
-    /// Whether this event ends a job (everything but `Progress`).
+    /// Whether this event ends a job (everything but `Progress` and
+    /// `NewMail`).
     pub fn is_final(&self) -> bool {
-        !matches!(self, Event::Progress)
+        !matches!(self, Event::Progress | Event::NewMail(_))
     }
 }
 
@@ -263,7 +299,12 @@ pub fn drain(events: UnboundedReceiver<Event>) -> impl Stream<Item = Event> {
     })
 }
 
-fn run_thread<C: Connector>(setup: WorkerSetup, connector: C, mut jobs: UnboundedReceiver<Job>) {
+fn run_thread<C: Connector>(
+    setup: WorkerSetup,
+    connector: C,
+    retry: Retry,
+    mut jobs: UnboundedReceiver<Job>,
+) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -272,7 +313,7 @@ fn run_thread<C: Connector>(setup: WorkerSetup, connector: C, mut jobs: Unbounde
     };
     runtime.block_on(async move {
         match Store::open(&setup.db_path) {
-            Ok(store) => Worker::new(setup, connector, store).run(jobs).await,
+            Ok(store) => Worker::new(setup, connector, retry, store).run(jobs).await,
             Err(e) => {
                 let message = format!("Erreur de la base locale : {e}");
                 while let Some(job) = jobs.recv().await {
@@ -306,7 +347,8 @@ fn refuse(job: Job, message: &str) {
         | Job::DeleteForever { reply, .. } => {
             let _ = reply.send(Event::Done(Err(error())));
         }
-        Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
+        // Nothing will happen on its own: the stream just ends.
+        Job::Watch { .. } | Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
     }
 }
 
@@ -324,11 +366,18 @@ enum Flow {
 #[allow(async_fn_in_trait)]
 pub trait Connector: Send + Sync + 'static {
     type Source: MailSource;
+    type Watch: InboxWatch;
     async fn connect(
         &self,
         cfg: &ServerConfig,
         creds: &Credentials,
     ) -> Result<Self::Source, SyncError>;
+    /// A session that watches the inbox.
+    async fn watch(
+        &self,
+        cfg: &ServerConfig,
+        creds: &Credentials,
+    ) -> Result<Self::Watch, SyncError>;
 }
 
 /// The real IMAP server.
@@ -336,6 +385,7 @@ pub struct Imap;
 
 impl Connector for Imap {
     type Source = ImapSource;
+    type Watch = ImapWatch;
 
     async fn connect(
         &self,
@@ -344,16 +394,21 @@ impl Connector for Imap {
     ) -> Result<ImapSource, SyncError> {
         ImapSource::connect(cfg, creds).await
     }
+
+    async fn watch(&self, cfg: &ServerConfig, creds: &Credentials) -> Result<ImapWatch, SyncError> {
+        ImapWatch::connect(cfg, creds).await
+    }
 }
 
-/// How an account logs in, shared by its two IMAP connections (the one
-/// for the user's actions and the one for the sync, on another thread).
+/// How an account logs in, shared by its IMAP connections (the one for
+/// the user's actions, and those of the sync and of the inbox watcher,
+/// on other threads).
 struct Login<C> {
     connector: C,
     secrets: Arc<dyn SecretStore>,
     config_dir: PathBuf,
-    /// The OAuth access token in memory. Both connections use the same
-    /// one: a token refreshed by one serves the other. The lock is held
+    /// The OAuth access token in memory. All connections use the same
+    /// one: a token refreshed by one serves the others. The lock is held
     /// during a refresh so they never refresh at the same time.
     token: tokio::sync::Mutex<Option<AccessToken>>,
 }
@@ -449,6 +504,15 @@ impl<C: Connector> Login<C> {
         }
     }
 
+    /// Opens a session that watches the inbox.
+    async fn connect_watch(&self, account: &Account) -> Result<C::Watch, AccountError> {
+        let creds = self.credentials(account).await?;
+        match self.connector.watch(&account.imap, &creds).await {
+            Ok(watch) => Ok(watch),
+            Err(error) => Err(self.classify(account, error).await),
+        }
+    }
+
     /// French message for a server or database error.
     async fn classify(&self, account: &Account, error: SyncError) -> AccountError {
         if matches!(error, SyncError::Auth(_)) && account.auth != avero_core::AuthKind::Password {
@@ -504,19 +568,39 @@ fn lock(listeners: &Listeners) -> std::sync::MutexGuard<'_, Vec<Reply>> {
     listeners.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How a sync ended.
+struct SyncEnd {
+    result: Result<(), AccountError>,
+    /// The new unread inbox messages it found (even if it failed later,
+    /// in another folder).
+    arrivals: Vec<Arrival>,
+}
+
+impl SyncEnd {
+    fn failed(error: AccountError) -> SyncEnd {
+        SyncEnd {
+            result: Err(error),
+            arrivals: Vec::new(),
+        }
+    }
+}
+
 /// A sync running on its own thread, with its own IMAP session and its
 /// own `Store` connection, so the worker keeps serving the user's jobs.
 struct RunningSync {
     listeners: Listeners,
     /// Dropping it (or sending) stops the sync at its next pause.
     cancel: Option<oneshot::Sender<()>>,
-    /// The result; closed without one if the sync was stopped.
-    done: oneshot::Receiver<Result<(), AccountError>>,
+    /// How it ended; closed without a value if the sync was stopped.
+    done: oneshot::Receiver<SyncEnd>,
     /// The settings version it started with (see `Worker::version`).
     version: u64,
-    /// Sync requests that came after the settings changed: they get a
-    /// new sync once this one ends.
+    /// Sync requests that must not join this one (the settings changed,
+    /// or the inbox changed after it started): they get a new sync once
+    /// this one ends.
     next: Vec<Reply>,
+    /// Whether the watch subscriber is already in `next`.
+    rerun_for_change: bool,
 }
 
 impl RunningSync {
@@ -539,12 +623,12 @@ struct SyncTask<C> {
 }
 
 impl<C: Connector> SyncTask<C> {
-    fn run(self, cancel: oneshot::Receiver<()>, done: oneshot::Sender<Result<(), AccountError>>) {
+    fn run(self, cancel: oneshot::Receiver<()>, done: oneshot::Sender<SyncEnd>) {
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            let _ = done.send(Err(AccountError::new(
+            let _ = done.send(SyncEnd::failed(AccountError::new(
                 ErrorKind::Other,
                 "Impossible de lancer la synchronisation",
             )));
@@ -552,8 +636,8 @@ impl<C: Connector> SyncTask<C> {
         };
         runtime.block_on(async move {
             tokio::select! {
-                result = self.sync() => {
-                    let _ = done.send(result);
+                end = self.sync() => {
+                    let _ = done.send(end);
                 }
                 // Asked to stop, or the worker is gone.
                 _ = cancel => {}
@@ -561,45 +645,152 @@ impl<C: Connector> SyncTask<C> {
         });
     }
 
-    async fn sync(&self) -> Result<(), AccountError> {
-        let store = Store::open(&self.db_path).map_err(|e| {
-            AccountError::new(ErrorKind::Other, format!("Erreur de la base locale : {e}"))
-        })?;
+    async fn sync(&self) -> SyncEnd {
+        let store = match Store::open(&self.db_path) {
+            Ok(store) => store,
+            Err(e) => {
+                return SyncEnd::failed(AccountError::new(
+                    ErrorKind::Other,
+                    format!("Erreur de la base locale : {e}"),
+                ));
+            }
+        };
         let id = self.account.id;
         let listeners = &self.listeners;
         let mut session = None;
-        self.login
+        let mut arrivals: Vec<Arrival> = Vec::new();
+        let result = self
+            .login
             .with_session(
                 &self.account,
                 &store,
                 &mut session,
                 true,
                 async |session, store| {
-                    sync_account(store, session, id, |_| {
+                    // Kept up to date after every batch, so what an
+                    // attempt found survives its failure.
+                    let mut found = Vec::new();
+                    let result = sync_account(store, session, id, |report| {
+                        found.clone_from(&report.arrivals);
                         for reply in lock(listeners).iter() {
                             let _ = reply.send(Event::Progress);
                         }
                     })
-                    .await
+                    .await;
+                    // A retried attempt may fetch a batch again.
+                    for arrival in found {
+                        if !arrivals.iter().any(|known| known.uid == arrival.uid) {
+                            arrivals.push(arrival);
+                        }
+                    }
+                    result
                 },
             )
             .await
-            .map(|_| ())
+            .map(|_| ());
+        SyncEnd { result, arrivals }
+    }
+}
+
+/// What the inbox watcher needs; it runs on its own thread, with its own
+/// IMAP session.
+struct WatchTask<C> {
+    account: Account,
+    login: Arc<Login<C>>,
+    retry: Retry,
+    /// Gets `()` each time the inbox changes.
+    changed: UnboundedSender<()>,
+}
+
+impl<C: Connector> WatchTask<C> {
+    /// Watches until cancelled; `_done` is dropped when the thread ends.
+    fn run(self, cancel: oneshot::Receiver<()>, _done: oneshot::Sender<()>) {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            tokio::select! {
+                () = self.watch() => {}
+                // Asked to stop, or the worker is gone.
+                _ = cancel => {}
+            }
+        });
+    }
+
+    /// Connects, waits for changes, and connects again after a failure,
+    /// a little later each time. Ends when the server refuses the
+    /// credentials: trying again could get the account locked. Watching
+    /// starts again once they are fixed (the settings change).
+    async fn watch(&self) {
+        let mut delay = self.retry.first;
+        loop {
+            match self.login.connect_watch(&self.account).await {
+                Ok(mut watcher) => {
+                    while let Ok(change) = watcher.wait().await {
+                        delay = self.retry.first;
+                        if change == Change::Changed && self.changed.send(()).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(error) if matches!(error.kind, ErrorKind::Auth | ErrorKind::Reconnect) => {
+                    return;
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(self.retry.max);
+        }
+    }
+}
+
+/// An inbox watcher running on its own thread.
+struct RunningWatch {
+    /// `()` each time the inbox changes; closed when the watcher ends
+    /// on its own (credentials refused).
+    changes: UnboundedReceiver<()>,
+    /// Dropping it (or sending) stops the watcher.
+    cancel: Option<oneshot::Sender<()>>,
+    /// Closed when the watcher's thread is done.
+    done: oneshot::Receiver<()>,
+}
+
+impl RunningWatch {
+    /// Stops the watcher and waits until its thread has let go of the
+    /// session and the secrets.
+    async fn stop(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = (&mut self.done).await;
     }
 }
 
 /// What woke the worker loop up.
 enum Wake {
     Job(Option<Job>),
-    Synced(Result<(), AccountError>),
+    Synced(SyncEnd),
+    /// The inbox changed (`Some`), or the watcher ended (`None`).
+    Watch(Option<()>),
 }
 
 /// Waits for the running sync to end; never ends when none runs.
-async fn sync_end(sync: &mut Option<RunningSync>) -> Result<(), AccountError> {
+async fn sync_end(sync: &mut Option<RunningSync>) -> SyncEnd {
     match sync {
         Some(running) => (&mut running.done)
             .await
-            .unwrap_or_else(|_| Err(sync_stopped())),
+            .unwrap_or_else(|_| SyncEnd::failed(sync_stopped())),
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits for news from the watcher; never ends when none runs.
+async fn watch_news(watch: &mut Option<RunningWatch>) -> Option<()> {
+    match watch {
+        Some(running) => running.changes.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -619,6 +810,11 @@ struct Worker<C: Connector> {
     /// sync started before is not taken for an up-to-date one.
     version: u64,
     sync: Option<RunningSync>,
+    /// Where what the worker does on its own goes (see [`Job::Watch`]);
+    /// the inbox is only watched once it is set.
+    events: Option<Reply>,
+    watch: Option<RunningWatch>,
+    retry: Retry,
     /// Archive folder path, once looked up (`Some(None)`: there is none).
     archive: Option<Option<String>>,
     prefetch: VecDeque<MessageRef>,
@@ -627,7 +823,7 @@ struct Worker<C: Connector> {
 }
 
 impl<C: Connector> Worker<C> {
-    fn new(setup: WorkerSetup, connector: C, store: Store) -> Worker<C> {
+    fn new(setup: WorkerSetup, connector: C, retry: Retry, store: Store) -> Worker<C> {
         Worker {
             account: setup.account,
             store,
@@ -641,6 +837,9 @@ impl<C: Connector> Worker<C> {
             session: None,
             version: 0,
             sync: None,
+            events: None,
+            watch: None,
+            retry,
             archive: None,
             prefetch: VecDeque::new(),
             prefetch_replies: Vec::new(),
@@ -648,18 +847,22 @@ impl<C: Connector> Worker<C> {
         }
     }
 
-    /// Handles jobs as they come, and the end of the sync running beside
-    /// them; when idle, downloads queued bodies one at a time so user
-    /// actions never wait for the whole prefetch.
+    /// Handles jobs as they come, the end of the sync running beside
+    /// them and the inbox watcher's news; when idle, downloads queued
+    /// bodies one at a time so user actions never wait for the whole
+    /// prefetch.
     async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
         loop {
             let wake = if self.prefetch.is_empty() {
                 tokio::select! {
                     job = jobs.recv() => Wake::Job(job),
-                    result = sync_end(&mut self.sync) => Wake::Synced(result),
+                    end = sync_end(&mut self.sync) => Wake::Synced(end),
+                    news = watch_news(&mut self.watch) => Wake::Watch(news),
                 }
-            } else if let Some(result) = self.sync_ended() {
-                Wake::Synced(result)
+            } else if let Some(end) = self.sync_ended() {
+                Wake::Synced(end)
+            } else if let Some(news) = self.watch_news_now() {
+                Wake::Watch(news)
             } else {
                 match jobs.try_recv() {
                     Ok(job) => Wake::Job(Some(job)),
@@ -677,18 +880,31 @@ impl<C: Connector> Worker<C> {
                     }
                 }
                 Wake::Job(None) => break,
-                Wake::Synced(result) => self.finish_sync(result).await,
+                Wake::Synced(end) => self.finish_sync(end).await,
+                Wake::Watch(Some(())) => self.sync_after_change(),
+                // The watcher ended on its own (credentials refused).
+                Wake::Watch(None) => self.watch = None,
             }
         }
     }
 
-    /// The result of the running sync if it has ended, without waiting.
-    fn sync_ended(&mut self) -> Option<Result<(), AccountError>> {
+    /// The end of the running sync if it has ended, without waiting.
+    fn sync_ended(&mut self) -> Option<SyncEnd> {
         let running = self.sync.as_mut()?;
         match running.done.try_recv() {
-            Ok(result) => Some(result),
+            Ok(end) => Some(end),
             Err(oneshot::error::TryRecvError::Empty) => None,
-            Err(oneshot::error::TryRecvError::Closed) => Some(Err(sync_stopped())),
+            Err(oneshot::error::TryRecvError::Closed) => Some(SyncEnd::failed(sync_stopped())),
+        }
+    }
+
+    /// The watcher's news if there is some, without waiting.
+    fn watch_news_now(&mut self) -> Option<Option<()>> {
+        let running = self.watch.as_mut()?;
+        match running.changes.try_recv() {
+            Ok(()) => Some(Some(())),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => Some(None),
         }
     }
 
@@ -696,7 +912,7 @@ impl<C: Connector> Worker<C> {
         match job {
             Job::SetPassword { password, reply } => {
                 let result = self.login.store_secret(self.account.id, &password);
-                self.settings_changed();
+                self.settings_changed().await;
                 let _ = reply.send(Event::Done(result));
             }
             Job::SetOAuth {
@@ -715,14 +931,20 @@ impl<C: Connector> Worker<C> {
                     None => Ok(()),
                 };
                 self.login.set_token(Some(access)).await;
-                self.settings_changed();
+                self.settings_changed().await;
                 let _ = reply.send(Event::Done(result));
             }
             Job::UpdateAccount(account) => {
                 self.account = account;
-                self.settings_changed();
+                self.settings_changed().await;
             }
             Job::Sync { reply } => self.request_sync(reply),
+            Job::Watch { reply } => {
+                self.events = Some(reply);
+                if self.watch.is_none() {
+                    self.start_watch();
+                }
+            }
             Job::FetchBody { target, reply } => {
                 let result = self.download_body(&target).await;
                 let _ = reply.send(Event::Body {
@@ -751,11 +973,13 @@ impl<C: Connector> Worker<C> {
                 let _ = reply.send(Event::Sent(result));
             }
             Job::Shutdown { delete_secret } => {
-                // The sync thread must be done with the secret before it
-                // is deleted (a refresh could store a new one).
+                // The sync and watcher threads must be done with the
+                // secret before it is deleted (a refresh could store a
+                // new one).
                 if let Some(running) = self.sync.take() {
                     running.stop().await;
                 }
+                self.stop_watch().await;
                 if delete_secret {
                     let _ = self.login.secrets.delete(self.account.id);
                 }
@@ -765,10 +989,63 @@ impl<C: Connector> Worker<C> {
         Flow::Continue
     }
 
-    /// Forgets the session; the next sync uses the new settings.
-    fn settings_changed(&mut self) {
+    /// Forgets the session; the next sync uses the new settings, and the
+    /// inbox watcher starts again with them (also after refused
+    /// credentials, which may be fixed now).
+    async fn settings_changed(&mut self) {
         self.session = None;
         self.version += 1;
+        if self.events.is_some() {
+            self.stop_watch().await;
+            self.start_watch();
+        }
+    }
+
+    /// Starts watching the inbox on a thread of its own.
+    fn start_watch(&mut self) {
+        let (changed, changes) = mpsc::unbounded_channel();
+        let (cancel, cancelled) = oneshot::channel();
+        let (finished, done) = oneshot::channel();
+        let task = WatchTask {
+            account: self.account.clone(),
+            login: self.login.clone(),
+            retry: self.retry,
+            changed,
+        };
+        // If the thread cannot start, `changes` closes: the worker then
+        // goes without watching, like after refused credentials.
+        let _ = std::thread::Builder::new()
+            .name(format!("avero-watch-{}", self.account.id.0))
+            .spawn(move || task.run(cancelled, finished));
+        self.watch = Some(RunningWatch {
+            changes,
+            cancel: Some(cancel),
+            done,
+        });
+    }
+
+    async fn stop_watch(&mut self) {
+        if let Some(running) = self.watch.take() {
+            running.stop().await;
+        }
+    }
+
+    /// The inbox changed: a sync must start after this moment. The one
+    /// running may have passed the inbox already, so instead of joining
+    /// it, the watch subscriber gets one more sync right after it.
+    fn sync_after_change(&mut self) {
+        let Some(events) = self.events.clone() else {
+            return;
+        };
+        match &mut self.sync {
+            Some(running) => {
+                if !running.rerun_for_change {
+                    running.rerun_for_change = true;
+                    running.next.push(events);
+                }
+            }
+            None => self.start_sync(vec![events]),
+        }
     }
 
     /// Runs `op` on the user's IMAP session, connecting first if needed.
@@ -835,15 +1112,36 @@ impl<C: Connector> Worker<C> {
             done,
             version: self.version,
             next: Vec::new(),
+            rerun_for_change: false,
         });
     }
 
-    /// Answers the replies of the sync that ended, queues the prefetch,
-    /// and starts the sync that was asked meanwhile, if any.
-    async fn finish_sync(&mut self, result: Result<(), AccountError>) {
+    /// Answers the replies of the sync that ended, tells the watch
+    /// subscriber about new mail, queues the prefetch, and starts the
+    /// sync that was asked meanwhile, if any.
+    async fn finish_sync(&mut self, end: SyncEnd) {
         let Some(running) = self.sync.take() else {
             return;
         };
+        let SyncEnd { result, arrivals } = end;
+        if !arrivals.is_empty()
+            && let Some(events) = &self.events
+        {
+            let _ = events.send(Event::NewMail(arrivals));
+        }
+        if running.version == self.version && self.events.is_some() {
+            match &result {
+                // No watching with refused credentials (the watcher
+                // would try them again and again).
+                Err(error) if matches!(error.kind, ErrorKind::Auth | ErrorKind::Reconnect) => {
+                    self.stop_watch().await;
+                }
+                // Accepted again (the server had refused them for a
+                // while): watch again.
+                Ok(()) if self.watch.is_none() => self.start_watch(),
+                _ => {}
+            }
+        }
         let replies = std::mem::take(&mut *lock(&running.listeners));
         match result {
             Ok(()) => {
@@ -1527,6 +1825,9 @@ mod tests {
 
     /// A fake IMAP server whose folder list waits until `open` turns
     /// true: a sync on it lasts as long as the test wants.
+    ///
+    /// Its inbox watchers wait for what the test sends on `inbox`: a
+    /// change, or an error (the connection drops).
     struct FakeServer {
         open: tokio::sync::watch::Receiver<bool>,
         /// Signalled when a folder list starts (the sync is running).
@@ -1534,12 +1835,23 @@ mod tests {
         lists: AtomicUsize,
         connects: AtomicUsize,
         dropped: AtomicUsize,
+        inbox: tokio::sync::Mutex<UnboundedReceiver<Result<Change, ()>>>,
+        /// Signalled when a watcher starts waiting.
+        watching: tokio::sync::Notify,
+        /// Watcher connections tried, and dropped.
+        watch_connects: AtomicUsize,
+        watch_dropped: AtomicUsize,
+        /// How many watcher connections fail before one succeeds.
+        watch_failures: AtomicUsize,
+        /// The watcher's login is refused.
+        watch_refused: std::sync::atomic::AtomicBool,
     }
 
     struct FakeConnector(Arc<FakeServer>);
 
     impl Connector for FakeConnector {
         type Source = FakeSession;
+        type Watch = FakeWatch;
 
         async fn connect(
             &self,
@@ -1548,6 +1860,43 @@ mod tests {
         ) -> Result<FakeSession, SyncError> {
             self.0.connects.fetch_add(1, Ordering::SeqCst);
             Ok(FakeSession(self.0.clone()))
+        }
+
+        async fn watch(
+            &self,
+            _cfg: &ServerConfig,
+            _creds: &Credentials,
+        ) -> Result<FakeWatch, SyncError> {
+            let server = &self.0;
+            server.watch_connects.fetch_add(1, Ordering::SeqCst);
+            if server.watch_refused.load(Ordering::SeqCst) {
+                return Err(SyncError::Auth("NO refused".into()));
+            }
+            let failures = server.watch_failures.load(Ordering::SeqCst);
+            if failures > 0 {
+                server.watch_failures.store(failures - 1, Ordering::SeqCst);
+                return Err(SyncError::Connect("unreachable".into()));
+            }
+            Ok(FakeWatch(server.clone()))
+        }
+    }
+
+    struct FakeWatch(Arc<FakeServer>);
+
+    impl Drop for FakeWatch {
+        fn drop(&mut self) {
+            self.0.watch_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl InboxWatch for FakeWatch {
+        async fn wait(&mut self) -> Result<Change, SyncError> {
+            let mut inbox = self.0.inbox.lock().await;
+            self.0.watching.notify_one();
+            match inbox.recv().await {
+                Some(Ok(change)) => Ok(change),
+                Some(Err(())) | None => Err(SyncError::Connect("lost".into())),
+            }
         }
     }
 
@@ -1626,6 +1975,8 @@ mod tests {
         worker: WorkerHandle,
         server: Arc<FakeServer>,
         open: tokio::sync::watch::Sender<bool>,
+        /// What the inbox watchers see next.
+        inbox: UnboundedSender<Result<Change, ()>>,
         target: MessageRef,
         store: Store,
         secrets: Arc<MemorySecrets>,
@@ -1663,12 +2014,19 @@ mod tests {
         let secrets = Arc::new(MemorySecrets::new());
         secrets.set(account.id, "pw").unwrap();
         let (open, gate) = tokio::sync::watch::channel(false);
+        let (inbox, changes) = mpsc::unbounded_channel();
         let server = Arc::new(FakeServer {
             open: gate,
             listing: tokio::sync::Notify::new(),
             lists: AtomicUsize::new(0),
             connects: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
+            inbox: tokio::sync::Mutex::new(changes),
+            watching: tokio::sync::Notify::new(),
+            watch_connects: AtomicUsize::new(0),
+            watch_dropped: AtomicUsize::new(0),
+            watch_failures: AtomicUsize::new(0),
+            watch_refused: std::sync::atomic::AtomicBool::new(false),
         });
         let worker = WorkerHandle::spawn_with(
             WorkerSetup {
@@ -1678,11 +2036,16 @@ mod tests {
                 config_dir: std::env::temp_dir().join("avero-worker-no-config"),
             },
             FakeConnector(server.clone()),
+            Retry {
+                first: Duration::from_millis(10),
+                max: Duration::from_millis(40),
+            },
         );
         Fake {
             worker,
             server,
             open,
+            inbox,
             target,
             store,
             secrets,
@@ -1804,5 +2167,157 @@ mod tests {
             fake.server.dropped.load(Ordering::SeqCst),
             fake.server.connects.load(Ordering::SeqCst)
         );
+    }
+
+    /// Waits until `condition` holds (other threads are at work), at
+    /// most a few seconds.
+    async fn eventually(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    /// The next event of a watch stream that is not a `Progress`.
+    async fn next_final(events: &mut BoxStream<'static, Event>) -> Option<Event> {
+        let waiting = async {
+            loop {
+                match events.next().await {
+                    Some(Event::Progress) => continue,
+                    other => return other,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("no event in time")
+    }
+
+    #[tokio::test]
+    async fn inbox_change_starts_a_sync() {
+        let fake = fake_worker("watch");
+        fake.open.send(true).unwrap();
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
+        fake.inbox.send(Ok(Change::Changed)).unwrap();
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+        // A quiet round asks for nothing.
+        fake.server.watching.notified().await;
+        fake.inbox.send(Ok(Change::Quiet)).unwrap();
+        fake.server.watching.notified().await;
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn inbox_change_during_a_sync_gets_a_sync_after_it() {
+        let fake = fake_worker("watchsync");
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        // A sync is running (it may have passed the inbox already).
+        let first = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        fake.inbox.send(Ok(Change::Changed)).unwrap();
+        // The watcher sent the change and waits again; give the worker
+        // a moment to take it while the sync still runs.
+        fake.server.watching.notified().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+        fake.open.send(true).unwrap();
+        let first = first.await.unwrap();
+        assert!(synced_ok(&first), "{first:?}");
+        // The change did not just join the running sync: a second one
+        // started after it.
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn watcher_reconnects_after_errors() {
+        let fake = fake_worker("rewatch");
+        fake.open.send(true).unwrap();
+        // The first two connections fail, then one drops while waiting.
+        fake.server.watch_failures.store(2, Ordering::SeqCst);
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 3);
+        fake.inbox.send(Err(())).unwrap();
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 4);
+        assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
+        // The new connection still reports changes.
+        fake.inbox.send(Ok(Change::Changed)).unwrap();
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+    }
+
+    #[tokio::test]
+    async fn refused_credentials_stop_watching_until_fixed() {
+        let fake = fake_worker("watchauth");
+        fake.server.watch_refused.store(true, Ordering::SeqCst);
+        let _events = fake.worker.watch();
+        eventually("the watcher's login", || {
+            fake.server.watch_connects.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // No new try on its own, even after several retry delays.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 1);
+        // A new password starts the watcher again.
+        fake.server.watch_refused.store(false, Ordering::SeqCst);
+        let _: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetPassword {
+                password: "new".into(),
+                reply,
+            })
+            .collect()
+            .await;
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn new_settings_restart_the_watcher() {
+        let fake = fake_worker("watchupdate");
+        let _events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        let account = fake
+            .store
+            .accounts()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == fake.account)
+            .unwrap();
+        fake.worker.send(Job::UpdateAccount(account));
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_watcher() {
+        let fake = fake_worker("watchstop");
+        let events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        fake.worker.send(Job::Shutdown {
+            delete_secret: true,
+        });
+        // The stream ends with the worker, without any event.
+        let events: Vec<Event> = tokio::time::timeout(Duration::from_secs(5), events.collect())
+            .await
+            .expect("the watch stream ends");
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(fake.secrets.get(fake.account).unwrap(), None);
+        // Its session was let go before the secret was deleted.
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
     }
 }

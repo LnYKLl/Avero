@@ -1,4 +1,4 @@
-//! The settings page: accounts, appearance, about.
+//! The settings page: accounts, notifications, appearance, about.
 
 use super::{dot, hr, tip, to_color};
 use crate::app::{AccountMsg, AddMsg, App, Message};
@@ -7,7 +7,9 @@ use crate::settings::ThemeChoice;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::{Account, AuthKind};
 use avero_oauth::Provider;
-use iced::widget::{Column, button, column, container, row, scrollable, space, text, tooltip};
+use iced::widget::{
+    Column, button, column, container, row, scrollable, space, text, toggler, tooltip,
+};
 use iced::{Alignment, Element, Fill};
 
 /// Width of the settings column.
@@ -21,6 +23,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         text("Réglages").size(26).font(SEMIBOLD),
         section("Comptes", accounts(app)),
         section("Connexion Google / Microsoft", oauth_clients(app)),
+        section("Notifications", notifications(app)),
         section("Apparence", appearance(app)),
         section("À propos", about()),
     ]
@@ -248,6 +251,26 @@ fn client_row(app: &App, provider: Provider) -> Element<'_, Message> {
     ]
     .spacing(14)
     .padding([14, 18])
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn notifications(app: &App) -> Element<'_, Message> {
+    row![
+        column![
+            text("Notifications de nouveaux messages")
+                .size(14)
+                .font(MEDIUM),
+            text("Expéditeur et objet des nouveaux mails non lus de la Réception.")
+                .size(12)
+                .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.notifications).on_toggle(Message::NotificationsToggled),
+    ]
+    .spacing(12)
+    .padding(18)
     .align_y(Alignment::Center)
     .into()
 }

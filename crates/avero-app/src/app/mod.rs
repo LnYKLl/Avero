@@ -235,6 +235,7 @@ pub enum Message {
     /// a provider's console).
     CopyText(String),
     ThemeChosen(ThemeChoice),
+    NotificationsToggled(bool),
 
     ShowMail,
     ShowSettings,
@@ -248,6 +249,9 @@ pub enum Message {
     LoadMore,
     Refresh,
     Worker(AccountId, Event),
+    /// What a worker did on its own: a sync because the inbox changed,
+    /// new mail to notify (see `Job::Watch`).
+    Background(AccountId, Event),
     /// A throttled list reload is due.
     ReloadDue,
     /// A body was parsed off the UI thread.
@@ -497,15 +501,23 @@ impl App {
             spinner: 0.0,
         };
         app.read_oauth_clients();
-        for account in app.accounts.clone() {
-            app.start_worker(&account);
-        }
+        let watching: Vec<Task<Message>> = app
+            .accounts
+            .clone()
+            .iter()
+            .map(|account| app.start_worker(account))
+            .collect();
         app.load_first_page();
         let system = iced::system::theme().map(Message::SystemTheme);
         let complete = app.complete_smtp_settings();
         (
             app,
-            Task::batch([system, Task::done(Message::AutoSync), complete]),
+            Task::batch([
+                system,
+                Task::done(Message::AutoSync),
+                complete,
+                Task::batch(watching),
+            ]),
         )
     }
 
@@ -575,6 +587,11 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::NotificationsToggled(on) => {
+                self.settings.notifications = on;
+                self.save_settings();
+                Task::none()
+            }
             Message::ShowMail => {
                 self.screen = Screen::Mail;
                 Task::none()
@@ -599,6 +616,7 @@ impl App {
             | Message::SaveAttachment(_)
             | Message::AttachmentSaved(_) => self.update_mail(message),
             Message::Worker(account, event) => self.on_worker_event(account, event),
+            Message::Background(account, event) => self.on_background_event(account, event),
             Message::ReloadDue => {
                 self.reload_scheduled = false;
                 self.reload_now();
@@ -685,23 +703,30 @@ impl App {
         })
     }
 
-    /// Starts the worker of an account (live mode only).
-    fn start_worker(&mut self, account: &Account) {
-        if let Backend::Live {
+    /// Starts the worker of an account (live mode only) and has it watch
+    /// the inbox; what it does on its own comes back as
+    /// `Message::Background`. Demo mode watches nothing.
+    fn start_worker(&mut self, account: &Account) -> Task<Message> {
+        let Backend::Live {
             db_path,
             secrets,
             config_dir,
             workers,
         } = &mut self.backend
-        {
-            let handle = WorkerHandle::spawn(worker::WorkerSetup {
-                account: account.clone(),
-                db_path: db_path.clone(),
-                secrets: secrets.clone(),
-                config_dir: config_dir.clone(),
-            });
-            workers.insert(account.id, handle);
-        }
+        else {
+            return Task::none();
+        };
+        let handle = WorkerHandle::spawn(worker::WorkerSetup {
+            account: account.clone(),
+            db_path: db_path.clone(),
+            secrets: secrets.clone(),
+            config_dir: config_dir.clone(),
+        });
+        let id = account.id;
+        let watching =
+            Task::stream(handle.watch()).map(move |event| Message::Background(id, event));
+        workers.insert(id, handle);
+        watching
     }
 
     /// Sends a job to an account's worker; its events come back as
@@ -816,7 +841,8 @@ fn demo_answer(job: Job) {
         | Job::DeleteForever { reply, .. } => {
             let _ = reply.send(Event::Done(Ok(())));
         }
-        Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
+        // Never sent in demo mode: no inbox to watch.
+        Job::Watch { .. } | Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
     }
 }
 
