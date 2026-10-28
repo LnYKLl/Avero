@@ -1,4 +1,5 @@
-//! Parsing of raw IMAP headers and detection of folder roles.
+//! Parsing of raw messages (headers for the list, full bodies for reading)
+//! and detection of folder roles.
 
 use avero_core::model::{FolderRole, NewMessage};
 use mail_parser::{MessageParser, MimeHeaders};
@@ -50,6 +51,191 @@ pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
     });
 
     msg
+}
+
+/// Width used to wrap text converted from HTML.
+const HTML_TEXT_WIDTH: usize = 100;
+
+/// An e-mail address with its optional display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Address {
+    pub name: Option<String>,
+    pub addr: String,
+}
+
+/// An attachment as listed by `parse_body`; its bytes come from
+/// `attachment_data(raw, index)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub name: String,
+    /// For example `application/pdf`.
+    pub mime: String,
+    /// Decoded size in bytes.
+    pub size: usize,
+    /// Position among the message's attachments.
+    pub index: usize,
+}
+
+/// A full message, ready to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedBody {
+    pub from: Option<Address>,
+    pub to: Vec<Address>,
+    pub cc: Vec<Address>,
+    pub reply_to: Vec<Address>,
+    /// Unix time in seconds (0 if unknown).
+    pub date: i64,
+    pub subject: String,
+    /// With angle brackets, like `NewMessage::message_id`.
+    pub message_id: Option<String>,
+    /// The References header (or In-Reply-To when absent), ids with angle
+    /// brackets separated by spaces: what a reply's References starts with.
+    pub references: Option<String>,
+    /// Readable text: the text/plain part, else the HTML converted to text.
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
+/// Parses a raw message (as fetched with `fetch_body`). Never panics:
+/// unreadable input gives an empty body.
+///
+/// HTML is turned into plain text locally; nothing is ever fetched from
+/// the network (no images, no style sheets).
+pub fn parse_body(raw: &[u8]) -> ParsedBody {
+    let mut body = ParsedBody {
+        from: None,
+        to: Vec::new(),
+        cc: Vec::new(),
+        reply_to: Vec::new(),
+        date: 0,
+        subject: "(sans objet)".to_string(),
+        message_id: None,
+        references: None,
+        text: String::new(),
+        attachments: Vec::new(),
+    };
+    let Some(message) = MessageParser::default().parse(raw) else {
+        return body;
+    };
+
+    body.from = message.from().and_then(|a| addresses(a).into_iter().next());
+    body.to = message.to().map(addresses).unwrap_or_default();
+    body.cc = message.cc().map(addresses).unwrap_or_default();
+    body.reply_to = message.reply_to().map(addresses).unwrap_or_default();
+    body.date = message.date().map_or(0, |d| d.to_timestamp());
+    if let Some(subject) = message.subject() {
+        body.subject = subject.to_string();
+    }
+    body.message_id = message.message_id().map(|id| format!("<{id}>"));
+    body.references = id_list(message.references()).or_else(|| id_list(message.in_reply_to()));
+    body.text = normalize_text(&readable_text(&message));
+    body.attachments = message
+        .attachments()
+        .enumerate()
+        .map(|(index, part)| Attachment {
+            name: part
+                .attachment_name()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("piece-jointe-{}", index + 1)),
+            mime: mime_type(part),
+            size: part.contents().len(),
+            index,
+        })
+        .collect();
+    body
+}
+
+/// The decoded bytes of attachment `index` (see `Attachment::index`).
+pub fn attachment_data(raw: &[u8], index: usize) -> Option<Vec<u8>> {
+    let message = MessageParser::default().parse(raw)?;
+    let part = message.attachments().nth(index)?;
+    Some(part.contents().to_vec())
+}
+
+/// Every plain address of an address header (groups are flattened).
+fn addresses(list: &mail_parser::Address<'_>) -> Vec<Address> {
+    list.iter()
+        .filter_map(|a| {
+            Some(Address {
+                name: a.name().map(str::to_string),
+                addr: a.address()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// `<a> <b>` from a header holding message ids (stored without brackets
+/// by mail-parser). `None` when the header is missing or empty.
+fn id_list(value: &mail_parser::HeaderValue<'_>) -> Option<String> {
+    let ids = value.as_text_list()?;
+    let joined = ids
+        .iter()
+        .map(|id| format!("<{id}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// The message's text: its text/plain parts if it has any, else its HTML
+/// parts converted to text.
+fn readable_text(message: &mail_parser::Message<'_>) -> String {
+    let parts: Vec<&mail_parser::MessagePart<'_>> = message
+        .text_body
+        .iter()
+        .filter_map(|&id| message.part(id))
+        .collect();
+    let plain: Vec<&str> = parts
+        .iter()
+        .filter(|part| !part.is_text_html())
+        .filter_map(|part| part.text_contents())
+        .collect();
+    if !plain.is_empty() {
+        return plain.join("\n\n");
+    }
+    message
+        .html_body
+        .iter()
+        .filter_map(|&id| message.part(id))
+        .filter_map(|part| part.text_contents())
+        .map(html_to_text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// HTML to readable text, entirely offline.
+fn html_to_text(html: &str) -> String {
+    html2text::from_read(html.as_bytes(), HTML_TEXT_WIDTH).unwrap_or_default()
+}
+
+/// LF line ends, no trailing spaces, at most one blank line in a row, no
+/// blank lines at the start or the end.
+fn normalize_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0;
+    for line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank_run += 1;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(if blank_run > 0 { "\n\n" } else { "\n" });
+        }
+        blank_run = 0;
+        out.push_str(line);
+    }
+    out
+}
+
+/// `type/subtype` of a part, `application/octet-stream` if unknown.
+fn mime_type(part: &mail_parser::MessagePart<'_>) -> String {
+    match part.content_type() {
+        Some(ct) => match ct.subtype() {
+            Some(sub) => format!("{}/{}", ct.ctype(), sub).to_lowercase(),
+            None => ct.ctype().to_lowercase(),
+        },
+        None => "application/octet-stream".to_string(),
+    }
 }
 
 /// Guesses the role of a folder from its SPECIAL-USE attributes, then
@@ -177,5 +363,157 @@ Content-Type: multipart/Mixed; boundary=x
     #[test]
     fn unknown_is_other() {
         assert_eq!(detect_role("Factures", &[]), FolderRole::Other);
+    }
+
+    const PLAIN: &str = "From: \"Marie D.\" <marie@ex.com>\r\n\
+To: Paul <paul@ex.com>, zoe@ex.com\r\n\
+Cc: chef@ex.com\r\n\
+Reply-To: equipe@ex.com\r\n\
+Subject: =?UTF-8?B?w4l0w6k=?=\r\n\
+Date: Mon, 26 Oct 2026 07:33:20 +0000\r\n\
+Message-ID: <abc@ex.com>\r\n\
+In-Reply-To: <parent@ex.com>\r\n\
+References: <root@ex.com> <parent@ex.com>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Bonjour,   \r\n\
+\r\n\
+\r\n\
+\r\n\
+On se voit jeudi.\r\n\
+\r\n";
+
+    #[test]
+    fn plain_message_headers_and_text() {
+        let body = parse_body(PLAIN.as_bytes());
+        assert_eq!(
+            body.from,
+            Some(Address {
+                name: Some("Marie D.".into()),
+                addr: "marie@ex.com".into()
+            })
+        );
+        let to: Vec<&str> = body.to.iter().map(|a| a.addr.as_str()).collect();
+        assert_eq!(to, vec!["paul@ex.com", "zoe@ex.com"]);
+        assert_eq!(body.to[0].name.as_deref(), Some("Paul"));
+        assert_eq!(body.cc[0].addr, "chef@ex.com");
+        assert_eq!(body.reply_to[0].addr, "equipe@ex.com");
+        assert_eq!(body.subject, "Été");
+        assert_eq!(body.date, 1_793_000_000);
+        assert_eq!(body.message_id.as_deref(), Some("<abc@ex.com>"));
+        assert_eq!(
+            body.references.as_deref(),
+            Some("<root@ex.com> <parent@ex.com>")
+        );
+        // CRLF gone, trailing spaces trimmed, blank lines collapsed.
+        assert_eq!(body.text, "Bonjour,\n\nOn se voit jeudi.");
+        assert!(body.attachments.is_empty());
+    }
+
+    #[test]
+    fn in_reply_to_is_used_without_references() {
+        let raw = "From: a@b.c\r\nIn-Reply-To: <parent@ex.com>\r\n\r\nok\r\n";
+        let body = parse_body(raw.as_bytes());
+        assert_eq!(body.references.as_deref(), Some("<parent@ex.com>"));
+        let raw = "From: a@b.c\r\n\r\nok\r\n";
+        assert_eq!(parse_body(raw.as_bytes()).references, None);
+    }
+
+    #[test]
+    fn html_only_message_is_converted_to_text() {
+        let raw = "From: a@b.c\r\n\
+Subject: html\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<html><head><style>p { color: red }</style></head><body>\
+<p>Bonjour <b>Paul</b>,</p><p>Voici la <a href=\"https://ex.com/f\">facture</a>.</p>\
+<img src=\"https://tracker.example/pixel.gif\"></body></html>\r\n";
+        let body = parse_body(raw.as_bytes());
+        assert!(body.text.contains("Bonjour"), "{}", body.text);
+        assert!(body.text.contains("Paul"), "{}", body.text);
+        assert!(body.text.contains("facture"), "{}", body.text);
+        assert!(!body.text.contains("<p>"), "{}", body.text);
+        assert!(!body.text.contains("color: red"), "{}", body.text);
+    }
+
+    #[test]
+    fn alternative_prefers_the_plain_part() {
+        let raw = "From: a@b.c\r\n\
+Content-Type: multipart/alternative; boundary=\"alt\"\r\n\
+\r\n\
+--alt\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Version texte\r\n\
+--alt\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>Version <b>HTML</b></p>\r\n\
+--alt--\r\n";
+        let body = parse_body(raw.as_bytes());
+        assert_eq!(body.text, "Version texte");
+        assert!(body.attachments.is_empty());
+    }
+
+    const MIXED_WITH_PDF: &str = "From: a@b.c\r\n\
+Subject: Facture\r\n\
+Content-Type: multipart/mixed; boundary=\"mix\"\r\n\
+\r\n\
+--mix\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Ci-joint la facture.\r\n\
+--mix\r\n\
+Content-Type: application/pdf; name=\"facture.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"facture.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+JVBERi0xLjQKJcOkw7zDtsOfCg==\r\n\
+--mix--\r\n";
+
+    #[test]
+    fn mixed_message_lists_its_pdf_attachment() {
+        let body = parse_body(MIXED_WITH_PDF.as_bytes());
+        assert_eq!(body.text, "Ci-joint la facture.");
+        let pdf_bytes = b"%PDF-1.4\n%\xc3\xa4\xc3\xbc\xc3\xb6\xc3\x9f\n";
+        assert_eq!(
+            body.attachments,
+            vec![Attachment {
+                name: "facture.pdf".into(),
+                mime: "application/pdf".into(),
+                size: pdf_bytes.len(),
+                index: 0,
+            }]
+        );
+        assert_eq!(
+            attachment_data(MIXED_WITH_PDF.as_bytes(), 0).as_deref(),
+            Some(&pdf_bytes[..])
+        );
+        assert_eq!(attachment_data(MIXED_WITH_PDF.as_bytes(), 1), None);
+    }
+
+    #[test]
+    fn garbage_body_does_not_panic() {
+        for raw in [
+            &[0xff, 0xfe, 0x00, 0x80][..],
+            b"",
+            b"\r\n\r\n",
+            b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n--x",
+            b"Content-Type: text/html\r\n\r\n<<<</p></div>&#xffffff;",
+        ] {
+            let body = parse_body(raw);
+            assert!(body.attachments.len() <= 1);
+            let _ = attachment_data(raw, 0);
+        }
+        assert_eq!(parse_body(b"").subject, "(sans objet)");
+    }
+
+    #[test]
+    fn normalize_text_collapses_blank_lines() {
+        assert_eq!(
+            normalize_text("\r\n\r\na  \r\n\r\n\r\n\r\nb\rc\n\n"),
+            "a\n\nb\nc"
+        );
+        assert_eq!(normalize_text("  indenté\n> cité"), "  indenté\n> cité");
     }
 }
