@@ -241,7 +241,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::view::add_account::Field;
-    use avero_core::secrets::MemorySecrets;
+    use avero_core::secrets::{MemorySecrets, SecretError};
     use avero_core::{NewAccount, NewMessage, ServerConfig};
 
     /// Adds an account with an inbox holding `count` messages.
@@ -516,5 +516,35 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// A keyring that refuses to store anything.
+    struct BrokenSecrets;
+
+    impl SecretStore for BrokenSecrets {
+        fn get(&self, _: AccountId) -> Result<Option<String>, SecretError> {
+            Ok(None)
+        }
+        fn set(&self, _: AccountId, _: &str) -> Result<(), SecretError> {
+            Err(SecretError::Keyring(keyring::Error::NoStorageAccess(
+                "test".into(),
+            )))
+        }
+        fn delete(&self, _: AccountId) -> Result<(), SecretError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn secret_store_failure_keeps_account_and_records_error() {
+        let store = Store::open_in_memory().unwrap();
+        let (mut app, _task) = App::new(store, Box::new(BrokenSecrets), PathBuf::new());
+        fill_form(&mut app, "993");
+        let _ = app.update(Message::AddAccountSubmitted);
+        assert_eq!(app.accounts.len(), 1);
+        assert!(app.form.is_none());
+        assert!(app.syncing.is_empty());
+        let message = app.errors.get(&app.accounts[0].id).expect("error recorded");
+        assert!(message.starts_with("Coffre-fort inaccessible"), "{message}");
     }
 }

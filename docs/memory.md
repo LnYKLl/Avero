@@ -5,7 +5,7 @@ Cible : moins de 50 Mo au repos avec 4 comptes (objectif mesuré, pas une barri�
 ## Mesure du 2026-10-28 (0 compte)
 
 - OS : Windows 11 Pro, build `cargo build --release -p avero-app`.
-- Comptes : 0, base vide (aucun mail). Aucun compte réel n'est disponible sur cette machine.
+- Comptes : 0, base présumée vide (~4 Ko). Aucun compte réel n'est disponible sur cette machine.
 - Méthode : lancement de `avero-app.exe`, 60 s d'inactivité, puis lecture de
   `Process.PrivateMemorySize64` (mémoire privée engagée) et `Process.WorkingSet64`.
   Deux exécutions ont donné les mêmes valeurs à 3 % près.
@@ -23,4 +23,4 @@ Constat : le rendu GPU (wgpu) coûte à lui seul environ 130 à 190 Mo ; c'est l
 
 ## À faire
 
-La mesure avec 4 comptes synchronisés (et leurs mails) reste à faire.
+4 comptes à mesurer : mesure à faire avec 4 comptes réels synchronisés.
