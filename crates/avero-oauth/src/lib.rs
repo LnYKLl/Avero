@@ -174,6 +174,7 @@ pub async fn refresh(
 
 async fn post_token(provider: Provider, form: &[(&str, &str)]) -> Result<Tokens, OAuthError> {
     let network = |e: reqwest::Error| OAuthError::Network(e.without_url().to_string());
+    use_ring_crypto();
     let http = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
@@ -236,6 +237,14 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Makes rustls use `ring`, like the IMAP and SMTP code, so the whole
+/// app has a single crypto backend (`aws-lc-rs` needs a C toolchain on
+/// some platforms). Installing twice is harmless: the second call fails
+/// and is ignored.
+fn use_ring_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 #[cfg(test)]

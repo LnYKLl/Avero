@@ -110,6 +110,7 @@ pub async fn discover(email: &str) -> Result<ProviderConfig, DiscoverError> {
         return Ok(config);
     }
 
+    use_ring_crypto();
     if let Ok(client) = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build() {
         let urls = [
             format!("https://autoconfig.thunderbird.net/v1.1/{domain}"),
@@ -163,6 +164,14 @@ fn guess(domain: &str) -> ProviderConfig {
         auth: vec![AuthMethod::Password],
         password_help: None,
     }
+}
+
+/// Makes rustls use `ring`, like the IMAP and SMTP code, so the whole
+/// app has a single crypto backend (`aws-lc-rs` needs a C toolchain on
+/// some platforms). Installing twice is harmless: the second call fails
+/// and is ignored.
+fn use_ring_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 #[cfg(test)]
