@@ -1,23 +1,73 @@
 # Configurer la connexion OAuth (Google et Microsoft)
 
 Avero connecte les comptes Gmail et Outlook par le navigateur (OAuth2, flux
-« application de bureau » avec redirection locale et PKCE). Pour cela, le
-responsable du projet doit enregistrer Avero auprès de Google et de Microsoft
-et fournir les identifiants client obtenus.
+« application de bureau » avec redirection locale et PKCE). Google et
+Microsoft exigent que chaque application ait son **propre identifiant
+client**, créé par son propriétaire dans leur console avec son compte : Avero
+ne peut pas en livrer un tout fait.
 
 Ces identifiants ne sont pas des secrets : pour une application de bureau, ils
-sont de toute façon embarqués dans le programme. Les jetons des utilisateurs,
-eux, ne quittent jamais la machine (le jeton de rafraîchissement va dans le
-trousseau du système).
+sont de toute façon embarqués dans le programme (Google le précise aussi pour
+le « code secret » d'un client de bureau). Avero ne les écrit jamais dans un
+journal et les masque à l'écran. Les jetons des utilisateurs, eux, ne quittent
+jamais la machine (le jeton de rafraîchissement va dans le trousseau du
+système).
 
-Sans identifiant configuré, le bouton correspondant reste indisponible et
-indique pourquoi ; le mot de passe d'application reste possible pour Gmail.
+## L'assistant intégré (recommandé)
+
+La première fois que vous cliquez sur « Continuer avec Google » (ou que vous
+saisissez une adresse Gmail) sans identifiant configuré, Avero ouvre
+l'assistant **« Configurer la connexion Google »** :
+
+![Assistant de configuration Google](screenshots/google-setup.png)
+
+1. Chaque étape a un bouton qui ouvre la bonne page de la console Google
+   Cloud : créer le projet, activer l'API Gmail, configurer l'écran de
+   consentement (audience « Externe », vous comme utilisateur test), ajouter
+   le champ d'application `https://mail.google.com/` (bouton « Copier le
+   champ »), créer l'ID client de type « Application de bureau ».
+2. Collez l'**ID client** et le **code secret du client** à droite. Avero
+   vérifie leur forme pendant la saisie (un ID Google se termine par
+   `.apps.googleusercontent.com`).
+3. « Enregistrer et se connecter » écrit `oauth.json` puis ouvre aussitôt la
+   connexion Google dans le navigateur.
+
+Comptez environ 5 minutes, une seule fois : ensuite, chaque compte Gmail se
+connecte en un clic. « Utiliser plutôt un mot de passe d'application » reste
+possible.
+
+Pour Microsoft, l'assistant « Configurer la connexion Microsoft » fait de
+même : inscription de l'application dans Microsoft Entra (redirection
+`http://localhost`, bouton « Copier l'adresse »), clients publics, puis les
+autorisations `IMAP.AccessAsUser.All`, `SMTP.Send` et `offline_access`. Seul
+l'**ID d'application (client)** est demandé.
+
+Les identifiants se consultent (masqués), se modifient ou se retirent dans
+**Réglages → Connexion Google / Microsoft**.
+
+En cas d'identifiant erroné, Avero l'explique au lieu d'afficher le code
+brut : Google répond `invalid_client` (« The OAuth client was not found »)
+pour un ID inconnu ou un mauvais code secret, Microsoft `unauthorized_client`
+(AADSTS700016) pour une application inconnue. Ces réponses sont vérifiées
+contre les vrais serveurs par `crates/avero-oauth/tests/live_endpoints.rs` :
+
+```sh
+cargo test -p avero-oauth --test live_endpoints -- --ignored --test-threads 1
+```
+
+Pour voir l'assistant sans rien enregistrer : `AVERO_DEMO=google-setup` (ou
+`microsoft-setup`).
+
+Les sections suivantes détaillent les mêmes étapes à la main, et les autres
+façons de fournir les identifiants (par exemple pour publier une version
+d'Avero qui les embarque).
 
 ## Où mettre les identifiants
 
 Avero cherche les identifiants dans cet ordre :
 
-1. **Au lancement**, dans le fichier `oauth.json` du dossier de configuration :
+1. **À l'exécution**, dans le fichier `oauth.json` du dossier de configuration
+   (c'est là que l'assistant les enregistre ; relu à chaque connexion) :
 
    ```json
    {

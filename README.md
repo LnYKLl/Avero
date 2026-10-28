@@ -43,14 +43,16 @@ $env:AVERO_DEMO = "1"; cargo run --release -p avero-app
 AVERO_DEMO=1 cargo run --release -p avero-app
 ```
 
-Demo mode uses an in-memory database with three made-up accounts and about forty French messages. Nothing touches the network or your real data. `AVERO_DEMO=empty` shows the welcome screen. `AVERO_THEME=dark` (or `light`) forces a theme without saving it.
+Demo mode uses an in-memory database with three made-up accounts and about forty French messages. Nothing touches the network or your real data. `AVERO_DEMO=empty` shows the welcome screen; `AVERO_DEMO=google-setup` (or `microsoft-setup`) opens the connection assistant (nothing is saved). `AVERO_THEME=dark` (or `light`) forces a theme without saving it.
 
 ### Gmail
 
-- **With the Google button**: this needs an OAuth client id compiled in or put in `oauth.json`; see [docs/oauth-setup.md](docs/oauth-setup.md). Without one, the app says so and offers the app-password path instead.
+- **With the Google button**: Google requires every app to have its own OAuth client, created by its owner in the Google Cloud console, so Avero cannot ship one. The first time, Avero opens a built-in assistant ("Configurer la connexion Google", about 5 minutes, once): each step has a button that opens the right console page, then you paste the client id and secret and Avero signs you in straight away. After that, every Gmail account is one click. The ids can be viewed (masked), changed or removed in Settings → "Connexion Google / Microsoft". Details and the manual way (`oauth.json`, compile-time variables): [docs/oauth-setup.md](docs/oauth-setup.md) (French).
+
+  ![Google connection assistant](docs/screenshots/google-setup.png)
 - **With an app password**: turn on 2-step verification on your Google account, create an app password at https://myaccount.google.com/apppasswords, and paste it in Avero (spaces are removed automatically).
 
-Outlook.com / Hotmail accounts only work with the Microsoft button, which also needs a client id (same document).
+Outlook.com / Hotmail accounts only work with the Microsoft button, which also needs a client id: the same assistant guides you through the Microsoft Entra app registration (only the application id is needed).
 
 ## Where files are kept
 
@@ -61,7 +63,7 @@ Removing an account in the settings deletes its local messages and its keyring e
 
 ## Known limitations
 
-- The V1 interface has mostly been exercised with the demo data and automated tests; testing against real servers is still limited. OAuth (Google, Microsoft) is implemented but needs a registered client id to be tried.
+- The V1 interface has mostly been exercised with the demo data and automated tests; testing against real servers is still limited. OAuth (Google, Microsoft) is implemented and its requests are checked against the real Google and Microsoft endpoints (ignored tests in `crates/avero-oauth/tests/live_endpoints.rs`), but a complete sign-in needs your own client id (in-app assistant) and is not covered by automated tests.
 - Gmail: "Archiver" moves the message to "All Mail", which Avero does not sync (it duplicates every other folder), so archived Gmail messages leave Avero's view. The "Archives" tab is hidden when no account has a real archive folder.
 - Only the special folders are synced (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille); your own folders and Gmail labels are not shown yet.
 - The first sync of a folder fetches its 2000 most recent messages; older ones are not downloaded.
