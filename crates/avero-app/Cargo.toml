@@ -9,8 +9,15 @@ avero-core = { path = "../avero-core" }
 avero-sync = { path = "../avero-sync" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 directories = "6"
-iced = "0.14"
+# iced's default features minus `wgpu`: software rendering (tiny-skia) by
+# default, which uses far less memory. See docs/memory.md.
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "x11", "wayland"] }
 tokio = { version = "1.54", features = ["rt", "sync", "net", "time"] }
+
+[features]
+# `cargo build --features gpu` adds the GPU renderer (wgpu). iced then
+# prefers it and falls back to tiny-skia if no GPU is available.
+gpu = ["iced/wgpu"]
 
 [dev-dependencies]
 futures = "0.3.34"
