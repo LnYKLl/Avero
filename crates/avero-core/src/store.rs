@@ -200,6 +200,18 @@ impl Store {
         Ok(())
     }
 
+    /// Moves the folder's last seen UID up to `uid` (it never goes down).
+    /// Used when the server's highest UIDs were deleted: we know there is
+    /// nothing below `uid` left to fetch.
+    pub fn set_last_seen_uid(&self, folder: FolderId, uid: u32) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET last_seen_uid = MAX(COALESCE(last_seen_uid, 0), ?1)
+             WHERE id = ?2",
+            params![uid, folder.0],
+        )?;
+        Ok(())
+    }
+
     /// The unified list for one folder role: copies of the same message
     /// (same Message-ID) are merged into one item, newest first.
     pub fn unified(
@@ -421,6 +433,19 @@ mod tests {
         assert_eq!(items.len(), 3);
         let folder = &s.folders(a).unwrap()[0];
         assert_eq!(folder.last_seen_uid, Some(3));
+    }
+
+    #[test]
+    fn set_last_seen_uid_keeps_the_highest() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let f = s.upsert_folder(a, "INBOX", FolderRole::Inbox).unwrap();
+        s.set_last_seen_uid(f.id, 10).unwrap();
+        assert_eq!(s.folders(a).unwrap()[0].last_seen_uid, Some(10));
+        s.set_last_seen_uid(f.id, 4).unwrap();
+        assert_eq!(s.folders(a).unwrap()[0].last_seen_uid, Some(10));
+        s.set_last_seen_uid(f.id, 25).unwrap();
+        assert_eq!(s.folders(a).unwrap()[0].last_seen_uid, Some(25));
     }
 
     #[test]

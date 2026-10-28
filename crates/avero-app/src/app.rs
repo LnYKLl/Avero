@@ -357,6 +357,7 @@ mod tests {
         let report = SyncReport {
             folders: 1,
             new_messages: 1,
+            skipped_folders: 0,
         };
         let _ = app.update(Message::SyncFinished(a, Ok(report)));
         assert!(!app.errors.contains_key(&a));
