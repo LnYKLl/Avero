@@ -80,14 +80,19 @@ Removing an account in the settings deletes its local messages and its keyring e
 
 ## Known limitations
 
-- The V1 interface has mostly been exercised with the demo data and automated tests; testing against real servers is still limited. OAuth (Google, Microsoft) is implemented and its requests are checked against the real Google and Microsoft endpoints (ignored tests in `crates/avero-oauth/tests/live_endpoints.rs`), but a complete sign-in needs your own client id (in-app assistant) and is not covered by automated tests.
+- Testing against real servers is still limited: the interface has mostly been exercised with the demo data and automated tests. OAuth (Google, Microsoft) is implemented and its requests are checked against the real Google and Microsoft endpoints (ignored tests in `crates/avero-oauth/tests/live_endpoints.rs`), but a complete sign-in needs your own client id (in-app assistant) and is not covered by automated tests.
 - Gmail: "Archiver" moves the message to "All Mail", which Avero does not sync (it duplicates every other folder), so archived Gmail messages leave Avero's view. The "Archives" tab is hidden when no account has a real archive folder.
 - Only the special folders are synced (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille); your own folders and Gmail labels are not shown yet.
 - The first sync of a folder fetches its 2000 most recent messages; older ones are not downloaded.
-- Only the inbox has its read flags and deletions resynchronised from the server; other folders only receive new messages.
+- Only the inbox has its read flags, stars and deletions resynchronised from the server; other folders only receive new messages.
 - Messages are shown as plain text; there is no HTML view and inline images are not displayed.
-- No drafts saving, no signatures, no threads (conversation view), no notifications yet.
-- Search covers only bodies already downloaded (the 30 newest inbox messages, plus every message you opened).
+- Rules, "Plus tard" reminders, scheduled sending and the spam filter live on this computer: they only act while Avero runs (a scheduled mail due while Avero was closed leaves at the next start, marked as late). Rules act on new inbox mail, read or not, but not on the first fill of an account (use "Appliquer maintenant").
+- New-mail notifications only show the sender and the subject, never for mail already read elsewhere nor for the first fill of an account. With the portable zip on Windows they appear under the name "Windows PowerShell" (see "Installation").
+- After an update from V1, the messages already stored get their threading and mailing-list headers and their size fetched again a few thousand at a time per sync: on a big mailbox, conversations, tabs and "Grand nettoyage" sizes are complete after a few syncs.
+- On a server without UIDPLUS, the previous copies of a draft are only marked deleted (other clients may show them crossed out until the folder is expunged), so that Avero never expunges what another client marked deleted.
+- Local search covers only the bodies already downloaded (the 30 newest inbox messages, plus every message you opened); "Chercher aussi sur le serveur" asks the servers for the rest.
+- One Avero at a time: starting it again brings the open window to the front.
+- No calendar, contacts or PGP; the Windows files are not signed and there is no macOS or Linux installer yet.
 
 ## Tests
 
