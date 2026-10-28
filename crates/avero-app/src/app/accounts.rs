@@ -8,7 +8,7 @@ use crate::auth::{self, OAuthGrant};
 use crate::background::{self, LoginError};
 use crate::notify::{self, Notice};
 use crate::worker::{AccountError, ErrorKind, Event, Job};
-use avero_core::store::StoreError;
+use avero_core::store::{Store, StoreError};
 use avero_core::{AccountFilter, AccountId, Credentials, NewAccount, ServerConfig};
 use avero_oauth::Provider;
 use avero_sync::sync::Arrival;
@@ -680,6 +680,7 @@ impl App {
                 Task::none()
             }
             AccountMsg::ConfirmDelete => self.delete_account(),
+            AccountMsg::Deleted(id, deleted) => self.account_deleted(id, deleted),
             AccountMsg::Reconnect(id) => self.reconnect(id),
             AccountMsg::Reconnected(id, result) => self.reconnected(id, result),
             AccountMsg::OpenServers(id) => {
@@ -924,27 +925,64 @@ impl App {
         Task::batch([store.chain(sync), toast])
     }
 
+    /// "Supprimer" confirmed. With a database file, its rows (tens of
+    /// thousands of messages) are deleted on a thread of its own, after
+    /// the account's worker stopped: the window goes on meanwhile, and
+    /// the account leaves it once that is done (see `account_deleted`).
+    /// The demo's database in memory is changed at once.
     fn delete_account(&mut self) -> Task<Message> {
         let Some(Overlay::ConfirmDelete(id)) = self.overlay else {
             return Task::none();
         };
         self.overlay = None;
-        if let Err(e) = self.store.delete_account(id) {
-            return self.toast(format!("Erreur de la base locale : {e}"), true);
-        }
-        if let Backend::Live {
-            workers, secrets, ..
+        let Backend::Live {
+            workers,
+            db_path,
+            secrets,
+            ..
         } = &mut self.backend
-        {
-            match workers.remove(&id) {
-                Some(worker) => worker.send(Job::Shutdown {
-                    delete_secret: true,
-                }),
-                None => {
-                    let secrets = secrets.clone();
-                    std::thread::spawn(move || secrets.delete(id));
-                }
+        else {
+            let deleted = self.store.delete_account(id).map_err(|e| e.to_string());
+            return self.account_deleted(id, deleted);
+        };
+        // The worker deletes the secret once its threads are done with it
+        // (a token refresh could store a new one).
+        match workers.remove(&id) {
+            Some(worker) => worker.send(Job::Shutdown {
+                delete_secret: true,
+            }),
+            None => {
+                let secrets = secrets.clone();
+                std::thread::spawn(move || secrets.delete(id));
             }
+        }
+        let path = db_path.clone();
+        let deleting = Task::perform(delete_aside(path, id), move |deleted| {
+            Message::Account(AccountMsg::Deleted(id, deleted))
+        });
+        Task::batch([
+            deleting,
+            self.toast("Suppression du compte en cours…", false),
+        ])
+    }
+
+    /// The rows of account `id` were deleted (or not): it leaves the
+    /// window. On failure it stays, with a worker again (its secret is
+    /// gone: it asks for it).
+    pub(super) fn account_deleted(
+        &mut self,
+        id: AccountId,
+        deleted: Result<(), String>,
+    ) -> Task<Message> {
+        if let Err(e) = deleted {
+            let stopped = matches!(&self.backend,
+                Backend::Live { workers, .. } if !workers.contains_key(&id));
+            let restart = match self.account(id).cloned() {
+                Some(account) if stopped => self.start_worker(&account),
+                _ => Task::none(),
+            };
+            let toast = self.toast(format!("Erreur de la base locale : {e}"), true);
+            return Task::batch([restart, toast]);
         }
         self.accounts.retain(|a| a.id != id);
         self.status.remove(&id);
@@ -1059,4 +1097,19 @@ pub fn login_message(error: &LoginError, app_password: bool) -> String {
         ),
         LoginError::Other(detail) => format!("Connexion impossible : {detail}"),
     }
+}
+
+/// Deletes the rows of an account on a thread of its own, with its own
+/// connection to the database.
+async fn delete_aside(path: std::path::PathBuf, id: AccountId) -> Result<(), String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = Store::open(&path)
+            .and_then(|store| store.delete_account(id))
+            .map_err(|e| e.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
+        .await
+        .unwrap_or_else(|_| Err("la suppression s'est arrêtée".to_string()))
 }

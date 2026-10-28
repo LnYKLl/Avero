@@ -9,11 +9,95 @@ use avero_core::{
     AccountFilter, AccountId, Category, FolderRole, Listing, MessageRef, UnifiedItem,
 };
 
+use avero_core::store::Store;
 use iced::Task;
 use iced::widget::text_editor;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+
+/// The numbers of the side bar and of the inbox's tabs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Unread items of each account's inbox.
+    unread: HashMap<AccountId, usize>,
+    snoozed: usize,
+    drafts: usize,
+    /// Unread items of each tab (none when the tabs are off).
+    tabs: HashMap<Category, usize>,
+}
+
+/// What `Counters` depend on, taken from the window's state.
+#[derive(Debug, Clone)]
+pub(super) struct CounterQuery {
+    accounts: Vec<AccountId>,
+    /// "Regrouper les conversations".
+    threads: bool,
+    /// The space shown (every account when none).
+    space: AccountFilter,
+    /// The accounts the list shows (the space, or one account).
+    scope: AccountFilter,
+    tabs: bool,
+}
+
+impl CounterQuery {
+    /// Counts on `store`; a count that fails gives 0.
+    fn count(&self, store: &Store) -> Counters {
+        let unread = self
+            .accounts
+            .iter()
+            .map(|&id| {
+                let only = AccountFilter::Only(id);
+                let count = if self.threads {
+                    store.unread_threads(FolderRole::Inbox, only)
+                } else {
+                    store.unread_count(FolderRole::Inbox, only)
+                };
+                (id, count.unwrap_or(0))
+            })
+            .collect();
+        let tabs = if self.tabs {
+            Category::ALL
+                .into_iter()
+                .map(|category| {
+                    let count =
+                        store.list_unread(&Listing::Tab(category), self.scope, self.threads);
+                    (category, count.unwrap_or(0))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        Counters {
+            unread,
+            snoozed: store
+                .list_count(&Listing::Snoozed, self.space, self.threads)
+                .unwrap_or(0),
+            drafts: store
+                .list_count(
+                    &Listing::Folder(FolderRole::Drafts),
+                    self.space,
+                    self.threads,
+                )
+                .unwrap_or(0),
+            tabs,
+        }
+    }
+}
+
+/// Counts on a thread of its own, with its own connection to the
+/// database, so that the window never waits for it. `None` if the
+/// database could not be opened (the numbers shown stay).
+async fn count_aside(path: PathBuf, query: CounterQuery) -> Option<Counters> {
+    let (sender, receiver) = oneshot::channel();
+    std::thread::spawn(move || {
+        let counted = Store::open(&path).ok().map(|store| query.count(&store));
+        let _ = sender.send(counted);
+    });
+    receiver.await.ok().flatten()
+}
 
 /// Delay between the last key typed in the search field and the search.
 const SEARCH_DELAY: Duration = Duration::from_millis(250);
@@ -211,6 +295,9 @@ impl App {
         })
     }
 
+    /// Reads the side bar's numbers again. With a database file, they are
+    /// counted aside (see `count_aside`) once the current message is
+    /// handled; with the demo's database in memory, at once.
     fn refresh_unread(&mut self) {
         self.trash_accounts = self
             .accounts
@@ -229,47 +316,54 @@ impl App {
                 Ok(Some(_))
             )
         });
-        self.unread = self
-            .accounts
-            .iter()
-            .map(|a| {
-                let only = AccountFilter::Only(a.id);
-                let count = if self.settings.group_threads {
-                    self.store.unread_threads(FolderRole::Inbox, only)
-                } else {
-                    self.store.unread_count(FolderRole::Inbox, only)
-                };
-                (a.id, count.unwrap_or(0))
-            })
-            .collect();
-        let space = match self.space {
-            Some(id) => AccountFilter::Space(id),
-            None => AccountFilter::All,
+        let query = CounterQuery {
+            accounts: self.accounts.iter().map(|a| a.id).collect(),
+            threads: self.settings.group_threads,
+            space: match self.space {
+                Some(id) => AccountFilter::Space(id),
+                None => AccountFilter::All,
+            },
+            scope: self.scope(),
+            tabs: self.settings.inbox_tabs,
         };
-        let threads = self.settings.group_threads;
-        self.snoozed_count = self
-            .store
-            .list_count(&Listing::Snoozed, space, threads)
-            .unwrap_or(0);
-        self.drafts_count = self
-            .store
-            .list_count(&Listing::Folder(FolderRole::Drafts), space, threads)
-            .unwrap_or(0);
-        self.tab_unread = if self.settings.inbox_tabs {
-            Category::ALL
-                .into_iter()
-                .map(|category| {
-                    let count = self.store.list_unread(
-                        &Listing::Tab(category),
-                        self.scope(),
-                        self.settings.group_threads,
-                    );
-                    (category, count.unwrap_or(0))
-                })
-                .collect()
-        } else {
-            Default::default()
+        match &self.backend {
+            super::Backend::Live { .. } => self.counters_wanted = Some(query),
+            super::Backend::Demo => {
+                let counted = query.count(&self.store);
+                self.show_counters(counted);
+            }
+        }
+    }
+
+    /// Starts counting aside what `refresh_unread` asked for, if anything.
+    pub(super) fn count_wanted(&mut self) -> Task<Message> {
+        let Some(query) = self.counters_wanted.take() else {
+            return Task::none();
         };
+        let super::Backend::Live { db_path, .. } = &self.backend else {
+            return Task::none();
+        };
+        self.counters_generation += 1;
+        let generation = self.counters_generation;
+        Task::perform(count_aside(db_path.clone(), query), move |counted| {
+            Message::Counted(generation, counted)
+        })
+    }
+
+    /// Numbers counted aside: shown unless newer ones are on their way.
+    pub(super) fn counted(&mut self, generation: u64, counted: Option<Counters>) {
+        if generation == self.counters_generation
+            && let Some(counted) = counted
+        {
+            self.show_counters(counted);
+        }
+    }
+
+    fn show_counters(&mut self, counted: Counters) {
+        self.unread = counted.unread;
+        self.snoozed_count = counted.snoozed;
+        self.drafts_count = counted.drafts;
+        self.tab_unread = counted.tabs;
     }
 
     /// Index of the selected item in the list.
@@ -901,4 +995,50 @@ pub fn by_account(refs: Vec<MessageRef>) -> BTreeMap<AccountId, Vec<MessageRef>>
         groups.entry(r.account_id).or_default().push(r);
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{add_account_with_mail, app_with};
+
+    #[tokio::test]
+    async fn counters_counted_aside_are_those_of_the_window() {
+        let path = std::env::temp_dir().join(format!("avero-count-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let a = add_account_with_mail(&store, "a@x.fr", 3);
+        let query = CounterQuery {
+            accounts: vec![a],
+            threads: true,
+            space: AccountFilter::All,
+            scope: AccountFilter::All,
+            tabs: true,
+        };
+        let here = query.count(&store);
+        assert_eq!(here.unread[&a], 3);
+        assert_eq!(count_aside(path.clone(), query).await, Some(here));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_the_newest_count_is_shown() {
+        let mut app = app_with(|s| {
+            add_account_with_mail(s, "a@x.fr", 2);
+        });
+        let a = app.accounts[0].id;
+        assert_eq!(app.unread[&a], 2);
+        let counted = |n| Counters {
+            unread: HashMap::from([(a, n)]),
+            ..Counters::default()
+        };
+        app.counters_generation = 2;
+        app.counted(1, Some(counted(7)));
+        assert_eq!(app.unread[&a], 2);
+        app.counted(2, None);
+        assert_eq!(app.unread[&a], 2);
+        app.counted(2, Some(counted(5)));
+        assert_eq!(app.unread[&a], 5);
+    }
 }

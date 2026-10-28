@@ -1100,6 +1100,8 @@ fn merged_accounts_secrets_are_erased() {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             "DROP TRIGGER messages_forget_row_keys;
+             DROP INDEX messages_missing_headers;
+             DROP INDEX messages_missing_sizes;
              DROP TABLE space_accounts;
              DROP TABLE spaces;
              DROP TABLE draft_files;

@@ -439,6 +439,9 @@ pub enum Message {
     /// What an account's server found for search number `.0` (see
     /// `App::server_generation`).
     ServerFound(u64, AccountId, Event),
+    /// The side bar's numbers, counted aside (number `.0`; see
+    /// `App::counters_generation`).
+    Counted(u64, Option<mail::Counters>),
 }
 
 /// Messages of the add-account card. `Debug` hides a typed password.
@@ -513,6 +516,8 @@ pub enum AccountMsg {
     PasswordChecked(u64, Result<(), LoginError>),
     AskDelete(AccountId),
     ConfirmDelete,
+    /// The account's rows were deleted (or not), off the UI thread.
+    Deleted(AccountId, Result<(), String>),
     Reconnect(AccountId),
     Reconnected(AccountId, Result<OAuthGrant, String>),
     OpenServers(AccountId),
@@ -542,6 +547,7 @@ impl fmt::Debug for AccountMsg {
             }
             AccountMsg::AskDelete(id) => write!(f, "AskDelete({id:?})"),
             AccountMsg::ConfirmDelete => f.write_str("ConfirmDelete"),
+            AccountMsg::Deleted(id, result) => write!(f, "Deleted({id:?}, {result:?})"),
             AccountMsg::Reconnect(id) => write!(f, "Reconnect({id:?})"),
             AccountMsg::Reconnected(id, result) => write!(f, "Reconnected({id:?}, {result:?})"),
             AccountMsg::OpenServers(id) => write!(f, "OpenServers({id:?})"),
@@ -612,6 +618,11 @@ pub struct App {
     pub(crate) sender: Option<SenderView>,
     /// Unread lines of each tab of the inbox.
     pub(crate) tab_unread: HashMap<Category, usize>,
+    /// Numbers to count aside once the current message is handled (see
+    /// `refresh_unread`).
+    counters_wanted: Option<mail::CounterQuery>,
+    /// Bumped at each count aside: only the newest one is shown.
+    counters_generation: u64,
     pub(crate) filter: AccountFilter,
     /// The spaces, in order, and the one shown (`None`: every account).
     pub(crate) spaces: Vec<Space>,
@@ -745,6 +756,8 @@ impl App {
             tab: Category::Important,
             sender: None,
             tab_unread: HashMap::new(),
+            counters_wanted: None,
+            counters_generation: 0,
             filter: AccountFilter::All,
             spaces: Vec::new(),
             space: None,
@@ -871,7 +884,18 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // The side bar's numbers, if the message changed them.
+        let counting = self.count_wanted();
+        Task::batch([task, counting])
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Counted(generation, counted) => {
+                self.counted(generation, counted);
+                Task::none()
+            }
             Message::SystemTheme(mode) => {
                 self.system_dark = mode == iced::theme::Mode::Dark;
                 self.refresh_theme();
