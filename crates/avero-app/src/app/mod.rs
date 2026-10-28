@@ -231,6 +231,9 @@ pub enum Message {
     Key(keyboard::Key, keyboard::Modifiers),
     ToastExpired(u64),
     OpenUrl(String),
+    /// Puts a value on the clipboard (a scope or redirect URI to paste in
+    /// a provider's console).
+    CopyText(String),
     ThemeChosen(ThemeChoice),
 
     ShowMail,
@@ -284,12 +287,21 @@ pub enum AddMsg {
     SignedIn(u64, Result<OAuthGrant, String>),
     CancelWait,
     Close,
+    /// Shows the OAuth assistant in the open card.
+    ShowSetup(Provider),
+    /// Opens the OAuth assistant alone (settings: change the client).
+    EditClient(Provider),
+    /// "Enregistrer et se connecter" in the assistant.
+    SaveSetup,
+    /// Removes the client saved in `oauth.json` (settings).
+    RemoveClient(Provider),
 }
 
 impl fmt::Debug for AddMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AddMsg::Field(Field::Password, _) => f.write_str("Field(Password, \"***\")"),
+            AddMsg::Field(Field::ClientSecret, _) => f.write_str("Field(ClientSecret, \"***\")"),
             AddMsg::Field(field, value) => write!(f, "Field({field:?}, {value:?})"),
             AddMsg::Open(provider) => write!(f, "Open({provider:?})"),
             AddMsg::SubmitEmail => f.write_str("SubmitEmail"),
@@ -308,6 +320,10 @@ impl fmt::Debug for AddMsg {
             }
             AddMsg::CancelWait => f.write_str("CancelWait"),
             AddMsg::Close => f.write_str("Close"),
+            AddMsg::ShowSetup(provider) => write!(f, "ShowSetup({provider:?})"),
+            AddMsg::EditClient(provider) => write!(f, "EditClient({provider:?})"),
+            AddMsg::SaveSetup => f.write_str("SaveSetup"),
+            AddMsg::RemoveClient(provider) => write!(f, "RemoveClient({provider:?})"),
         }
     }
 }
@@ -362,6 +378,15 @@ impl fmt::Debug for AccountMsg {
     }
 }
 
+/// An OAuth client as the settings show it: never the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientInfo {
+    /// The id shortened (`123456…tent.com`).
+    pub masked_id: String,
+    /// Saved in `oauth.json` (can be removed), not compiled in.
+    pub saved: bool,
+}
+
 /// The window.
 pub struct App {
     pub(crate) store: Store,
@@ -399,6 +424,9 @@ pub struct App {
     pub(crate) overlay: Option<Overlay>,
     /// Stops the browser sign-in in progress.
     oauth_cancel: Option<oneshot::Sender<()>>,
+    /// The OAuth clients configured, shown in the settings (read again
+    /// whenever the assistant saves or removes one).
+    pub(crate) oauth_clients: HashMap<Provider, ClientInfo>,
     pub(crate) toast: Option<Toast>,
     toast_seq: u64,
     /// Angle of the refresh icon while syncing.
@@ -449,10 +477,12 @@ impl App {
             composer: None,
             overlay: None,
             oauth_cancel: None,
+            oauth_clients: HashMap::new(),
             toast: None,
             toast_seq: 0,
             spinner: 0.0,
         };
+        app.read_oauth_clients();
         for account in app.accounts.clone() {
             app.start_worker(&account);
         }
@@ -511,8 +541,19 @@ impl App {
                 Task::none()
             }
             Message::OpenUrl(url) => {
-                let _ = webbrowser::open(&url);
+                if webbrowser::open(&url).is_err() {
+                    // Without a browser the address can still be pasted.
+                    let toast = self.toast(
+                        "Navigateur introuvable : l'adresse a été copiée dans le presse-papiers",
+                        true,
+                    );
+                    return Task::batch([iced::clipboard::write(url), toast]);
+                }
                 Task::none()
+            }
+            Message::CopyText(text) => {
+                let toast = self.toast(format!("Copié : {text}"), false);
+                Task::batch([iced::clipboard::write(text), toast])
             }
             Message::ThemeChosen(choice) => {
                 self.settings.theme = choice;

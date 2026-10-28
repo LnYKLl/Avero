@@ -6,6 +6,7 @@ use crate::icons::{self, Icon, Tone};
 use crate::settings::ThemeChoice;
 use crate::theme::{self, MEDIUM, SEMIBOLD};
 use avero_core::{Account, AuthKind};
+use avero_oauth::Provider;
 use iced::widget::{Column, button, column, container, row, scrollable, space, text, tooltip};
 use iced::{Alignment, Element, Fill};
 
@@ -19,6 +20,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let page = column![
         text("Réglages").size(26).font(SEMIBOLD),
         section("Comptes", accounts(app)),
+        section("Connexion Google / Microsoft", oauth_clients(app)),
         section("Apparence", appearance(app)),
         section("À propos", about()),
     ]
@@ -150,6 +152,101 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
         ),
     ]
     .spacing(12)
+    .padding([14, 18])
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The OAuth clients behind "Continuer avec Google / Microsoft".
+fn oauth_clients(app: &App) -> Element<'_, Message> {
+    let mut list = Column::new();
+    for (index, provider) in [Provider::Google, Provider::Microsoft]
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            list = list.push(hr());
+        }
+        list = list.push(client_row(app, provider));
+    }
+    list.push(hr())
+        .push(
+            container(
+                text(
+                    "Google et Microsoft demandent que chaque application soit enregistrée par \
+                     son propriétaire. L'assistant vous guide une seule fois ; ensuite chaque \
+                     compte se connecte en un clic.",
+                )
+                .size(12)
+                .style(theme::muted),
+            )
+            .padding([12, 18]),
+        )
+        .into()
+}
+
+fn client_row(app: &App, provider: Provider) -> Element<'_, Message> {
+    let name = crate::auth::provider_name(provider);
+    let logo = match provider {
+        Provider::Google => Icon::Google,
+        Provider::Microsoft => Icon::Microsoft,
+    };
+    let info = app.oauth_clients.get(&provider);
+    let status: Element<'_, Message> = match info {
+        Some(info) => row![
+            icons::icon(Icon::Check, 13.0, Tone::Fixed(theme::LIGHT.success)),
+            text(if info.saved {
+                format!("Configurée · {}", info.masked_id)
+            } else {
+                format!("Intégrée à cette version · {}", info.masked_id)
+            })
+            .size(12)
+            .style(theme::muted),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+        None => text(format!(
+            "Non configurée : nécessaire pour « Continuer avec {name} »"
+        ))
+        .size(12)
+        .style(theme::muted)
+        .into(),
+    };
+    let edit_label = if info.is_some() {
+        "Modifier"
+    } else {
+        "Configurer"
+    };
+    let mut actions = row![
+        button(text(edit_label).size(13).font(MEDIUM))
+            .padding([6, 12])
+            .on_press(Message::Add(AddMsg::EditClient(provider)))
+            .style(theme::secondary),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    if info.is_some_and(|i| i.saved) {
+        actions = actions.push(tip(
+            button(icons::icon(Icon::Trash, 17.0, Tone::Danger))
+                .padding(8)
+                .on_press(Message::Add(AddMsg::RemoveClient(provider)))
+                .style(theme::ghost),
+            "Retirer l'identifiant",
+            tooltip::Position::Bottom,
+        ));
+    }
+    row![
+        icons::icon(logo, 20.0, Tone::Original),
+        column![
+            text(format!("Connexion {name}")).size(14).font(SEMIBOLD),
+            status,
+        ]
+        .spacing(3)
+        .width(Fill),
+        actions,
+    ]
+    .spacing(14)
     .padding([14, 18])
     .align_y(Alignment::Center)
     .into()

@@ -477,7 +477,7 @@ impl Worker {
             return Err(AccountError::new(
                 ErrorKind::Other,
                 format!(
-                    "La connexion {} n'est pas configurée dans cette version d'Avero",
+                    "La connexion {} n'est pas configurée (Réglages → Connexion Google / Microsoft)",
                     auth::provider_name(provider)
                 ),
             ));

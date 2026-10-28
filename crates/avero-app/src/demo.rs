@@ -1,6 +1,8 @@
 //! Demo mode (`AVERO_DEMO=1`): an in-memory database with three made-up
 //! accounts and about forty French messages, and no network at all.
-//! `AVERO_DEMO=empty` starts with no account (welcome screen).
+//! `AVERO_DEMO=empty` starts with no account (welcome screen);
+//! `AVERO_DEMO=google-setup` (or `microsoft-setup`) also opens the
+//! connection assistant, as after a click on "Continuer avec Google".
 
 use avero_core::store::Store;
 use avero_core::{AccountId, AuthKind, FolderRole, NewAccount, NewMessage, Security, ServerConfig};
@@ -11,6 +13,8 @@ use chrono::{Local, TimeZone};
 pub enum DemoKind {
     Seeded,
     Empty,
+    /// No account, the OAuth assistant open.
+    Setup(avero_oauth::Provider),
 }
 
 /// Reads the value of `AVERO_DEMO`.
@@ -18,6 +22,12 @@ pub fn from_env_value(value: Option<&str>) -> Option<DemoKind> {
     match value.map(str::trim) {
         None | Some("") | Some("0") => None,
         Some(v) if v.eq_ignore_ascii_case("empty") => Some(DemoKind::Empty),
+        Some(v) if v.eq_ignore_ascii_case("google-setup") => {
+            Some(DemoKind::Setup(avero_oauth::Provider::Google))
+        }
+        Some(v) if v.eq_ignore_ascii_case("microsoft-setup") => {
+            Some(DemoKind::Setup(avero_oauth::Provider::Microsoft))
+        }
         Some(_) => Some(DemoKind::Seeded),
     }
 }
@@ -335,6 +345,10 @@ mod tests {
         assert_eq!(from_env_value(Some("0")), None);
         assert_eq!(from_env_value(Some("1")), Some(DemoKind::Seeded));
         assert_eq!(from_env_value(Some("EMPTY")), Some(DemoKind::Empty));
+        assert_eq!(
+            from_env_value(Some("google-setup")),
+            Some(DemoKind::Setup(avero_oauth::Provider::Google))
+        );
     }
 
     #[test]

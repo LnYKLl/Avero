@@ -557,8 +557,10 @@ fn add_account_flow_checks_login_before_saving() {
     let generation = form(&app).generation;
     let config = avero_autoconfig::known("jean@gmail.com");
     let _ = app.update(Message::Add(AddMsg::Detected(generation, config)));
+    // No OAuth client in demo mode: the assistant first, then the app password.
+    let _ = app.update(Message::Add(AddMsg::UsePassword));
     assert_eq!(form(&app).stage, crate::account_form::Stage::Credentials);
-    assert!(form(&app).shows_password(), "no OAuth client in demo mode");
+    assert!(form(&app).shows_password());
     let _ = app.update(Message::Add(AddMsg::Field(
         Field::Password,
         "abcd efgh ijkl mnop".into(),
@@ -638,12 +640,119 @@ fn duplicate_account_is_refused() {
 }
 
 #[test]
-fn google_button_without_client_explains_why() {
+fn google_button_without_client_opens_the_assistant() {
+    use crate::account_form::Stage;
     let mut app = app_with(|_| {});
     let _ = app.update(Message::Add(AddMsg::Open(Some(Provider::Google))));
-    let note = form(&app).note.clone().unwrap();
-    assert!(note.contains("docs/oauth-setup.md"), "{note}");
-    assert_eq!(form(&app).stage, crate::account_form::Stage::Email);
+    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
+    // The app password stays possible: the address comes first.
+    let _ = app.update(Message::Add(AddMsg::UsePassword));
+    assert_eq!(form(&app).stage, Stage::Email);
+    assert!(form(&app).note.as_deref().unwrap().contains("Gmail"));
+}
+
+#[test]
+fn gmail_address_without_client_opens_the_assistant() {
+    use crate::account_form::Stage;
+    let mut app = app_with(|_| {});
+    let _ = app.update(Message::Add(AddMsg::Open(None)));
+    let _ = app.update(Message::Add(AddMsg::Field(
+        Field::Email,
+        "jean@gmail.com".into(),
+    )));
+    let _ = app.update(Message::Add(AddMsg::SubmitEmail));
+    let generation = form(&app).generation;
+    let _ = app.update(Message::Add(AddMsg::Detected(
+        generation,
+        avero_autoconfig::known("jean@gmail.com"),
+    )));
+    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
+    let _ = app.update(Message::Add(AddMsg::UsePassword));
+    assert_eq!(form(&app).stage, Stage::Credentials);
+    assert!(form(&app).shows_password());
+    // ... and back to the assistant from the credentials.
+    let _ = app.update(Message::Add(AddMsg::ShowSetup(Provider::Google)));
+    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
+}
+
+const GOOGLE_ID: &str = "1234567890-abcdef.apps.googleusercontent.com";
+
+fn fill_google_setup(app: &mut App) {
+    let _ = app.update(Message::Add(AddMsg::Field(
+        Field::ClientId,
+        GOOGLE_ID.into(),
+    )));
+    let _ = app.update(Message::Add(AddMsg::Field(
+        Field::ClientSecret,
+        "GOCSPX-abcdefghijkl".into(),
+    )));
+}
+
+#[test]
+fn assistant_saves_nothing_in_demo_mode() {
+    let mut app = app_with(|_| {});
+    let _ = app.update(Message::Add(AddMsg::Open(Some(Provider::Google))));
+    fill_google_setup(&mut app);
+    let _ = app.update(Message::Add(AddMsg::SaveSetup));
+    assert!(form(&app).error.as_deref().unwrap().contains("Mode démo"));
+}
+
+#[test]
+fn assistant_saves_the_client_then_signs_in() {
+    use crate::account_form::Stage;
+    let dir = std::env::temp_dir().join(format!("avero-setup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let backend = Backend::Live {
+        db_path: dir.join("unused.db"),
+        secrets: Arc::new(avero_core::secrets::MemorySecrets::default()),
+        config_dir: dir.join("config"),
+        workers: HashMap::new(),
+    };
+    let store = Store::open_in_memory().unwrap();
+    let (mut app, _) = App::new(store, backend, Settings::default(), None);
+    assert!(
+        app.oauth_clients
+            .get(&Provider::Google)
+            .is_none_or(|c| !c.saved)
+    );
+
+    let _ = app.update(Message::Add(AddMsg::Open(Some(Provider::Google))));
+    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
+    let _ = app.update(Message::Add(AddMsg::Field(
+        Field::ClientId,
+        "pas un id".into(),
+    )));
+    let _ = app.update(Message::Add(AddMsg::SaveSetup));
+    assert!(form(&app).error.is_some());
+    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
+
+    fill_google_setup(&mut app);
+    let _ = app.update(Message::Add(AddMsg::SaveSetup));
+    // Saved, then straight to the browser sign-in.
+    assert_eq!(form(&app).stage, Stage::Authorizing(Provider::Google));
+    assert!(form(&app).setup.client_secret.is_empty());
+    let saved = avero_oauth::saved_client_config(Provider::Google, &dir.join("config")).unwrap();
+    assert_eq!(saved.client_id, GOOGLE_ID);
+    let info = &app.oauth_clients[&Provider::Google];
+    assert!(info.saved);
+    assert!(!info.masked_id.contains("abcdef.apps"));
+
+    // Settings: change (prefilled, saving just closes), then remove.
+    let _ = app.update(Message::Add(AddMsg::CancelWait));
+    let _ = app.update(Message::Add(AddMsg::EditClient(Provider::Google)));
+    assert!(form(&app).setup_only);
+    assert_eq!(form(&app).setup.client_id, GOOGLE_ID);
+    let _ = app.update(Message::Add(AddMsg::SaveSetup));
+    assert!(app.overlay.is_none());
+    let _ = app.update(Message::Add(AddMsg::RemoveClient(Provider::Google)));
+    assert!(avero_oauth::saved_client_config(Provider::Google, &dir.join("config")).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn add_message_debug_hides_the_client_secret() {
+    let message = AddMsg::Field(Field::ClientSecret, "GOCSPX-hidden".into());
+    assert!(!format!("{message:?}").contains("hidden"));
 }
 
 fn form(app: &App) -> &AccountForm {

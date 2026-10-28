@@ -13,13 +13,18 @@ use iced::{Alignment, Element, Fill};
 
 /// Width of the card.
 pub const WIDTH: f32 = 460.0;
+/// Width of the card while it shows the OAuth assistant.
+pub const SETUP_WIDTH: f32 = 840.0;
 
 pub fn view<'a>(app: &'a App, form: &'a AccountForm) -> Element<'a, Message> {
+    let title = match form.stage {
+        Stage::Setup(provider) if form.setup_only => {
+            format!("Connexion {}", auth::provider_name(provider))
+        }
+        _ => "Ajouter un compte".to_string(),
+    };
     let header = row![
-        text("Ajouter un compte")
-            .size(20)
-            .font(SEMIBOLD)
-            .width(Fill),
+        text(title).size(20).font(SEMIBOLD).width(Fill),
         icon_button(
             Icon::Close,
             "Fermer (Échap)",
@@ -38,7 +43,12 @@ pub fn view<'a>(app: &'a App, form: &'a AccountForm) -> Element<'a, Message> {
         Stage::Credentials => credentials_step(form),
         Stage::Checking => waiting(app, &form.email, "Vérification de la connexion…"),
         Stage::Authorizing(provider) => authorizing(app, provider),
+        Stage::Setup(provider) => super::oauth_setup::view(form, provider),
     });
+    let width = match form.stage {
+        Stage::Setup(_) => SETUP_WIDTH,
+        _ => WIDTH,
+    };
 
     // Scrolls when the window is too short for the advanced settings.
     container(
@@ -51,7 +61,7 @@ pub fn view<'a>(app: &'a App, form: &'a AccountForm) -> Element<'a, Message> {
                     .margin(3),
             )),
     )
-    .width(WIDTH)
+    .width(width)
     .style(theme::card)
     .into()
 }
@@ -132,11 +142,22 @@ fn credentials_step(form: &AccountForm) -> Element<'_, Message> {
         }
         return step.into();
     }
-    if let Some(note) = form.oauth_missing_note() {
-        step = step.push(note_box(note));
-    }
+    let setup_link = form.setup_offer().map(|provider| {
+        container(
+            button(
+                text(format!(
+                    "Configurer plutôt la connexion {} (une seule fois)",
+                    auth::provider_name(provider)
+                ))
+                .size(13),
+            )
+            .on_press(Message::Add(AddMsg::ShowSetup(provider)))
+            .style(theme::link),
+        )
+        .center_x(Fill)
+    });
     if !form.shows_password() {
-        return step.into();
+        return step.extend(setup_link.map(Element::from)).into();
     }
 
     let label = if form.app_password() {
@@ -194,6 +215,7 @@ fn credentials_step(form: &AccountForm) -> Element<'_, Message> {
             .on_press(Message::Add(AddMsg::SubmitPassword))
             .style(theme::primary),
     )
+    .extend(setup_link.map(Element::from))
     .into()
 }
 
@@ -309,21 +331,34 @@ fn waiting<'a>(app: &'a App, email: &'a str, label: &'a str) -> Element<'a, Mess
 
 fn authorizing<'a>(app: &'a App, provider: Provider) -> Element<'a, Message> {
     let name = auth::provider_name(provider);
-    column![
+    let column = column![
         spinner_line(app, "Autorisez Avero dans votre navigateur…"),
         text(format!(
             "Une page {name} s'est ouverte dans votre navigateur. Connectez-vous et acceptez l'accès, puis revenez ici : la suite est automatique."
         ))
         .size(13)
         .style(theme::muted),
-        button(container(text("Annuler").size(14).font(MEDIUM)).center_x(Fill))
-            .width(Fill)
-            .padding([10, 16])
-            .on_press(Message::Add(AddMsg::CancelWait))
-            .style(theme::secondary),
     ]
-    .spacing(16)
-    .into()
+    .spacing(16);
+    let column = if provider == Provider::Google {
+        column.push(note_box(
+            "Google affiche « Cette appli n'a pas été validée » ? Cliquez sur « Continuer ». \
+             « Accès bloqué » ? Ajoutez cette adresse comme utilisateur test (étape Audience \
+             de la configuration)."
+                .to_string(),
+        ))
+    } else {
+        column
+    };
+    column
+        .push(
+            button(container(text("Annuler").size(14).font(MEDIUM)).center_x(Fill))
+                .width(Fill)
+                .padding([10, 16])
+                .on_press(Message::Add(AddMsg::CancelWait))
+                .style(theme::secondary),
+        )
+        .into()
 }
 
 /// A turning loader with a label.

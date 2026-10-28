@@ -8,13 +8,14 @@ mod background;
 mod compose;
 mod demo;
 mod icons;
+mod oauth_setup;
 mod paths;
 mod settings;
 mod theme;
 mod view;
 mod worker;
 
-use app::{App, Backend, Message};
+use app::{AddMsg, App, Backend, Message};
 use avero_core::secrets::KeyringSecrets;
 use avero_core::store::Store;
 use iced::{Size, Task, window};
@@ -71,10 +72,17 @@ fn boot() -> (App, Task<Message>) {
         Some(kind) => {
             let store = match kind {
                 demo::DemoKind::Seeded => demo::seeded_store(),
-                demo::DemoKind::Empty => Store::open_in_memory().expect("in-memory database"),
+                demo::DemoKind::Empty | demo::DemoKind::Setup(_) => {
+                    Store::open_in_memory().expect("in-memory database")
+                }
             };
             // Demo mode never writes the settings file.
-            App::new(store, Backend::Demo, settings, None)
+            let (mut app, task) = App::new(store, Backend::Demo, settings, None);
+            if let demo::DemoKind::Setup(provider) = kind {
+                let open = app.update(Message::Add(AddMsg::Open(Some(provider))));
+                return (app, Task::batch([task, open]));
+            }
+            (app, task)
         }
         None => {
             let db_path = paths::database_path();

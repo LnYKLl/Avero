@@ -44,6 +44,8 @@ pub enum Icon {
     User,
     Users,
     Close,
+    Copy,
+    ExternalLink,
     /// The Avero mark (monochrome, `currentColor`).
     Mark,
     /// The Avero app icon tile (keeps its own colours).
@@ -53,7 +55,7 @@ pub enum Icon {
 }
 
 /// All icons, in the order of `bytes`; used to build the handle cache.
-const ALL: [Icon; 37] = [
+const ALL: [Icon; 39] = [
     Icon::Archive,
     Icon::Check,
     Icon::ChevronDown,
@@ -87,6 +89,8 @@ const ALL: [Icon; 37] = [
     Icon::User,
     Icon::Users,
     Icon::Close,
+    Icon::Copy,
+    Icon::ExternalLink,
     Icon::Mark,
     Icon::Logo,
     Icon::Google,
@@ -129,6 +133,8 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::User => include_bytes!("../assets/icons/user.svg"),
         Icon::Users => include_bytes!("../assets/icons/users.svg"),
         Icon::Close => include_bytes!("../assets/icons/x.svg"),
+        Icon::Copy => include_bytes!("../assets/icons/copy.svg"),
+        Icon::ExternalLink => include_bytes!("../assets/icons/external-link.svg"),
         Icon::Mark => include_bytes!("../assets/logo/avero-mark.svg"),
         Icon::Logo => include_bytes!("../assets/logo/avero-icon.svg"),
         Icon::Google => include_bytes!("../assets/logo/google.svg"),

@@ -2,6 +2,7 @@
 //! was detected, and the checks done before an account is saved.
 
 use crate::auth;
+use crate::oauth_setup::SetupFields;
 use avero_autoconfig::{AuthMethod, ProviderConfig};
 use avero_core::{AuthKind, NewAccount, Security, ServerConfig};
 use avero_oauth::Provider;
@@ -19,6 +20,9 @@ pub enum Stage {
     Checking,
     /// Waiting for the browser ("Autorisez Avero dans votre navigateur…").
     Authorizing(Provider),
+    /// The one-time assistant that registers Avero with the provider
+    /// ("Configurer la connexion Google").
+    Setup(Provider),
 }
 
 /// Editable fields.
@@ -31,9 +35,14 @@ pub enum Field {
     ImapPort,
     SmtpHost,
     SmtpPort,
+    /// OAuth client id typed in the assistant.
+    ClientId,
+    /// Google client secret typed in the assistant.
+    ClientSecret,
 }
 
-/// The state of the add-account card. `Debug` hides the password.
+/// The state of the add-account card. `Debug` hides the password and
+/// the client secret.
 #[derive(Clone)]
 pub struct AccountForm {
     pub stage: Stage,
@@ -58,6 +67,11 @@ pub struct AccountForm {
     pub error: Option<String>,
     /// Bumped on every new background job, to ignore stale answers.
     pub generation: u64,
+    /// What was pasted in the OAuth assistant.
+    pub setup: SetupFields,
+    /// The assistant was opened from the settings: saving closes the card
+    /// instead of signing in.
+    pub setup_only: bool,
 }
 
 impl std::fmt::Debug for AccountForm {
@@ -74,6 +88,7 @@ impl std::fmt::Debug for AccountForm {
             .field("smtp_security", &self.smtp_security)
             .field("error", &self.error)
             .field("generation", &self.generation)
+            .field("setup", &self.setup)
             .finish_non_exhaustive()
     }
 }
@@ -103,6 +118,19 @@ impl AccountForm {
             note: None,
             error: None,
             generation: 0,
+            setup: SetupFields::default(),
+            setup_only: false,
+        }
+    }
+
+    /// The assistant for `provider`, opened from the settings with the
+    /// current client (if any) prefilled.
+    pub fn setup_only(provider: Provider, current: Option<avero_oauth::ClientConfig>) -> Self {
+        AccountForm {
+            stage: Stage::Setup(provider),
+            setup: SetupFields::from_client(current),
+            setup_only: true,
+            ..AccountForm::new()
         }
     }
 
@@ -122,6 +150,30 @@ impl AccountForm {
                 }
                 self.smtp_port = value;
             }
+            Field::ClientId => self.setup.client_id = value,
+            Field::ClientSecret => self.setup.client_secret = value,
+        }
+    }
+
+    /// The provider whose assistant should be shown instead of the
+    /// credentials: the address needs OAuth, no client is configured and
+    /// the user did not choose the app password.
+    pub fn needs_setup(&self) -> Option<Provider> {
+        let provider = self.oauth_provider()?;
+        (!self.oauth_configured && !self.use_password).then_some(provider)
+    }
+
+    /// Leaves the assistant for the app password: back to the
+    /// credentials if the address is known, else to the address.
+    pub fn choose_password(&mut self) {
+        self.use_password = true;
+        self.error = None;
+        if let Stage::Setup(_) = self.stage {
+            self.stage = if self.provider.is_some() {
+                Stage::Credentials
+            } else {
+                Stage::Email
+            };
         }
     }
 
@@ -268,25 +320,10 @@ impl AccountForm {
         Ok((account, password))
     }
 
-    /// French explanation when OAuth is the only way and is missing.
-    pub fn oauth_missing_note(&self) -> Option<String> {
-        let provider = self.oauth_provider()?;
-        if self.oauth_configured {
-            return None;
-        }
-        let name = auth::provider_name(provider);
-        Some(if self.allows_password() {
-            format!(
-                "La connexion {name} n'est pas configurée dans cette version d'Avero \
-                 (voir docs/oauth-setup.md). Vous pouvez utiliser un mot de passe \
-                 d'application à la place."
-            )
-        } else {
-            format!(
-                "Ce compte nécessite la connexion {name}, qui n'est pas disponible dans \
-                 cette version d'Avero (identifiant client manquant, voir docs/oauth-setup.md)."
-            )
-        })
+    /// The provider whose assistant can still be opened from the
+    /// credentials step (the user first chose the app password).
+    pub fn setup_offer(&self) -> Option<Provider> {
+        self.oauth_provider().filter(|_| !self.oauth_configured)
     }
 }
 
@@ -383,31 +420,58 @@ mod tests {
         assert_eq!(form.oauth_provider(), Some(Provider::Google));
         assert!(form.offers_oauth());
         assert!(!form.shows_password());
-        assert!(form.oauth_missing_note().is_none());
+        assert_eq!(form.needs_setup(), None);
+        assert_eq!(form.setup_offer(), None);
     }
 
     #[test]
-    fn gmail_without_client_falls_back_to_app_password() {
-        let form = gmail_form(false);
+    fn gmail_without_client_opens_the_assistant_or_the_app_password() {
+        let mut form = gmail_form(false);
         assert!(!form.offers_oauth());
+        assert_eq!(form.needs_setup(), Some(Provider::Google));
+        form.stage = Stage::Setup(Provider::Google);
+        form.choose_password();
+        assert_eq!(form.stage, Stage::Credentials);
+        assert_eq!(form.needs_setup(), None);
         assert!(form.shows_password());
-        let note = form.oauth_missing_note().unwrap();
-        assert!(note.contains("docs/oauth-setup.md"));
-        assert!(note.contains("mot de passe"));
+        assert_eq!(form.setup_offer(), Some(Provider::Google));
     }
 
     #[test]
-    fn outlook_without_client_is_unavailable() {
+    fn app_password_from_the_welcome_assistant_asks_the_address() {
+        let mut form = AccountForm::new();
+        form.stage = Stage::Setup(Provider::Google);
+        form.choose_password();
+        assert_eq!(form.stage, Stage::Email);
+        assert!(form.use_password);
+    }
+
+    #[test]
+    fn outlook_without_client_needs_the_assistant() {
         let mut form = AccountForm::new();
         form.set(Field::Email, "a@hotmail.fr".into());
         form.apply_detection(avero_autoconfig::known("a@hotmail.fr"), false);
         assert!(!form.shows_password());
         assert!(!form.offers_oauth());
-        assert!(
-            form.oauth_missing_note()
-                .unwrap()
-                .contains("pas disponible")
+        assert_eq!(form.needs_setup(), Some(Provider::Microsoft));
+    }
+
+    #[test]
+    fn assistant_fields_and_debug() {
+        let mut form = AccountForm::setup_only(
+            Provider::Google,
+            Some(avero_oauth::ClientConfig {
+                client_id: "1-a.apps.googleusercontent.com".into(),
+                client_secret: Some("GOCSPX-old-secret".into()),
+            }),
         );
+        assert_eq!(form.stage, Stage::Setup(Provider::Google));
+        assert!(form.setup_only);
+        assert_eq!(form.setup.client_id, "1-a.apps.googleusercontent.com");
+        form.set(Field::ClientSecret, "GOCSPX-new-secret".into());
+        assert_eq!(form.setup.client_secret, "GOCSPX-new-secret");
+        let debug = format!("{form:?}");
+        assert!(!debug.contains("new-secret"), "{debug}");
     }
 
     #[test]

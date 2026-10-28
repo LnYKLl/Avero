@@ -5,6 +5,7 @@ pub mod add_account;
 pub mod composer;
 pub mod dialogs;
 pub mod list;
+pub mod oauth_setup;
 pub mod rail;
 pub mod reader;
 pub mod settings;

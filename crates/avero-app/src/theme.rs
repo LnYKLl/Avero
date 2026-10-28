@@ -360,6 +360,17 @@ pub fn note(theme: &Theme) -> container::Style {
     }
 }
 
+/// The round number of an assistant step.
+pub fn step_badge(theme: &Theme) -> container::Style {
+    let t = tokens(theme);
+    container::Style {
+        background: Some(t.accent_soft.into()),
+        text_color: Some(t.accent),
+        border: rounded(999.0),
+        ..container::Style::default()
+    }
+}
+
 /// An error banner.
 pub fn error_banner(theme: &Theme) -> container::Style {
     let t = tokens(theme);
@@ -454,6 +465,13 @@ pub fn muted(theme: &Theme) -> text::Style {
 pub fn accent(theme: &Theme) -> text::Style {
     text::Style {
         color: Some(tokens(theme).accent),
+    }
+}
+
+/// Confirmation text ("ID client valide").
+pub fn success_text(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(tokens(theme).success),
     }
 }
 

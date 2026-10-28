@@ -91,6 +91,118 @@ impl App {
         avero_oauth::client_config(provider, &self.config_dir()?)
     }
 
+    /// Reads which OAuth clients are configured, for the settings.
+    pub(super) fn read_oauth_clients(&mut self) {
+        let dir = self.config_dir();
+        self.oauth_clients = [Provider::Google, Provider::Microsoft]
+            .into_iter()
+            .filter_map(|provider| {
+                let dir = dir.as_deref()?;
+                let client = avero_oauth::client_config(provider, dir)?;
+                let saved = avero_oauth::saved_client_config(provider, dir).is_some();
+                Some((
+                    provider,
+                    super::ClientInfo {
+                        masked_id: avero_oauth::mask_client_id(&client.client_id),
+                        saved,
+                    },
+                ))
+            })
+            .collect();
+    }
+
+    /// Shows the assistant in the open add-account card.
+    fn show_setup(&mut self, provider: Provider) -> Task<Message> {
+        if let Some(form) = self.form() {
+            form.next_generation();
+            form.stage = Stage::Setup(provider);
+            form.use_password = false;
+            form.error = None;
+        }
+        Task::none()
+    }
+
+    /// "Enregistrer et se connecter": saves the client in `oauth.json`,
+    /// then starts the sign-in at once (or just closes, from the settings).
+    fn save_setup(&mut self) -> Task<Message> {
+        let config_dir = self.config_dir();
+        let Some(form) = self.form() else {
+            return Task::none();
+        };
+        let Stage::Setup(provider) = form.stage else {
+            return Task::none();
+        };
+        let client = match form.setup.client(provider) {
+            Ok(client) => client,
+            Err(error) => {
+                form.error = Some(error.to_string());
+                return Task::none();
+            }
+        };
+        let Some(config_dir) = config_dir else {
+            form.error = Some("Mode démo : rien n'est enregistré ni envoyé.".to_string());
+            return Task::none();
+        };
+        if let Err(e) = avero_oauth::save_client_config(provider, &config_dir, &client) {
+            form.error = Some(format!("Impossible d'enregistrer la configuration : {e}"));
+            return Task::none();
+        }
+        let setup_only = form.setup_only;
+        form.oauth_configured = true;
+        form.use_password = false;
+        form.setup = Default::default();
+        self.read_oauth_clients();
+        let name = auth::provider_name(provider);
+        if setup_only {
+            self.overlay = None;
+            return self.toast(format!("Connexion {name} configurée"), false);
+        }
+        self.start_sign_in(provider)
+    }
+
+    /// Opens the assistant alone, from the settings.
+    fn edit_client(&mut self, provider: Provider) -> Task<Message> {
+        let current = self
+            .config_dir()
+            .and_then(|dir| avero_oauth::saved_client_config(provider, &dir));
+        self.oauth_cancel = None;
+        self.overlay = Some(Overlay::AddAccount(Box::new(AccountForm::setup_only(
+            provider, current,
+        ))));
+        Task::none()
+    }
+
+    fn remove_client(&mut self, provider: Provider) -> Task<Message> {
+        let name = auth::provider_name(provider);
+        let Some(config_dir) = self.config_dir() else {
+            return self.toast("Mode démo : rien n'est enregistré", false);
+        };
+        if let Err(e) = avero_oauth::remove_client_config(provider, &config_dir) {
+            return self.toast(
+                format!("Impossible de modifier la configuration : {e}"),
+                true,
+            );
+        }
+        self.read_oauth_clients();
+        let used = self
+            .accounts
+            .iter()
+            .any(|a| auth::provider_of(a.auth) == Some(provider));
+        let text = if self.oauth_clients.contains_key(&provider) {
+            format!(
+                "Identifiant retiré : celui intégré à cette version d'Avero est utilisé pour {name}"
+            )
+        } else if used {
+            format!(
+                "Connexion {name} retirée. Les comptes {name} ne pourront plus se connecter \
+                 tant qu'elle n'est pas configurée à nouveau."
+            )
+        } else {
+            format!("Connexion {name} retirée")
+        };
+        self.toast(text, false)
+    }
+
     pub(super) fn update_add(&mut self, message: AddMsg) -> Task<Message> {
         match message {
             AddMsg::Open(provider) => self.open_add(provider),
@@ -118,6 +230,10 @@ impl App {
                     && form.stage == Stage::Detecting
                 {
                     form.apply_detection(config, configured);
+                    if let Some(provider) = form.needs_setup() {
+                        form.stage = Stage::Setup(provider);
+                        return Task::none();
+                    }
                     return iced::widget::operation::focus(PASSWORD_ID);
                 }
                 Task::none()
@@ -138,11 +254,26 @@ impl App {
                 Task::none()
             }
             AddMsg::UsePassword => {
-                if let Some(form) = self.form() {
-                    form.use_password = true;
+                let Some(form) = self.form() else {
+                    return Task::none();
+                };
+                let from_welcome =
+                    form.stage == Stage::Setup(Provider::Google) && form.provider.is_none();
+                form.choose_password();
+                if from_welcome {
+                    form.note = Some(
+                        "Saisissez votre adresse Gmail : vous pourrez ensuite coller un mot de \
+                         passe d'application."
+                            .to_string(),
+                    );
+                    return iced::widget::operation::focus(EMAIL_ID);
                 }
-                Task::none()
+                iced::widget::operation::focus(PASSWORD_ID)
             }
+            AddMsg::ShowSetup(provider) => self.show_setup(provider),
+            AddMsg::EditClient(provider) => self.edit_client(provider),
+            AddMsg::SaveSetup => self.save_setup(),
+            AddMsg::RemoveClient(provider) => self.remove_client(provider),
             AddMsg::SmtpSecurity(security) => {
                 if let Some(form) = self.form() {
                     form.smtp_security = security;
@@ -186,21 +317,10 @@ impl App {
             self.overlay = Some(Overlay::AddAccount(Box::new(form)));
             return self.start_sign_in(provider);
         }
-        let name = auth::provider_name(provider);
-        form.note = Some(match provider {
-            Provider::Google => format!(
-                "La connexion {name} n'est pas configurée dans cette version d'Avero \
-                 (voir docs/oauth-setup.md). Saisissez votre adresse Gmail : vous pourrez \
-                 utiliser un mot de passe d'application."
-            ),
-            Provider::Microsoft => format!(
-                "La connexion {name} n'est pas disponible dans cette version d'Avero \
-                 (identifiant client manquant, voir docs/oauth-setup.md). Les adresses \
-                 Outlook.com et Hotmail ne peuvent pas encore être ajoutées."
-            ),
-        });
+        // No client yet: the one-time assistant, then the sign-in.
+        form.stage = Stage::Setup(provider);
         self.overlay = Some(Overlay::AddAccount(Box::new(form)));
-        focus
+        Task::none()
     }
 
     fn submit_email(&mut self) -> Task<Message> {
@@ -694,11 +814,8 @@ impl App {
             return self.toast("Mode démo : aucune connexion", false);
         }
         let Some(client) = self.oauth_client(provider) else {
-            let name = auth::provider_name(provider);
-            return self.toast(
-                format!("La connexion {name} n'est pas configurée dans cette version d'Avero"),
-                true,
-            );
+            // The client was removed: the assistant, then "Reconnecter" again.
+            return self.edit_client(provider);
         };
         let (cancel, cancelled) = oneshot::channel();
         self.oauth_cancel = Some(cancel);
