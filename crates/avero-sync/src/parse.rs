@@ -40,7 +40,8 @@ pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
 }
 
 /// Guesses the role of a folder from its SPECIAL-USE attributes, then
-/// from the last segment of its path.
+/// from its path: `INBOX` (any case) is the inbox, otherwise the last
+/// segment of the path is compared to well-known names.
 pub fn detect_role(path: &str, attributes: &[String]) -> FolderRole {
     for attribute in attributes {
         match attribute.to_lowercase().as_str() {
@@ -53,10 +54,14 @@ pub fn detect_role(path: &str, attributes: &[String]) -> FolderRole {
         }
     }
 
+    // Only the real INBOX is the inbox, not a sub-folder named "Inbox".
+    if path.eq_ignore_ascii_case("INBOX") {
+        return FolderRole::Inbox;
+    }
+
     // Last segment, whatever the delimiter ('/' or '.').
     let name = path.rsplit(['/', '.']).next().unwrap_or(path);
     match name.to_lowercase().as_str() {
-        "inbox" => FolderRole::Inbox,
         "sent" | "sent items" | "sent messages" | "envoyés" | "éléments envoyés" => {
             FolderRole::Sent
         }
@@ -123,6 +128,14 @@ mod tests {
         assert_eq!(detect_role("[Gmail]/Corbeille", &[]), FolderRole::Trash);
         assert_eq!(detect_role("inbox", &[]), FolderRole::Inbox);
         assert_eq!(detect_role("Éléments envoyés", &[]), FolderRole::Sent);
+    }
+
+    #[test]
+    fn only_the_real_inbox_is_inbox() {
+        assert_eq!(detect_role("INBOX", &[]), FolderRole::Inbox);
+        assert_eq!(detect_role("Inbox", &[]), FolderRole::Inbox);
+        assert_eq!(detect_role("Archives/2023/Inbox", &[]), FolderRole::Other);
+        assert_eq!(detect_role("INBOX.Inbox", &[]), FolderRole::Other);
     }
 
     #[test]
