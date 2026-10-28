@@ -386,6 +386,17 @@ impl Store {
         Ok(())
     }
 
+    /// Marks every message of the folder as lacking its extra headers, so
+    /// that the next sync fetches them again (for a version of Avero that
+    /// reads more headers; used by tests to stand for old messages).
+    pub fn mark_headers_missing(&self, folder: FolderId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE messages SET headers_v2 = 0 WHERE folder_id = ?1",
+            params![folder.0],
+        )?;
+        Ok(())
+    }
+
     /// UIDs of the folder's messages stored before their extra headers
     /// were read (see `MessageHeaders`), newest first, at most `limit`.
     pub fn missing_headers(&self, folder: FolderId, limit: usize) -> Result<Vec<u32>, StoreError> {

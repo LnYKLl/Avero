@@ -24,6 +24,9 @@ pub struct SyncReport {
     /// notification. Empty on the first fill of the inbox (or after a
     /// UIDVALIDITY change): those messages are not new, only new here.
     pub arrivals: Vec<Arrival>,
+    /// Messages stored by an older Avero whose extra headers (threading,
+    /// mailing lists) were fetched again.
+    pub completed_headers: usize,
 }
 
 /// A new unread message of the inbox, with only what a notification
@@ -38,7 +41,9 @@ pub struct Arrival {
 
 /// Brings the local copy of the special folders (inbox, sent, drafts,
 /// archive, trash, junk) up to date, INBOX first, then resynchronises the
-/// INBOX's flags and deletions.
+/// INBOX's flags and deletions. Last, messages stored by an older Avero
+/// get the headers it did not keep (see [`complete_headers`]), INBOX
+/// first; the list is usable meanwhile.
 ///
 /// Other folders (user folders, Gmail labels) are left aside for now: on
 /// a big account they would make the first sync very long. Folders marked
@@ -75,16 +80,75 @@ pub async fn sync_account<S: MailSource>(
     // Stable sort: INBOX first, the others keep the server's order.
     remotes.sort_by_key(|(remote, _)| !remote.path.eq_ignore_ascii_case("INBOX"));
 
+    let mut synced = Vec::new();
     for (remote, role) in remotes {
         let folder = store.upsert_folder(account, &remote.path, role)?;
         match sync_folder(store, source, &folder, &mut report, &mut on_progress).await {
-            Ok(()) => report.folders += 1,
+            Ok(()) => {
+                report.folders += 1;
+                synced.push(folder.id);
+            }
             Err(SyncError::Protocol(_)) => report.skipped_folders += 1,
             Err(other) => return Err(other),
         }
     }
 
+    // Read again: the sync updated their UID validity.
+    let folders = store.folders(account)?;
+    for id in synced {
+        let Some(folder) = folders.iter().find(|f| f.id == id) else {
+            continue;
+        };
+        match complete_headers(store, source, folder, &mut report, &mut on_progress).await {
+            // A refusal leaves them for the next sync.
+            Ok(()) | Err(SyncError::Protocol(_)) => {}
+            Err(other) => return Err(other),
+        }
+    }
+
     Ok(report)
+}
+
+/// Fetches again, [`BATCH`] at a time and newest first, the headers of
+/// the folder's messages stored before Avero kept the threading and
+/// mailing-list headers, so that they join their conversations. Selects
+/// the folder only if there is something to do.
+async fn complete_headers<S: MailSource>(
+    store: &Store,
+    source: &mut S,
+    folder: &Folder,
+    report: &mut SyncReport,
+    on_progress: &mut impl FnMut(&SyncReport),
+) -> Result<(), SyncError> {
+    let mut selected = false;
+    loop {
+        let mut uids = store.missing_headers(folder.id, BATCH as usize)?;
+        if uids.is_empty() {
+            return Ok(());
+        }
+        if !selected {
+            let status = source.select(&folder.path).await?;
+            // The UIDs changed meaning since the sync: the next one
+            // starts the folder again.
+            if folder.uid_validity != Some(status.uid_validity) {
+                return Ok(());
+            }
+            selected = true;
+        }
+        uids.sort_unstable();
+        let (first, last) = (uids[0], uids[uids.len() - 1]);
+        let messages: Vec<NewMessage> = source
+            .fetch_headers(first, Some(last))
+            .await?
+            .iter()
+            .filter(|h| uids.binary_search(&h.uid).is_ok())
+            .map(|h| parse_headers(h.uid, h.seen, &h.raw))
+            .collect();
+        // Every UID asked is marked done, so this loop always ends.
+        store.complete_headers(folder.id, &uids, &messages)?;
+        report.completed_headers += messages.len();
+        on_progress(report);
+    }
 }
 
 /// `\Noselect` and `\NonExistent` folders cannot be opened.
@@ -278,6 +342,25 @@ mod tests {
         select_fails: Option<Fail>,
         /// A fetch starting at or after this UID fails.
         fetch_fails_from: Option<(u32, Fail)>,
+        /// Extra header lines of some messages, by UID.
+        extra: Vec<(u32, String)>,
+    }
+
+    impl FakeFolder {
+        /// The header block of `uid`: its Message-ID tells the folder
+        /// apart, so copies in two folders are different messages.
+        fn raw(&self, uid: u32) -> Vec<u8> {
+            let mut raw = format!(
+                "Message-ID: <{uid}.{}@fake>\r\nFrom: a@b.c\r\nSubject: m{uid}\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n",
+                self.path
+            );
+            for (_, line) in self.extra.iter().filter(|(u, _)| *u == uid) {
+                raw.push_str(line);
+                raw.push_str("\r\n");
+            }
+            raw.push_str("\r\n");
+            raw.into_bytes()
+        }
     }
 
     #[derive(Default)]
@@ -306,6 +389,7 @@ mod tests {
                 uid_next: None,
                 select_fails: None,
                 fetch_fails_from: None,
+                extra: Vec::new(),
             });
         }
 
@@ -317,13 +401,6 @@ mod tests {
             let index = self.selected.expect("select first");
             &mut self.folders[index]
         }
-    }
-
-    fn fake_raw(uid: u32) -> Vec<u8> {
-        format!(
-            "Message-ID: <{uid}@fake>\r\nFrom: a@b.c\r\nSubject: m{uid}\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n\r\n"
-        )
-        .into_bytes()
     }
 
     impl MailSource for FakeSource {
@@ -377,7 +454,7 @@ mod tests {
                 .map(|&uid| FetchedHeader {
                     uid,
                     seen: folder.seen.contains(&uid),
-                    raw: fake_raw(uid),
+                    raw: folder.raw(uid),
                 })
                 .collect())
         }
@@ -407,7 +484,7 @@ mod tests {
                 .map(|uid| FetchedHeader {
                     uid,
                     seen: folder.seen.contains(&uid),
-                    raw: fake_raw(uid),
+                    raw: folder.raw(uid),
                 })
                 .collect())
         }
@@ -449,7 +526,7 @@ mod tests {
 
         async fn fetch_body(&mut self, uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
             let folder = self.selected();
-            Ok(folder.uids.contains(&uid).then(|| fake_raw(uid)))
+            Ok(folder.uids.contains(&uid).then(|| folder.raw(uid)))
         }
 
         async fn set_seen(&mut self, uids: &[u32], seen: bool) -> Result<(), SyncError> {
@@ -1008,6 +1085,96 @@ mod tests {
         assert_eq!(source.fetches[0].0, 601);
         assert_eq!(report.new_messages, 200);
         assert_eq!(total_rows(&store, account), 800);
+    }
+
+    #[tokio::test]
+    async fn new_messages_join_their_conversation_across_folders() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("INBOX", &[], 1, vec![1, 2]);
+        source.add_folder("Sent", &["\\Sent"], 1, vec![1]);
+        source
+            .folder("Sent")
+            .extra
+            .push((1, "In-Reply-To: <2.INBOX@fake>".into()));
+
+        sync(&store, &mut source, account).await.unwrap();
+
+        let threads = store
+            .threads(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap();
+        let counts: Vec<usize> = threads.iter().map(|t| t.count).collect();
+        assert_eq!(counts, vec![2, 1]);
+    }
+
+    #[tokio::test]
+    async fn old_messages_get_their_headers_inbox_first() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("Sent", &["\\Sent"], 1, vec![1]);
+        source.add_folder("INBOX", &[], 1, (1..=700).collect());
+        sync(&store, &mut source, account).await.unwrap();
+        // As if stored by an older Avero, which kept no References.
+        for folder in store.folders(account).unwrap() {
+            store.mark_headers_missing(folder.id).unwrap();
+        }
+        source.folder("Sent").extra.push((
+            1,
+            "References: <699.INBOX@fake>\r\nIn-Reply-To: <700.INBOX@fake>".into(),
+        ));
+        source
+            .folder("INBOX")
+            .extra
+            .push((700, "In-Reply-To: <699.INBOX@fake>".into()));
+        // A message deleted meanwhile is not asked for.
+        source.folder("INBOX").uids.retain(|&uid| uid != 3);
+        source.selects.clear();
+        source.fetches.clear();
+
+        let report = sync(&store, &mut source, account).await.unwrap();
+
+        assert_eq!(report.completed_headers, 700);
+        // The usual sync, then the headers: INBOX first, newest first.
+        assert_eq!(source.selects, vec!["INBOX", "Sent", "INBOX", "Sent"]);
+        assert_eq!(
+            source.fetches,
+            vec![(201, Some(700)), (1, Some(200)), (1, Some(1))]
+        );
+        for folder in store.folders(account).unwrap() {
+            assert!(store.missing_headers(folder.id, 10).unwrap().is_empty());
+        }
+        let threads = store
+            .threads(FolderRole::Inbox, AccountFilter::All, 1000, 0)
+            .unwrap();
+        assert_eq!(threads.len(), 698);
+        let conversation = threads.iter().find(|t| t.count > 1).unwrap();
+        assert_eq!(conversation.count, 3);
+        assert_eq!(conversation.row_ids.len(), 2);
+
+        // Nothing left: the next sync does not select the folders again.
+        source.selects.clear();
+        let report = sync(&store, &mut source, account).await.unwrap();
+        assert_eq!(report.completed_headers, 0);
+        assert_eq!(source.selects, vec!["INBOX", "Sent"]);
+    }
+
+    #[tokio::test]
+    async fn refused_header_fetch_leaves_them_for_later() {
+        let (store, account) = setup();
+        let mut source = FakeSource::default();
+        source.add_folder("INBOX", &[], 1, vec![1, 2]);
+        sync(&store, &mut source, account).await.unwrap();
+        let inbox = inbox_id(&store, account);
+        store.mark_headers_missing(inbox).unwrap();
+        source.folders[0].fetch_fails_from = Some((1, Fail::Protocol));
+
+        let report = sync(&store, &mut source, account).await.unwrap();
+
+        assert_eq!(report.skipped_folders, 0);
+        assert_eq!(store.missing_headers(inbox, 10).unwrap(), vec![2, 1]);
+        source.folders[0].fetch_fails_from = None;
+        sync(&store, &mut source, account).await.unwrap();
+        assert!(store.missing_headers(inbox, 10).unwrap().is_empty());
     }
 
     #[tokio::test]

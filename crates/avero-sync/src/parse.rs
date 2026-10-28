@@ -1,8 +1,15 @@
 //! Parsing of raw messages (headers for the list, full bodies for reading)
 //! and detection of folder roles.
 
-use avero_core::model::{FolderRole, NewMessage};
+use avero_core::model::{FolderRole, MessageHeaders, NewMessage};
 use mail_parser::{MessageParser, MimeHeaders};
+
+/// The header fields the sync asks for (`BODY.PEEK[HEADER.FIELDS (...)]`):
+/// what `parse_headers` reads, and nothing else (no `Received`, no DKIM
+/// signatures), so each message costs a few hundred bytes.
+pub const HEADER_FIELDS: &str = "MESSAGE-ID SUBJECT FROM DATE CONTENT-TYPE TO IN-REPLY-TO \
+     REFERENCES DELIVERED-TO LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST LIST-ID PRECEDENCE \
+     AUTO-SUBMITTED";
 
 /// Builds a `NewMessage` from raw header bytes. Never panics: anything
 /// missing or unreadable falls back to a default value.
@@ -51,7 +58,51 @@ pub fn parse_headers(uid: u32, seen: bool, raw: &[u8]) -> NewMessage {
                 .is_some_and(|sub| sub.eq_ignore_ascii_case("mixed"))
     });
 
+    msg.headers = MessageHeaders {
+        in_reply_to: ids(parsed.in_reply_to()).into_iter().next(),
+        references: ids(parsed.references()),
+        to: parsed
+            .to()
+            .map(|list| addresses(list).into_iter().map(|a| a.addr).collect())
+            .unwrap_or_default(),
+        delivered_to: raw_header(&parsed, "Delivered-To"),
+        list_unsubscribe: raw_header(&parsed, "List-Unsubscribe"),
+        list_unsubscribe_post: raw_header(&parsed, "List-Unsubscribe-Post"),
+        list_id: raw_header(&parsed, "List-Id"),
+        precedence: raw_header(&parsed, "Precedence"),
+        auto_submitted: raw_header(&parsed, "Auto-Submitted"),
+    };
+
     msg
+}
+
+/// The message ids of a header, with angle brackets.
+fn ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    value
+        .as_text_list()
+        .unwrap_or_default()
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("<{id}>"))
+        .collect()
+}
+
+/// The first header called `name` (any case), as written, on one line
+/// (folding removed). `None` when missing or empty.
+fn raw_header(message: &mail_parser::Message<'_>, name: &str) -> Option<String> {
+    let header = message
+        .headers()
+        .iter()
+        .find(|h| h.name.as_str().eq_ignore_ascii_case(name))?;
+    let start = header.offset_start as usize;
+    let end = header.offset_end as usize;
+    let bytes = message.raw_message.get(start..end)?;
+    let value = String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!value.is_empty()).then_some(value)
 }
 
 /// Width used to wrap text converted from HTML.
@@ -378,6 +429,41 @@ mod tests {
         assert_eq!(m.from_addr, "marie@ex.com");
         // Mon, 26 Oct 2026 07:33:20 +0000
         assert_eq!(m.date, 1_793_000_000);
+    }
+
+    #[test]
+    fn reads_threading_list_and_recipient_headers() {
+        let raw = "Message-ID: <n@ex.com>\r\n\
+Delivered-To: moi@ex.com\r\n\
+Delivered-To: alias@ex.com\r\n\
+To: Moi <moi@ex.com>, autre@ex.com\r\n\
+In-Reply-To: <p@ex.com>\r\n\
+References: <root@ex.com>\r\n <p@ex.com>\r\n\
+List-Unsubscribe: <mailto:u@list.ex.com?subject=unsub>,\r\n <https://list.ex.com/u/42>\r\n\
+List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+List-Id: Nouvelles <news.list.ex.com>\r\n\
+Precedence: bulk\r\n\
+Auto-Submitted: auto-generated\r\n\
+\r\n";
+        let h = parse_headers(1, false, raw.as_bytes()).headers;
+        assert_eq!(h.in_reply_to.as_deref(), Some("<p@ex.com>"));
+        assert_eq!(h.references, vec!["<root@ex.com>", "<p@ex.com>"]);
+        assert_eq!(h.to, vec!["moi@ex.com", "autre@ex.com"]);
+        assert_eq!(h.delivered_to.as_deref(), Some("moi@ex.com"));
+        assert_eq!(
+            h.list_unsubscribe.as_deref(),
+            Some("<mailto:u@list.ex.com?subject=unsub>, <https://list.ex.com/u/42>")
+        );
+        assert_eq!(
+            h.list_unsubscribe_post.as_deref(),
+            Some("List-Unsubscribe=One-Click")
+        );
+        assert_eq!(h.list_id.as_deref(), Some("Nouvelles <news.list.ex.com>"));
+        assert_eq!(h.precedence.as_deref(), Some("bulk"));
+        assert_eq!(h.auto_submitted.as_deref(), Some("auto-generated"));
+
+        let bare = parse_headers(1, false, b"Subject: a\r\n\r\n").headers;
+        assert_eq!(bare, MessageHeaders::default());
     }
 
     #[test]

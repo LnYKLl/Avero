@@ -2,6 +2,7 @@
 //! says), logged in with a password (LOGIN) or an OAuth2 token
 //! (AUTHENTICATE XOAUTH2).
 
+use crate::parse::HEADER_FIELDS;
 use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncError};
 use crate::watch::{Change, IDLE_RENEW, InboxWatch, POLL_EVERY};
 use async_imap::error::Error as ImapError;
@@ -319,6 +320,11 @@ where
     }
 }
 
+/// The header fields `parse_headers` reads, without setting `\Seen`.
+fn header_section() -> String {
+    format!("BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})]")
+}
+
 /// Headers (with UID and flags) of the messages in `from_uid..=to_uid`.
 async fn fetch_headers_from<T>(
     session: &mut Session<T>,
@@ -332,7 +338,7 @@ where
         Some(to) => format!("{from_uid}:{to}"),
         None => format!("{from_uid}:*"),
     };
-    let command = format!("UID FETCH {range} (UID FLAGS BODY.PEEK[HEADER])");
+    let command = format!("UID FETCH {range} (UID FLAGS {})", header_section());
     let mut headers = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         headers.extend(header_from_fetch(attributes, from_uid));
@@ -352,7 +358,7 @@ async fn fetch_headers_seq<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
-    let command = format!("FETCH {from_seq}:{to_seq} (UID FLAGS BODY.PEEK[HEADER])");
+    let command = format!("FETCH {from_seq}:{to_seq} (UID FLAGS {})", header_section());
     let mut headers = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         headers.extend(header_from_fetch(attributes, 0));
@@ -1117,7 +1123,38 @@ mod tests {
         assert_eq!(uids, vec![40_017, 90_123]);
         assert!(headers[1].seen);
         let sent = commands(session, server).await;
-        assert_eq!(sent, vec!["FETCH 1999:2000 (UID FLAGS BODY.PEEK[HEADER])"]);
+        assert_eq!(
+            sent,
+            vec![format!("FETCH 1999:2000 (UID FLAGS {})", header_section())]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_asks_only_the_needed_header_fields() {
+        let header = "Message-ID: <a@b>\r\nIn-Reply-To: <p@b>\r\n\r\n";
+        let reply = format!(
+            "* 1 FETCH (UID 4 FLAGS () BODY[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO)] {{{}}}\r\n{header})\r\n{{tag}} OK done\r\n",
+            header.len()
+        );
+        let (mut session, server) = session_recording(vec![&reply]).await;
+
+        let headers = fetch_headers_from(&mut session, 4, Some(9)).await.unwrap();
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].raw, header.as_bytes());
+        let sent = commands(session, server).await;
+        assert!(
+            sent[0].starts_with("UID FETCH 4:9 (UID FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID "),
+            "{sent:?}"
+        );
+        for field in [
+            "REFERENCES",
+            "LIST-UNSUBSCRIBE-POST",
+            "CONTENT-TYPE",
+            "DELIVERED-TO",
+        ] {
+            assert!(sent[0].contains(field), "{field}: {sent:?}");
+        }
     }
 
     #[tokio::test]

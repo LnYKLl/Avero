@@ -439,6 +439,17 @@ async fn mail_goes_round_end_to_end() {
         "{reply_text}"
     );
     assert_eq!(reply_body.text.trim_end(), "Payée hier.");
+    // ...and were stored at sync: the reply and the invoice make one
+    // conversation.
+    let stored = store.headers(reply.row_id).unwrap().unwrap();
+    assert_eq!(stored.in_reply_to.as_deref(), Some(first_id.as_str()));
+    assert_eq!(stored.references, vec![first_id.clone()]);
+    assert_eq!(stored.to, vec![bob.addr.clone()]);
+    let threads = store
+        .threads(FolderRole::Inbox, AccountFilter::Only(account), 10, 0)
+        .unwrap();
+    let counts: Vec<usize> = threads.iter().map(|t| t.count).collect();
+    assert_eq!(counts, vec![2, 1], "{threads:?}");
 
     // Read, then unread again: the server's flag comes back on sync.
     let meeting = &store.message_refs(&items[1].row_ids).unwrap()[0];
