@@ -2,7 +2,7 @@
 //! written) and the mail scheduled to be sent later ("Programmés"), which
 //! are drafts with a sending time. See `schema_v9.sql`.
 
-use super::{Store, StoreError};
+use super::{Store, StoreError, write_tx};
 use crate::{AccountId, DraftCopy, DraftFields, DraftFile, DraftRecord, FolderId};
 use rusqlite::{OptionalExtension, params};
 
@@ -23,7 +23,7 @@ impl Store {
         files: Option<&[DraftFile]>,
         now: i64,
     ) -> Result<i64, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         let f = fields;
         let updated = match id {
             Some(id) => tx.execute(
@@ -286,7 +286,7 @@ impl Store {
     /// late (more than `late_after` seconds after its time, Avero was
     /// closed), it stays in "Programmés" to say so, without its files.
     pub fn scheduled_sent(&self, id: i64, now: i64, late_after: i64) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         let late = tx.execute(
             "UPDATE drafts SET sent_at = ?1, attempted_at = NULL, error = NULL
              WHERE id = ?2 AND send_at IS NOT NULL AND ?1 - send_at > ?3",

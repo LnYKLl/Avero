@@ -1,6 +1,6 @@
 //! "Grand nettoyage": who fills the mailbox, and message sizes.
 
-use super::{Store, StoreError, filter_account};
+use super::{Store, StoreError, filter_account, write_tx};
 use crate::category::sender_key;
 use crate::{AccountFilter, AccountId, FolderId, SenderStats};
 use rusqlite::{OptionalExtension, params};
@@ -117,7 +117,7 @@ impl Store {
         asked: &[u32],
         sizes: &[(u32, u32)],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt =
                 tx.prepare("UPDATE messages SET size = ?1 WHERE folder_id = ?2 AND uid = ?3")?;

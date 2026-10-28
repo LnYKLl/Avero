@@ -3,8 +3,9 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 mod cleanup;
 mod drafts;
@@ -30,6 +31,39 @@ pub enum StoreError {
     /// An account with this e-mail address (case and spaces ignored) exists.
     #[error("an account with this address already exists")]
     DuplicateAccount,
+}
+
+impl StoreError {
+    /// Whether another connection held the database for too long (see
+    /// `BUSY_TIMEOUT`): trying again a little later may work.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+}
+
+/// How long a write waits for the write of another connection (the
+/// interface, each account's worker and sync, the spam filter's learning)
+/// before failing with "database is locked".
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts a transaction that writes. `BEGIN IMMEDIATE` takes the write
+/// lock at once, waiting up to `BUSY_TIMEOUT` if another connection holds
+/// it. A plain (deferred) transaction that reads first and writes later
+/// fails at once instead, without waiting: in WAL mode SQLite cannot let
+/// it write over a snapshot that another connection changed meanwhile.
+/// Every transaction of the `Store` that writes starts here.
+pub(crate) fn write_tx(conn: &Connection) -> Result<Transaction<'_>, StoreError> {
+    Ok(Transaction::new_unchecked(
+        conn,
+        TransactionBehavior::Immediate,
+    )?)
 }
 
 /// Length of `UnifiedItem::snippet`, in characters.
@@ -155,6 +189,7 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Store, StoreError> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let mut store = Store {
             conn,
@@ -188,7 +223,7 @@ impl Store {
                 // be switched outside a transaction.
                 self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
                 let result = self.conn.execute_batch(&format!(
-                    "BEGIN;\n{sql}\nPRAGMA user_version = {target};\nCOMMIT;"
+                    "BEGIN IMMEDIATE;\n{sql}\nPRAGMA user_version = {target};\nCOMMIT;"
                 ));
                 if result.is_err() {
                     let _ = self.conn.execute_batch("ROLLBACK;");
@@ -201,38 +236,38 @@ impl Store {
             self.migrate_to_v4()?;
         }
         if version < 5 {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = write_tx(&self.conn)?;
             tx.execute_batch(include_str!("schema_v5.sql"))?;
             tx.execute_batch("PRAGMA user_version = 5;")?;
             tx.commit()?;
         }
         if version < 6 {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = write_tx(&self.conn)?;
             tx.execute_batch(include_str!("schema_v6.sql"))?;
             tx.execute_batch("PRAGMA user_version = 6;")?;
             tx.commit()?;
         }
         if version < 7 {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = write_tx(&self.conn)?;
             tx.execute_batch(include_str!("schema_v7.sql"))?;
             classify_unsorted(&tx)?;
             tx.execute_batch("PRAGMA user_version = 7;")?;
             tx.commit()?;
         }
         if version < 8 {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = write_tx(&self.conn)?;
             tx.execute_batch(include_str!("schema_v8.sql"))?;
             tx.execute_batch("PRAGMA user_version = 8;")?;
             tx.commit()?;
         }
         if version < 9 {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = write_tx(&self.conn)?;
             tx.execute_batch(include_str!("schema_v9.sql"))?;
             tx.execute_batch("PRAGMA user_version = 9;")?;
             tx.commit()?;
         }
         if version < 10 {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = write_tx(&self.conn)?;
             tx.execute_batch(include_str!("schema_v10.sql"))?;
             tx.execute_batch("PRAGMA user_version = 10;")?;
             tx.commit()?;
@@ -245,7 +280,7 @@ impl Store {
     /// unique index keeps it that way. Foreign keys stay on, so bodies go
     /// with their messages.
     fn migrate_to_v4(&mut self) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         let doomed: Vec<i64> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM accounts
@@ -383,7 +418,7 @@ impl Store {
     /// Removes an account with its folders, messages, bodies and search
     /// entries. Its secret is not touched (that is the `SecretStore`'s job).
     pub fn delete_account(&self, id: AccountId) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         delete_account_rows(&tx, id)?;
         tx.commit()?;
         Ok(())
@@ -440,7 +475,7 @@ impl Store {
 
     /// Forgets the folder's messages and records its new UID validity.
     pub fn reset_folder(&self, folder: FolderId, uid_validity: u32) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "DELETE FROM messages WHERE folder_id = ?1",
             params![folder.0],
@@ -458,7 +493,7 @@ impl Store {
     /// joins its conversation (see `link_thread`) and gets its tab (see
     /// `category_for`).
     pub fn insert_messages(&self, folder: FolderId, msgs: &[NewMessage]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO messages
@@ -548,7 +583,7 @@ impl Store {
         asked: &[u32],
         fetched: &[NewMessage],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut find = tx.prepare(
                 "SELECT id, message_id, from_addr FROM messages
@@ -1067,7 +1102,7 @@ impl Store {
         text: &str,
         has_attachments: bool,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "INSERT INTO bodies (message_row, raw, text) VALUES (?1, ?2, ?3)
              ON CONFLICT(message_row) DO UPDATE SET raw = excluded.raw, text = excluded.text",
@@ -1084,7 +1119,7 @@ impl Store {
     /// Marks rows as read or unread locally. The change stays pending
     /// (the server's flag does not overwrite it) until `confirm_seen`.
     pub fn set_seen(&self, row_ids: &[i64], seen: bool) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET seen = ?1, seen_pending = seen_pending + 1 WHERE id = ?2",
@@ -1100,7 +1135,7 @@ impl Store {
     /// One pending read/unread change of these rows reached the server
     /// (or failed): the server's flags apply again once none is left.
     pub fn confirm_seen(&self, row_ids: &[i64]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET seen_pending = MAX(seen_pending - 1, 0) WHERE id = ?1",
@@ -1117,7 +1152,7 @@ impl Store {
     /// pending (the server's flag does not overwrite it) until
     /// `confirm_flagged`.
     pub fn set_flagged(&self, row_ids: &[i64], flagged: bool) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET flagged = ?1, flag_pending = flag_pending + 1 WHERE id = ?2",
@@ -1133,7 +1168,7 @@ impl Store {
     /// One pending star change of these rows reached the server (or
     /// failed): the server's flag applies again once none is left.
     pub fn confirm_flagged(&self, row_ids: &[i64]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET flag_pending = MAX(flag_pending - 1, 0) WHERE id = ?1",
@@ -1201,7 +1236,7 @@ impl Store {
         also: &[i64],
     ) -> Result<(), StoreError> {
         let key = sender_key(addr);
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         if !key.is_empty() {
             tx.execute(
                 "INSERT INTO senders (addr, category) VALUES (?1, ?2)
@@ -1263,7 +1298,7 @@ impl Store {
     /// Hides rows from every list (while they are being moved on the
     /// server) or shows them again (the move failed).
     pub fn set_hidden(&self, row_ids: &[i64], hidden: bool) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare("UPDATE messages SET hidden = ?1 WHERE id = ?2")?;
             for &id in row_ids {
@@ -1277,7 +1312,7 @@ impl Store {
     /// Removes rows locally (after a move or delete on the server), with
     /// their bodies and search entries.
     pub fn delete_messages(&self, row_ids: &[i64]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare("DELETE FROM messages WHERE id = ?1")?;
             for &id in row_ids {
@@ -1316,7 +1351,7 @@ impl Store {
         let listed: std::collections::HashSet<u32> = present.iter().map(|f| f.uid).collect();
         let stored = self.inbox_uids(folder)?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut seen = tx.prepare(
                 "UPDATE messages SET seen = ?1
@@ -2249,6 +2284,62 @@ mod tests {
         let err = s.add_account(new_account(" A@X.fr ")).unwrap_err();
         assert!(matches!(err, StoreError::DuplicateAccount), "{err:?}");
         assert_eq!(s.accounts().unwrap().len(), 1);
+    }
+
+    /// Another connection (another thread of Avero) holds the write lock
+    /// for `hold`, from the moment this returns.
+    fn lock_from_elsewhere(path: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let other = Connection::open(path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        other
+            .execute("UPDATE accounts SET name = name", [])
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            other.execute_batch("COMMIT;").unwrap();
+        })
+    }
+
+    #[test]
+    fn a_write_waits_for_another_connection_instead_of_failing() {
+        let path = std::env::temp_dir().join(format!("avero-busy-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        s.insert_messages(f.id, &[msg(1, Some("<1@x>"), 10)])
+            .unwrap();
+
+        // `insert_messages` reads (the sender's tab) before it writes.
+        let other = lock_from_elsewhere(&path, Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        s.insert_messages(f.id, &[msg(2, Some("<2@x>"), 20)])
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        other.join().unwrap();
+
+        let other = lock_from_elsewhere(&path, Duration::from_millis(300));
+        s.set_seen(&inbox_rows(&s), true).unwrap();
+        other.join().unwrap();
+        assert_eq!(count(&s, "messages"), 2);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_lock_held_too_long_is_a_busy_error() {
+        let path = std::env::temp_dir().join(format!("avero-busy-long-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        acct(&s, "a@x.fr");
+        s.conn.busy_timeout(Duration::from_millis(50)).unwrap();
+        let other = lock_from_elsewhere(&path, Duration::from_millis(400));
+        let err = s.set_signature(AccountId(1), "x").unwrap_err();
+        assert!(err.is_busy(), "{err:?}");
+        other.join().unwrap();
+        assert!(!StoreError::DuplicateAccount.is_busy());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Spaces: named groups of accounts ("Perso", "Pro") that limit the list,
 //! the counters and the search to their accounts.
 
-use super::{Store, StoreError};
+use super::{Store, StoreError, write_tx};
 use crate::{AccountFilter, AccountId, Space, SpaceId};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -39,7 +39,7 @@ impl Store {
         color: usize,
         accounts: &[AccountId],
     ) -> Result<SpaceId, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "INSERT INTO spaces (name, icon, color, position)
              VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(position), 0) + 1 FROM spaces))",
@@ -93,7 +93,7 @@ impl Store {
         id: SpaceId,
         accounts: &[AccountId],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         set_members(&tx, id, accounts)?;
         tx.commit()?;
         Ok(())
@@ -111,7 +111,7 @@ impl Store {
         }
         let mut order = order;
         order.swap(from, to as usize);
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         for (position, space) in order.iter().enumerate() {
             tx.execute(
                 "UPDATE spaces SET position = ?1 WHERE id = ?2",

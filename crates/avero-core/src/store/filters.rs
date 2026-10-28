@@ -1,7 +1,7 @@
 //! The user's rules and the spam filter's model, in the database (see
 //! `rules.rs` and `spam.rs` for what they mean).
 
-use super::{Store, StoreError, filter_account, split_list};
+use super::{Store, StoreError, filter_account, split_list, write_tx};
 use crate::category::sender_key;
 use crate::rules::{Condition, Rule, RuleDef, RuleFacts, RuleField, RuleMove};
 use crate::spam::{self, Learned, SpamInput, TokenCount};
@@ -64,7 +64,7 @@ impl Store {
 
     /// Saves a new rule, enabled, after the others.
     pub fn add_rule(&self, def: &RuleDef) -> Result<Rule, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "INSERT INTO rules (name, match_all, mark_read, move_to, account_id, enabled, position)
              VALUES (?1, ?2, ?3, ?4, ?5, 1,
@@ -89,7 +89,7 @@ impl Store {
 
     /// Replaces what a rule says (its place and its switch stay).
     pub fn update_rule(&self, id: i64, def: &RuleDef) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "UPDATE rules SET name = ?1, match_all = ?2, mark_read = ?3, move_to = ?4,
                  account_id = ?5
@@ -144,7 +144,7 @@ impl Store {
         };
         let mut order = order;
         order.swap(at, other);
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare("UPDATE rules SET position = ?1 WHERE id = ?2")?;
             for (position, rule) in order.iter().enumerate() {
@@ -214,7 +214,7 @@ impl Store {
     /// is skipped, and one learned the other way is taken back first.
     /// Returns how many messages changed the model.
     pub fn learn_spam(&self, rows: &[i64], spam: bool) -> Result<usize, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         let mut changed = 0;
         for &row in rows {
             if let Some(message) = learnable(&tx, row)?

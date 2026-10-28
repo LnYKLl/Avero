@@ -25,7 +25,7 @@ use avero_sync::parse::{guarded, parse_body};
 use avero_sync::search::{SEARCH_LIMIT, ServerHits, search_server};
 use avero_sync::smtp::{self, Outgoing, SendError};
 use avero_sync::source::{MailSource, SyncError};
-use avero_sync::sync::{Arrival, sync_account};
+use avero_sync::sync::{Arrival, SyncReport, sync_account};
 use avero_sync::watch::{Change, InboxWatch};
 use iced::futures::stream::{self, BoxStream};
 use iced::futures::{Stream, StreamExt};
@@ -676,6 +676,26 @@ impl RunningSync {
     }
 }
 
+/// How long a sync waits before trying again when the database stayed
+/// locked by another connection (see `Store::BUSY_TIMEOUT`).
+const BUSY_RETRY: Duration = Duration::from_secs(2);
+
+/// Runs `op`, and once more after `pause` if it failed because another
+/// connection held the database too long. A sync can safely run again:
+/// it starts where the batches already saved left off.
+async fn once_more_if_busy<T>(
+    pause: Duration,
+    mut op: impl AsyncFnMut() -> Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    match op().await {
+        Err(SyncError::Store(e)) if e.is_busy() => {
+            tokio::time::sleep(pause).await;
+            op().await
+        }
+        other => other,
+    }
+}
+
 /// What a sync thread needs.
 struct SyncTask<C> {
     account: Account,
@@ -732,11 +752,14 @@ impl<C: Connector> SyncTask<C> {
                     // Kept up to date after every batch, so what an
                     // attempt found survives its failure.
                     let mut found = Vec::new();
-                    let result = sync_account(store, session, id, |report| {
+                    let mut progress = |report: &SyncReport| {
                         found.clone_from(&report.arrivals);
                         for reply in lock(listeners).iter() {
                             let _ = reply.send(Event::Progress);
                         }
+                    };
+                    let result = once_more_if_busy(BUSY_RETRY, async || {
+                        sync_account(store, session, id, &mut progress).await
                     })
                     .await;
                     // A retried attempt may fetch a batch again.
@@ -1887,6 +1910,40 @@ mod tests {
         let store_err = Store::open(&std::env::temp_dir()).err().unwrap();
         let store = user_error(&SyncError::Store(store_err), &account);
         assert!(store.message.starts_with("Erreur de la base locale : "));
+    }
+
+    #[tokio::test]
+    async fn a_locked_database_is_tried_once_more() {
+        let busy = || {
+            SyncError::Store(avero_core::store::StoreError::Sqlite(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), None),
+            ))
+        };
+        let mut calls = 0;
+        let result = once_more_if_busy(Duration::ZERO, async || {
+            calls += 1;
+            if calls == 1 { Err(busy()) } else { Ok(calls) }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 2);
+
+        // Twice locked, or another error: no more tries.
+        let mut calls = 0;
+        let result: Result<(), SyncError> = once_more_if_busy(Duration::ZERO, async || {
+            calls += 1;
+            Err(busy())
+        })
+        .await;
+        assert!(matches!(result, Err(SyncError::Store(_))));
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let result: Result<(), SyncError> = once_more_if_busy(Duration::ZERO, async || {
+            calls += 1;
+            Err(SyncError::Protocol("no".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]

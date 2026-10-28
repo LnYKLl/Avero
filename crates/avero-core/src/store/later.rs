@@ -1,7 +1,7 @@
 //! "Plus tard": conversations put away until a given time. Only this
 //! computer knows (nothing moves on the server).
 
-use super::{MESSAGE_KEY, Store, StoreError};
+use super::{MESSAGE_KEY, Store, StoreError, write_tx};
 use crate::Woken;
 use rusqlite::params;
 use std::collections::BTreeSet;
@@ -21,7 +21,7 @@ impl Store {
     /// every message they hold leaves the lists but "Plus tard". Snoozing
     /// again only moves the time.
     pub fn snooze(&self, rows: &[i64], until: i64) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(&format!(
                 "INSERT INTO snoozes (key, until, woke_at)
@@ -39,7 +39,7 @@ impl Store {
     /// Takes the conversations of `rows` out of "Plus tard" now ("Annuler
     /// le rappel"): they go back to their place in the lists.
     pub fn unsnooze(&self, rows: &[i64]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt =
                 tx.prepare(&format!("DELETE FROM snoozes WHERE key IN ({THREAD_KEYS})"))?;
@@ -66,7 +66,7 @@ impl Store {
     /// one `Woken` per conversation still stored (the caller marks its
     /// newest message unread and tells the user), oldest due first.
     pub fn wake_snoozed(&self, now: i64) -> Result<Vec<Woken>, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         let threads: Vec<i64> = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT m.thread_id, MIN(s.until) FROM snoozes s
