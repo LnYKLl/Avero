@@ -15,4 +15,4 @@ tokio = { version = "1.54", features = ["net", "time", "rt"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 
 [dev-dependencies]
-tokio = { version = "1.54", features = ["macros", "rt"] }
+tokio = { version = "1.54", features = ["macros", "rt", "io-util", "test-util"] }
