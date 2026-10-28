@@ -957,7 +957,35 @@ impl Store {
         filter: AccountFilter,
         by_thread: bool,
     ) -> Result<usize, StoreError> {
+        self.count_items(listing, filter, by_thread, true)
+    }
+
+    /// Number of items of `list`, read or not (the same arguments, all
+    /// pages): the counters of the side bar.
+    pub fn list_count(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+    ) -> Result<usize, StoreError> {
+        self.count_items(listing, filter, by_thread, false)
+    }
+
+    /// Number of items of `list`; only those not seen yet when
+    /// `unread_only`.
+    fn count_items(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+        unread_only: bool,
+    ) -> Result<usize, StoreError> {
         let scope = Scope::of(listing);
+        let having = if unread_only {
+            "HAVING MIN(m.seen) = 0"
+        } else {
+            ""
+        };
         let key = if by_thread {
             "m.thread_id"
         } else {
@@ -971,7 +999,7 @@ impl Store {
                      FROM messages m JOIN folders f ON f.id = m.folder_id
                      WHERE {LIST_CONDITIONS} AND ?3 IS NULL AND ?4 IS NULL AND ?5 IS NULL
                      GROUP BY {key}
-                     HAVING MIN(m.seen) = 0
+                     {having}
                  )"
             ),
             params![
@@ -1983,6 +2011,12 @@ mod tests {
         let only_a = AccountFilter::Only(a);
         assert_eq!(s.unread_count(FolderRole::Inbox, only_a).unwrap(), 1);
         assert_eq!(s.unread_count(FolderRole::Sent, all).unwrap(), 0);
+        // Read or not: the merged message, the read one and b's own.
+        let inbox_listing = Listing::Folder(FolderRole::Inbox);
+        assert_eq!(s.list_count(&inbox_listing, all, false).unwrap(), 3);
+        assert_eq!(s.list_count(&inbox_listing, only_a, false).unwrap(), 2);
+        let sent = Listing::Folder(FolderRole::Sent);
+        assert_eq!(s.list_count(&sent, all, false).unwrap(), 0);
     }
 
     #[test]
