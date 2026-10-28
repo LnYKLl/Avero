@@ -3,3 +3,7 @@ name = "avero-core"
 version.workspace = true
 edition.workspace = true
 license = "GPL-3.0-or-later"
+
+[dependencies]
+rusqlite = { version = "0.41", features = ["bundled"] }
+thiserror = "2"
