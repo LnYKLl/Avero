@@ -130,4 +130,13 @@ pub trait MailSource {
     /// UIDs of the messages of the selected folder whose Message-ID
     /// header is `message_id` (with its angle brackets).
     async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError>;
+
+    /// UIDs of the messages of the selected folder whose sender, subject
+    /// or text holds every word of `query` (what the user typed), in
+    /// increasing order.
+    async fn search_text(&mut self, query: &str) -> Result<Vec<u32>, SyncError>;
+
+    /// Headers of the messages of the selected folder with these UIDs
+    /// (gone ones are left out).
+    async fn fetch_headers_of(&mut self, uids: &[u32]) -> Result<Vec<FetchedHeader>, SyncError>;
 }

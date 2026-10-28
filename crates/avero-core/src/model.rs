@@ -4,6 +4,10 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AccountId(pub i64);
 
+/// Database identifier of a space (a named group of accounts).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SpaceId(pub i64);
+
 /// Database identifier of a folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FolderId(pub i64);
@@ -61,6 +65,9 @@ const PALETTE: [AccountColor; 8] = [
 ];
 
 impl AccountColor {
+    /// How many colours the palette holds.
+    pub const COUNT: usize = PALETTE.len();
+
     /// Returns the colour at `index`, cycling through the 8 fixed colours.
     pub fn palette(index: usize) -> AccountColor {
         PALETTE[index % PALETTE.len()]
@@ -310,6 +317,30 @@ pub enum Listing {
 pub enum AccountFilter {
     All,
     Only(AccountId),
+    /// The accounts of a space (none if the space has none).
+    Space(SpaceId),
+}
+
+/// A space: a name, an icon, a colour and the accounts it shows ("Perso",
+/// "Pro"). An account can be in several spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Space {
+    pub id: SpaceId,
+    pub name: String,
+    /// The name of its icon (the app knows which ones exist).
+    pub icon: String,
+    /// Its colour, an index in the accounts' palette (see
+    /// `AccountColor::palette`).
+    pub color: usize,
+    /// Its accounts, by account id.
+    pub accounts: Vec<AccountId>,
+}
+
+impl Space {
+    /// Whether the space shows this account.
+    pub fn contains(&self, account: AccountId) -> bool {
+        self.accounts.contains(&account)
+    }
 }
 
 /// One line of the unified inbox (duplicates across accounts merged).

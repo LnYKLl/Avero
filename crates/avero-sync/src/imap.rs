@@ -7,7 +7,9 @@ use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncE
 use crate::watch::{Change, IDLE_RENEW, InboxWatch, POLL_EVERY};
 use async_imap::error::Error as ImapError;
 use async_imap::extensions::idle::IdleResponse;
-use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+};
 use async_imap::types::NameAttribute;
 use async_imap::{Authenticator, Client, Session};
 use avero_core::model::{Credentials, Security, ServerConfig, ServerFlags};
@@ -371,6 +373,139 @@ where
     })
     .await?;
     Ok(headers)
+}
+
+/// Headers (with UID and flags) of the messages with these UIDs, asked
+/// in one `UID FETCH` with a UID set (they can be far apart).
+async fn fetch_headers_of<T>(
+    session: &mut Session<T>,
+    uids: &[u32],
+) -> Result<Vec<FetchedHeader>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let Some(&lowest) = uids.iter().min() else {
+        return Ok(Vec::new());
+    };
+    let command = format!(
+        "UID FETCH {} (UID FLAGS RFC822.SIZE {})",
+        uid_set(uids),
+        header_section()
+    );
+    let mut headers = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        headers.extend(header_from_fetch(attributes, lowest));
+    })
+    .await?;
+    headers.retain(|header| uids.contains(&header.uid));
+    Ok(headers)
+}
+
+/// Most words of a search sent to the server.
+const SEARCH_WORDS: usize = 8;
+
+/// The criteria of a search on the server for what the user typed, like
+/// the local search: every word must be in the sender, the subject or the
+/// text (`OR OR FROM "w" SUBJECT "w" BODY "w"` per word, the words
+/// joined, which means "and"). Words without any letter or digit are
+/// dropped; `None` when nothing is left.
+///
+/// Each word is an IMAP quoted string: `\` and `"` escaped with `\`, control
+/// characters (line breaks above all, which would end the command)
+/// removed. Accented words are sent as UTF-8 inside the quotes, which the
+/// big servers accept with `CHARSET UTF-8` (async-imap cannot send
+/// literals, which wait for the server's go-ahead).
+pub fn search_criteria(input: &str) -> Option<String> {
+    let words: Vec<String> = input
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .take(SEARCH_WORDS)
+        .map(|word| {
+            let clean: String = word.chars().filter(|c| !c.is_control()).collect();
+            format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
+        })
+        .map(|quoted| format!("OR OR FROM {quoted} SUBJECT {quoted} BODY {quoted}"))
+        .collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
+/// The `UID SEARCH` command for `criteria`, announcing UTF-8 or not.
+fn search_command(criteria: &str, charset: bool) -> String {
+    if charset {
+        format!("UID SEARCH CHARSET UTF-8 {criteria}")
+    } else {
+        format!("UID SEARCH {criteria}")
+    }
+}
+
+/// Searches the selected folder for what the user typed (see
+/// [`search_criteria`]); the UIDs found, in increasing order. A server
+/// that refuses `CHARSET UTF-8` is asked again without it.
+async fn search_text<T>(session: &mut Session<T>, input: &str) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let Some(criteria) = search_criteria(input) else {
+        return Ok(Vec::new());
+    };
+    let first = with_timeout(
+        FETCH_TIMEOUT,
+        "UID SEARCH",
+        run_uid_search(session, &search_command(&criteria, true)),
+    )
+    .await;
+    match first {
+        Err(SyncError::Protocol(_)) => {
+            with_timeout(
+                FETCH_TIMEOUT,
+                "UID SEARCH",
+                run_uid_search(session, &search_command(&criteria, false)),
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+/// Sends a `UID SEARCH` command and reads the UIDs it finds, up to the
+/// answer tagged for it. Unlike async-imap's `uid_search`, a refusal (NO
+/// or BAD) is an error (`SyncError::Protocol`), not "nothing found".
+async fn run_uid_search<T>(session: &mut Session<T>, command: &str) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let tag = session.run_command(command).await.map_err(command_error)?;
+    let mut uids = Vec::new();
+    loop {
+        let response = match session.read_response().await {
+            Ok(Some(response)) => response,
+            Ok(None) => return Err(SyncError::Connect("connection lost".to_string())),
+            Err(e) => return Err(SyncError::Connect(e.to_string())),
+        };
+        match response.parsed() {
+            Response::Done {
+                tag: done_tag,
+                status,
+                outcome,
+            } if *done_tag == tag => {
+                if *status == Status::Ok {
+                    uids.sort_unstable();
+                    uids.dedup();
+                    return Ok(uids);
+                }
+                let reason = outcome.information.as_deref().unwrap_or("");
+                return Err(SyncError::Protocol(format!(
+                    "UID SEARCH refused: {status:?} {reason}"
+                )));
+            }
+            Response::MailboxData(MailboxDatum::Search(found)) => uids.extend(found),
+            _ => {}
+        }
+    }
 }
 
 /// UIDs of the messages from `from_uid` up, in increasing order.
@@ -938,6 +1073,15 @@ impl MailSource for ImapSource {
     async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError> {
         search_id(&mut self.session, message_id).await
     }
+
+    async fn search_text(&mut self, query: &str) -> Result<Vec<u32>, SyncError> {
+        search_text(&mut self.session, query).await
+    }
+
+    async fn fetch_headers_of(&mut self, uids: &[u32]) -> Result<Vec<FetchedHeader>, SyncError> {
+        let fetching = fetch_headers_of(&mut self.session, uids);
+        with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
+    }
 }
 
 #[cfg(test)]
@@ -1467,6 +1611,111 @@ mod tests {
         assert_eq!(uids, vec![4, 12]);
         let sent = commands(session, server).await;
         assert_eq!(sent, vec!["UID SEARCH HEADER Message-ID \"<d1@ex.fr>\""]);
+    }
+
+    #[test]
+    fn search_criteria_ask_every_word_in_sender_subject_or_text() {
+        assert_eq!(
+            search_criteria("facture").as_deref(),
+            Some(r#"OR OR FROM "facture" SUBJECT "facture" BODY "facture""#)
+        );
+        assert_eq!(
+            search_criteria("  Marie   été ").as_deref(),
+            Some(concat!(
+                r#"OR OR FROM "Marie" SUBJECT "Marie" BODY "Marie" "#,
+                r#"OR OR FROM "été" SUBJECT "été" BODY "été""#
+            ))
+        );
+        // Nothing to look for.
+        assert_eq!(search_criteria("  - ** "), None);
+        assert_eq!(search_criteria(""), None);
+    }
+
+    #[test]
+    fn search_criteria_escape_quotes_and_drop_line_breaks() {
+        let criteria = search_criteria(r#"a"b\c"#).unwrap();
+        assert!(
+            criteria.starts_with(r#"OR OR FROM "a\"b\\c" "#),
+            "{criteria}"
+        );
+        // A line break would end the command: it never goes out.
+        let criteria = search_criteria("x\u{7}y").unwrap();
+        assert!(criteria.contains(r#""xy""#), "{criteria}");
+        assert!(!criteria.contains(['\r', '\n']));
+        // A long query is cut to its first words.
+        let long = "mot ".repeat(20);
+        assert_eq!(
+            search_criteria(&long).unwrap().matches("FROM").count(),
+            SEARCH_WORDS
+        );
+    }
+
+    #[tokio::test]
+    async fn text_search_announces_utf8_and_reads_the_uids() {
+        let (mut session, server) =
+            session_recording(vec!["* SEARCH 40 3 17\r\n{tag} OK done\r\n"]).await;
+        let uids = search_text(&mut session, "réunion").await.unwrap();
+        assert_eq!(uids, vec![3, 17, 40]);
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent[0],
+            r#"UID SEARCH CHARSET UTF-8 OR OR FROM "réunion" SUBJECT "réunion" BODY "réunion""#
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_charset_is_asked_again_without_it() {
+        let (mut session, server) = session_recording(vec![
+            "{tag} NO [BADCHARSET (US-ASCII)] unknown charset\r\n",
+            "* SEARCH 8\r\n{tag} OK done\r\n",
+        ])
+        .await;
+        let uids = search_text(&mut session, "budget").await.unwrap();
+        assert_eq!(uids, vec![8]);
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent[..2],
+            [
+                r#"UID SEARCH CHARSET UTF-8 OR OR FROM "budget" SUBJECT "budget" BODY "budget""#,
+                r#"UID SEARCH OR OR FROM "budget" SUBJECT "budget" BODY "budget""#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_refused_twice_is_a_protocol_error() {
+        let (mut session, _server) =
+            session_recording(vec!["{tag} BAD nope\r\n", "{tag} NO still not\r\n"]).await;
+        let result = search_text(&mut session, "budget").await;
+        assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_search_sends_nothing() {
+        let (mut session, server) = session_recording(vec![]).await;
+        assert!(search_text(&mut session, " ? ").await.unwrap().is_empty());
+        assert!(commands(session, server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn headers_of_scattered_uids_are_asked_in_one_fetch() {
+        let header = "Subject: hi\r\n\r\n";
+        let reply = format!(
+            "{}{}{{tag}} OK done\r\n",
+            fetch_line(1, 5, "", header),
+            fetch_line(2, 900, "\\Seen", header)
+        );
+        let (mut session, server) = session_recording(vec![&reply]).await;
+        let headers = fetch_headers_of(&mut session, &[900, 5]).await.unwrap();
+        let uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
+        assert_eq!(uids, vec![5, 900]);
+        assert!(headers[1].seen);
+        let sent = commands(session, server).await;
+        assert!(
+            sent[0].starts_with("UID FETCH 900,5 (UID FLAGS"),
+            "{}",
+            sent[0]
+        );
     }
 
     #[tokio::test]

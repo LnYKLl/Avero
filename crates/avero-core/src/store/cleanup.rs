@@ -11,7 +11,7 @@ use rusqlite::{OptionalExtension, params};
 /// addresses.
 const CLEANUP_SCOPE: &str = "m.hidden = 0
      AND f.role NOT IN ('trash', 'junk', 'sent', 'drafts')
-     AND (?1 IS NULL OR f.account_id = ?1)
+     AND (?1 IS NULL OR f.account_id IN (SELECT value FROM json_each(?1)))
      AND lower(trim(m.from_addr)) NOT IN (SELECT lower(trim(email)) FROM accounts)";
 
 impl Store {
@@ -41,7 +41,11 @@ impl Store {
              LIMIT ?2 OFFSET ?3"
         ))?;
         let rows = stmt.query_map(
-            params![filter_account(filter), limit as i64, offset as i64],
+            params![
+                filter_account(&self.conn, filter)?,
+                limit as i64,
+                offset as i64
+            ],
             |row| {
                 let addr: String = row.get(0)?;
                 let name: Option<String> = row.get(5)?;
@@ -66,9 +70,10 @@ impl Store {
              WHERE {CLEANUP_SCOPE} AND lower(trim(m.from_addr)) = ?2
              ORDER BY m.date DESC, m.id DESC"
         ))?;
-        let rows = stmt.query_map(params![filter_account(filter), sender_key(addr)], |row| {
-            row.get(0)
-        })?;
+        let rows = stmt.query_map(
+            params![filter_account(&self.conn, filter)?, sender_key(addr)],
+            |row| row.get(0),
+        )?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -84,9 +89,9 @@ impl Store {
             .query_row(
                 "SELECT m.id, f.account_id FROM messages m JOIN folders f ON f.id = m.folder_id
                  WHERE lower(trim(m.from_addr)) = ?1 AND m.list_unsubscribe IS NOT NULL
-                   AND (?2 IS NULL OR f.account_id = ?2)
+                   AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
                  ORDER BY m.date DESC, m.id DESC LIMIT 1",
-                params![sender_key(addr), filter_account(filter)],
+                params![sender_key(addr), filter_account(&self.conn, filter)?],
                 |row| Ok((row.get(0)?, AccountId(row.get(1)?))),
             )
             .optional()?;

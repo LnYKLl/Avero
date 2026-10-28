@@ -162,10 +162,10 @@ impl Store {
             "SELECT {FACT_COLUMNS}
              FROM messages m JOIN folders f ON f.id = m.folder_id
              WHERE f.role = 'inbox' AND m.hidden = 0
-               AND (?1 IS NULL OR f.account_id = ?1)
+               AND (?1 IS NULL OR f.account_id IN (SELECT value FROM json_each(?1)))
              ORDER BY m.date DESC, m.id DESC"
         ))?;
-        let rows = stmt.query_map(params![filter_account(filter)], facts_from_row)?;
+        let rows = stmt.query_map(params![filter_account(&self.conn, filter)?], facts_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

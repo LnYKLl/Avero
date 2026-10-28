@@ -10,6 +10,10 @@ mod cleanup;
 mod drafts;
 mod filters;
 mod later;
+mod server_search;
+mod spaces;
+
+use spaces::filter_account;
 
 use crate::category::{classify, sender_key};
 use crate::{
@@ -54,13 +58,14 @@ const ITEM_COLUMNS: &str = "r.ids, r.accounts, m.subject, m.from_name, m.from_ad
      r.snoozed_until";
 
 /// Which messages a list (and its unread count) takes, on `m` (a message)
-/// and `f` (its folder). Parameters: ?1 folder role, ?2 account, ?6 tab
+/// and `f` (its folder). Parameters: ?1 folder role, ?2 accounts (see
+/// `spaces::filter_account`), ?6 tab
 /// (category), ?7 sender, ?8 starred only, ?9 trash and spam left out;
 /// NULL or 0 means "no condition". ?10 is 1 for "Plus tard" (only the
 /// snoozed messages), else 0 (every list but that one leaves them out).
 /// ?3 (search), ?4 and ?5 (paging) are the caller's.
 const LIST_CONDITIONS: &str = "(?1 IS NULL OR f.role = ?1)
-     AND (?2 IS NULL OR f.account_id = ?2)
+     AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
      AND m.hidden = 0
      AND (?6 IS NULL OR COALESCE(m.category, 'important') = ?6)
      AND (?7 IS NULL OR lower(trim(m.from_addr)) = ?7)
@@ -116,6 +121,14 @@ impl Scope {
     }
 }
 
+/// What a search looks for (see `Store::search_with`).
+struct Search<'a> {
+    /// The FTS query (see `fts_query`).
+    fts: &'a str,
+    /// Rows found otherwise, as a JSON array.
+    rows: String,
+}
+
 /// What makes two rows the same message: the Message-ID, or the row
 /// itself when there is none.
 const MESSAGE_KEY: &str = "COALESCE(m.message_id, 'row:' || m.id)";
@@ -124,7 +137,7 @@ const MESSAGE_KEY: &str = "COALESCE(m.message_id, 'row:' || m.id)";
 /// or NULL, `?3` the folder role being listed): every folder but the
 /// trash and spam ones, unless the list is one of them.
 const THREAD_SCOPE: &str = "m.thread_id = ?1 AND m.hidden = 0
-     AND (?2 IS NULL OR f.account_id = ?2)
+     AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
      AND (f.role NOT IN ('trash', 'junk') OR f.role = ?3)";
 
 impl Store {
@@ -216,6 +229,12 @@ impl Store {
             let tx = self.conn.unchecked_transaction()?;
             tx.execute_batch(include_str!("schema_v9.sql"))?;
             tx.execute_batch("PRAGMA user_version = 9;")?;
+            tx.commit()?;
+        }
+        if version < 10 {
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(include_str!("schema_v10.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 10;")?;
             tx.commit()?;
         }
         Ok(())
@@ -688,6 +707,7 @@ impl Store {
             return Ok(items);
         }
         let own = self.own_addresses()?;
+        let accounts = filter_account(&self.conn, filter)?;
         let mut stmt = self.conn.prepare(&format!(
             "SELECT COALESCE(m.message_id, 'row:' || m.id), m.from_name, m.from_addr
              FROM messages m JOIN folders f ON f.id = m.folder_id
@@ -698,14 +718,13 @@ impl Store {
             let Some(thread) = item.thread_id else {
                 continue;
             };
-            let rows =
-                stmt.query_map(params![thread, filter_account(filter), scope.role], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
+            let rows = stmt.query_map(params![thread, accounts, scope.role], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
             let mut messages = HashSet::new();
             let mut people: Vec<(String, String)> = Vec::new();
             for found in rows {
@@ -769,7 +788,7 @@ impl Store {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![thread, filter_account(filter), role.as_str()],
+            params![thread, filter_account(&self.conn, filter)?, role.as_str()],
             |row| item_from_row(row, true),
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -789,14 +808,33 @@ impl Store {
         filter: AccountFilter,
         limit: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
+        self.search_with(query, role, filter, &[], limit)
+    }
+
+    /// `search`, plus the rows of `also` (in the folders and accounts
+    /// searched): the messages a search on the server found, whose text
+    /// may not be on this computer.
+    pub fn search_with(
+        &self,
+        query: &str,
+        role: Option<FolderRole>,
+        filter: AccountFilter,
+        also: &[i64],
+        limit: usize,
+    ) -> Result<Vec<UnifiedItem>, StoreError> {
         let scope = match role {
             Some(role) => Scope::of(&Listing::Folder(role)),
             None => Scope::everywhere(),
         };
-        match fts_query(query) {
-            Some(fts) => self.grouped(&scope, filter, Some(&fts), false, limit, 0),
-            None => Ok(Vec::new()),
-        }
+        let Some(fts) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<String> = also.iter().map(i64::to_string).collect();
+        let found = Search {
+            fts: &fts,
+            rows: format!("[{}]", rows.join(",")),
+        };
+        self.grouped(&scope, filter, Some(&found), false, limit, 0)
     }
 
     /// Shared by `list` and `search`: one item per Message-ID (or per row
@@ -806,14 +844,17 @@ impl Store {
         &self,
         scope: &Scope,
         filter: AccountFilter,
-        fts: Option<&str>,
+        search: Option<&Search>,
         by_thread: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        let fts_condition = match fts {
-            Some(_) => "AND m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3)",
-            None => "AND ?3 IS NULL",
+        let fts_condition = match search {
+            Some(_) => {
+                "AND (m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3)
+                      OR m.id IN (SELECT value FROM json_each(?11)))"
+            }
+            None => "AND ?3 IS NULL AND ?11 IS NULL",
         };
         let key = if by_thread {
             "m.thread_id"
@@ -865,8 +906,8 @@ impl Store {
         let rows = stmt.query_map(
             params![
                 scope.role,
-                filter_account(filter),
-                fts,
+                filter_account(&self.conn, filter)?,
+                search.map(|s| s.fts),
                 limit as i64,
                 offset as i64,
                 scope.category,
@@ -874,6 +915,7 @@ impl Store {
                 scope.starred,
                 scope.skip_trash,
                 scope.snoozed,
+                search.map(|s| s.rows.as_str()),
             ],
             |row| item_from_row(row, by_thread),
         )?;
@@ -934,7 +976,7 @@ impl Store {
             ),
             params![
                 scope.role,
-                filter_account(filter),
+                filter_account(&self.conn, filter)?,
                 none,
                 none,
                 none,
@@ -1089,13 +1131,15 @@ impl Store {
             "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
              WHERE m.thread_id = (SELECT thread_id FROM messages WHERE id = ?1)
                AND m.flagged = 1 AND m.hidden = 0
-               AND (?2 IS NULL OR f.account_id = ?2)
+               AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
                AND f.role NOT IN ('trash', 'junk')
              ORDER BY m.id",
         )?;
         let mut found: Vec<i64> = Vec::new();
         for &id in row_ids {
-            let rows = stmt.query_map(params![id, filter_account(filter)], |row| row.get(0))?;
+            let rows = stmt.query_map(params![id, filter_account(&self.conn, filter)?], |row| {
+                row.get(0)
+            })?;
             for row in rows {
                 let row = row?;
                 if !row_ids.contains(&row) && !found.contains(&row) {
@@ -1406,7 +1450,8 @@ fn split_list(text: Option<&str>, separator: char) -> Vec<String> {
 
 /// Deletes the rows an account owns, inside the caller's transaction.
 fn delete_account_rows(conn: &Connection, id: AccountId) -> Result<(), StoreError> {
-    // Bodies go by ON DELETE CASCADE, search entries by trigger.
+    // Bodies (and the account's place in its spaces) go by ON DELETE
+    // CASCADE, search entries by trigger.
     conn.execute(
         "DELETE FROM messages
          WHERE folder_id IN (SELECT id FROM folders WHERE account_id = ?1)",
@@ -1415,14 +1460,6 @@ fn delete_account_rows(conn: &Connection, id: AccountId) -> Result<(), StoreErro
     conn.execute("DELETE FROM folders WHERE account_id = ?1", params![id.0])?;
     conn.execute("DELETE FROM accounts WHERE id = ?1", params![id.0])?;
     Ok(())
-}
-
-/// `None` for all accounts, else the account id (for `?n IS NULL OR ...`).
-fn filter_account(filter: AccountFilter) -> Option<i64> {
-    match filter {
-        AccountFilter::All => None,
-        AccountFilter::Only(id) => Some(id.0),
-    }
 }
 
 /// Builds a list item from a row of `ITEM_COLUMNS`. With `in_thread`, the
@@ -2515,7 +2552,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let ids = thread_ids(&s);
         assert_eq!(ids["Un"], 1);
         assert_eq!(ids["Deux"], 3);
@@ -2535,8 +2572,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Undoes versions 9 and 8 (to test older migrations).
+    /// Undoes versions 10, 9 and 8 (to test older migrations).
     const UNDO_V8: &str = "
+        DROP TABLE space_accounts;
+        DROP TABLE spaces;
         DROP TABLE draft_files;
         DROP TABLE drafts;
         DROP TABLE snoozes;
@@ -2870,7 +2909,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
         assert_eq!(tab(&s, Category::Notification), vec!["noreply@banque.fr 2"]);
         assert!(tab(&s, Category::Important).is_empty());
@@ -2931,7 +2970,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

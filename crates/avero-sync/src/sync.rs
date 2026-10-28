@@ -339,7 +339,7 @@ fn arrivals(messages: Vec<NewMessage>) -> impl Iterator<Item = Arrival> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use avero_core::model::{
         AccountFilter, AuthKind, Listing, NewAccount, Security, ServerConfig, ServerFlags,
@@ -361,11 +361,11 @@ mod tests {
         }
     }
 
-    struct FakeFolder {
+    pub(crate) struct FakeFolder {
         path: String,
         attributes: Vec<String>,
         uid_validity: u32,
-        uids: Vec<u32>,
+        pub(crate) uids: Vec<u32>,
         /// UIDs carrying `\Seen`.
         seen: Vec<u32>,
         /// UIDs carrying `\Flagged`.
@@ -380,6 +380,13 @@ mod tests {
         extra: Vec<(u32, String)>,
         /// The headers come without RFC822.SIZE (an old Avero).
         no_sizes: bool,
+        /// What a text search finds (whatever the words).
+        pub(crate) found: Vec<u32>,
+        /// A text search on this folder is refused.
+        pub(crate) search_fails: bool,
+        /// Messages with another folder's Message-ID (a Gmail label is a
+        /// view: its messages are those of the other folders).
+        pub(crate) same_as: Vec<(u32, String)>,
     }
 
     impl FakeFolder {
@@ -391,9 +398,12 @@ mod tests {
         /// The header block of `uid`: its Message-ID tells the folder
         /// apart, so copies in two folders are different messages.
         fn raw(&self, uid: u32) -> Vec<u8> {
+            let id = match self.same_as.iter().find(|(u, _)| *u == uid) {
+                Some((_, id)) => id.clone(),
+                None => format!("<{uid}.{}@fake>", self.path),
+            };
             let mut raw = format!(
-                "Message-ID: <{uid}.{}@fake>\r\nFrom: a@b.c\r\nSubject: m{uid}\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n",
-                self.path
+                "Message-ID: {id}\r\nFrom: a@b.c\r\nSubject: m{uid}\r\nDate: Mon, 1 Jan 2024 10:00:00 +0000\r\n"
             );
             for (_, line) in self.extra.iter().filter(|(u, _)| *u == uid) {
                 raw.push_str(line);
@@ -405,7 +415,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeSource {
+    pub(crate) struct FakeSource {
         folders: Vec<FakeFolder>,
         selected: Option<usize>,
         selects: Vec<String>,
@@ -419,10 +429,20 @@ mod tests {
         flag_ranges: Vec<(u32, u32)>,
         /// (from, to) of every fetch_sizes call.
         size_fetches: Vec<(u32, u32)>,
+        /// The UIDs of every fetch_headers_of call.
+        pub(crate) uid_fetches: Vec<Vec<u32>>,
+        /// The words of every text search.
+        pub(crate) searches: Vec<String>,
     }
 
     impl FakeSource {
-        fn add_folder(&mut self, path: &str, attrs: &[&str], validity: u32, uids: Vec<u32>) {
+        pub(crate) fn add_folder(
+            &mut self,
+            path: &str,
+            attrs: &[&str],
+            validity: u32,
+            uids: Vec<u32>,
+        ) {
             self.folders.push(FakeFolder {
                 path: path.to_string(),
                 attributes: attrs.iter().map(|a| a.to_string()).collect(),
@@ -435,10 +455,13 @@ mod tests {
                 fetch_fails_from: None,
                 extra: Vec::new(),
                 no_sizes: false,
+                found: Vec::new(),
+                search_fails: false,
+                same_as: Vec::new(),
             });
         }
 
-        fn folder(&mut self, path: &str) -> &mut FakeFolder {
+        pub(crate) fn folder(&mut self, path: &str) -> &mut FakeFolder {
             self.folders.iter_mut().find(|f| f.path == path).unwrap()
         }
 
@@ -647,9 +670,45 @@ mod tests {
         async fn search_message_id(&mut self, _message_id: &str) -> Result<Vec<u32>, SyncError> {
             Ok(Vec::new())
         }
+
+        async fn search_text(&mut self, query: &str) -> Result<Vec<u32>, SyncError> {
+            self.searches.push(query.to_string());
+            let folder = self.selected();
+            if folder.search_fails {
+                return Err(SyncError::Protocol("SEARCH refused".into()));
+            }
+            let mut found: Vec<u32> = folder
+                .found
+                .iter()
+                .copied()
+                .filter(|uid| folder.uids.contains(uid))
+                .collect();
+            found.sort_unstable();
+            Ok(found)
+        }
+
+        async fn fetch_headers_of(
+            &mut self,
+            uids: &[u32],
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            self.uid_fetches.push(uids.to_vec());
+            let folder = self.selected();
+            Ok(folder
+                .uids
+                .iter()
+                .filter(|uid| uids.contains(uid))
+                .map(|&uid| FetchedHeader {
+                    uid,
+                    seen: folder.seen.contains(&uid),
+                    flagged: folder.flagged.contains(&uid),
+                    size: folder.size(uid),
+                    raw: folder.raw(uid),
+                })
+                .collect())
+        }
     }
 
-    fn setup() -> (Store, AccountId) {
+    pub(crate) fn setup() -> (Store, AccountId) {
         let store = Store::open_in_memory().unwrap();
         let server = |host: &str| ServerConfig {
             host: host.into(),
@@ -670,7 +729,7 @@ mod tests {
     }
 
     /// Synchronises without watching progress.
-    async fn sync(
+    pub(crate) async fn sync(
         store: &Store,
         source: &mut FakeSource,
         account: AccountId,
