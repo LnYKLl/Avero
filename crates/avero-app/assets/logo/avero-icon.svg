@@ -1,11 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#7B70FF"/>
-      <stop offset="1" stop-color="#4A3FD6"/>
+      <stop offset="0" stop-color="#4F3BD1"/>
+      <stop offset="0.55" stop-color="#6A4FE6"/>
+      <stop offset="1" stop-color="#A35BD0"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
-  <path d="M17 47 L32 15 L47 47" fill="none" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M21.5 37.5 C28 33.5 36 32 49 27" fill="none" stroke="#FFFFFF" stroke-opacity="0.82" stroke-width="4.5" stroke-linecap="round"/>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <!-- "Ruban": a strip of paper folded into an A; the light leg in front. -->
+  <path d="M51 51 L41.5 51 L27.5 13 L37 13 Z" fill="#E4DBFF" fill-opacity="0.8"/>
+  <path d="M13 51 L22.5 51 L36.5 13 L27 13 Z" fill="#FFFFFF"/>
 </svg>

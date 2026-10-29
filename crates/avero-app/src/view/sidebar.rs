@@ -216,7 +216,7 @@ fn brand<'a>() -> Element<'a, Message> {
     container(
         button(
             row![
-                container(text("A").size(16).font(BOLD))
+                container(icons::icon(Icon::Mark, 18.0, Tone::Accent))
                     .center(30)
                     .style(theme::logo_tile),
                 text("Avero").size(19).font(BOLD).color(Color::WHITE),
@@ -551,7 +551,7 @@ fn folded_view(app: &App) -> Element<'_, Message> {
         Message::Space(SpaceMsg::Select(None)),
     ));
     let content = column![
-        container(text("A").size(16).font(BOLD))
+        container(icons::icon(Icon::Mark, 18.0, Tone::Accent))
             .center(30)
             .style(theme::logo_tile),
         space().height(14),
