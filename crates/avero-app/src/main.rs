@@ -11,6 +11,7 @@ mod diag;
 mod icons;
 mod instance;
 mod later;
+mod links;
 mod marks;
 mod notify;
 mod oauth_setup;
@@ -135,6 +136,20 @@ fn boot(opened: Option<Store>) -> (App, Task<Message>) {
                     ));
                     // The first letter of Le Monde: an HTML mail.
                     Some(Message::MessageSelected(2))
+                }
+                Ok("link") => {
+                    // The dialog of a link whose text shows another site.
+                    let _ = app.update(Message::TabSelected(
+                        avero_core::category::Category::Newsletter,
+                    ));
+                    let _ = app.update(Message::MessageSelected(2));
+                    if let Some(reading) = &mut app.reading {
+                        reading.pressed_link = Some(marks::Link {
+                            url: "http://banque-securite.example/connexion?session=8f2c".into(),
+                            label: "www.mabanque.fr".into(),
+                        });
+                    }
+                    Some(Message::ReaderReleased)
                 }
                 _ => None,
             };

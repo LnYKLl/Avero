@@ -19,8 +19,8 @@ use avero_sync::parse::{Address, ParsedBody};
 use chrono::Local;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Column, Row, button, center, column, container, row, scrollable, space, text, text_editor,
-    tooltip,
+    Column, Row, button, center, column, container, mouse_area, row, scrollable, space, text,
+    text_editor, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Padding, keyboard};
 
@@ -189,11 +189,11 @@ fn body_text<'a>(entry: &'a Entry, index: usize, fill: bool) -> Element<'a, Mess
                 .padding(0)
                 .wrapping(Wrapping::WordOrGlyph)
                 .style(theme::bare_editor);
-            if fill {
-                editor.height(Fill).into()
-            } else {
-                editor.into()
-            }
+            let editor = if fill { editor.height(Fill) } else { editor };
+            // A link opens on the release (see `ReaderReleased`).
+            mouse_area(editor)
+                .on_release(Message::ReaderReleased)
+                .into()
         }
     }
 }

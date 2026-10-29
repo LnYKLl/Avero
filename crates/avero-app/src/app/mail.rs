@@ -168,12 +168,26 @@ impl App {
                     }) = reading.entries.get_mut(entry)
                 {
                     let click = matches!(action, text_editor::Action::Click(_));
+                    let drag = matches!(action, text_editor::Action::Drag(_));
                     content.perform(action);
-                    // A click (not a drag) on a link opens it.
-                    let at = content.cursor().position;
-                    if click && let Some(url) = marks.link_at(at.line, at.column) {
-                        return Task::done(Message::OpenUrl(url.to_string()));
+                    // A link opens when the button is released (see
+                    // `ReaderReleased`): opening the browser on the press
+                    // would take the release away from the text, which
+                    // would then keep selecting as the mouse moves.
+                    if click {
+                        let at = content.cursor().position;
+                        reading.pressed_link = marks.link_at(at.line, at.column).cloned();
+                    } else if drag && content.selection().is_some() {
+                        // A selection, not a click.
+                        reading.pressed_link = None;
                     }
+                }
+                Task::none()
+            }
+            Message::ReaderReleased => {
+                let link = self.reading.as_mut().and_then(|r| r.pressed_link.take());
+                if let Some(checked) = link.and_then(|l| crate::links::check(&l.url, &l.label)) {
+                    self.overlay = Some(Overlay::OpenLink(checked));
                 }
                 Task::none()
             }
@@ -468,6 +482,7 @@ impl App {
             sender,
             category,
             unsubscribe,
+            pressed_link: None,
         });
         let mut tasks = vec![self.unfold(newest)];
         if !item.seen {
