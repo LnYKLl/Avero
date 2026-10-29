@@ -605,6 +605,7 @@ mod tests {
             in_reply_to: Some("<a@ex.com>".to_string()),
             references: Some("<a@ex.com>".to_string()),
             text: "Bonjour,\n\nÀ jeudi.".to_string(),
+            lines: Vec::new(),
             attachments: Vec::new(),
         }
     }

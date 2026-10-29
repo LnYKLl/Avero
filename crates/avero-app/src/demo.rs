@@ -136,7 +136,14 @@ fn samples() -> Vec<Sample> {
           "Bonjour Camille,\n\nJ'ai avancé 240 € pour la commande des maillots. Je te transmets la facture, peux-tu me faire le virement quand tu as un moment ?\n\nMerci, Claire",
           2 * D + 3 * H, true, Some(("facture-maillots.pdf", "application/pdf", 96_000))),
         s(0, Inbox, ("Le Monde", "newsletter@lemonde.fr"), "La lettre du matin : ce qu'il faut retenir",
-          "Bonjour,\n\nAu sommaire ce matin : climat, budget 2027 et un portrait de la nouvelle génération de cyclistes urbains.\n\nBonne lecture.",
+          "<table width=\"100%\"><tr><td><img src=\"https://example.org/logo.png\" alt=\"Logo\"></td>\
+<td align=\"right\"><a href=\"https://example.org/lettre\">Voir dans le navigateur</a></td></tr>\
+<tr><td colspan=\"2\"><h1>La lettre du matin</h1><p>Bonjour,</p><p>Au sommaire ce matin : <strong>climat</strong>, \
+budget 2027 et un portrait de la nouvelle génération de cyclistes urbains.</p>\
+<p><a href=\"https://example.org/climat\">Climat : ce que change l'accord de la nuit</a><br>\
+<a href=\"https://example.org/budget\">Budget 2027 : les trois chiffres à retenir</a></p><p>Bonne lecture.</p>\
+<p><small>Vous recevez cette lettre car vous y êtes inscrite. \
+<a href=\"https://example.org/desinscription\">Se désinscrire</a></small></p></td></tr></table>",
           2 * D + 10 * H, true, None),
         s(1, Inbox, ("Malt", "team@malt.fr"), "Nouvelle mission : refonte d'une application mobile",
           "Une mission correspondant à votre profil vient d'être publiée : refonte UX d'une application de covoiturage, 20 jours, Lyon ou télétravail.",
@@ -407,7 +414,8 @@ pub fn seed(store: &Store) {
             let _ = store.put_body(
                 row,
                 raw.as_bytes(),
-                sample.body,
+                // Like the sync: the text, not the HTML it may come from.
+                &avero_sync::parse::parse_body(raw.as_bytes()).text,
                 sample.attachment.is_some(),
             );
         }
@@ -643,9 +651,15 @@ fn raw_message(sample: &Sample, to: &str, uid: u32, date: i64, references: &[Str
         ));
     }
     let body = sample.body.replace('\n', "\r\n");
+    // A body written in HTML goes as such (a newsletter).
+    let kind = if body.starts_with('<') {
+        "html"
+    } else {
+        "plain"
+    };
     match sample.attachment {
         None => format!(
-            "{headers}Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{body}\r\n"
+            "{headers}Content-Type: text/{kind}; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{body}\r\n"
         ),
         Some((name, mime, size)) => {
             let filler = filler(size);

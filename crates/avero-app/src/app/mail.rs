@@ -163,11 +163,17 @@ impl App {
                 if !action.is_edit()
                     && let Some(reading) = &mut self.reading
                     && let Some(Entry {
-                        body: Body::Ready { content, .. },
+                        body: Body::Ready { content, marks, .. },
                         ..
                     }) = reading.entries.get_mut(entry)
                 {
+                    let click = matches!(action, text_editor::Action::Click(_));
                     content.perform(action);
+                    // A click (not a drag) on a link opens it.
+                    let at = content.cursor().position;
+                    if click && let Some(url) = marks.link_at(at.line, at.column) {
+                        return Task::done(Message::OpenUrl(url.to_string()));
+                    }
                 }
                 Task::none()
             }
@@ -960,13 +966,15 @@ pub(super) fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
 
 /// The reader's state for a parsed body.
 fn ready_body(opened: Arc<OpenedBody>) -> Body {
-    let text = if opened.parsed.text.trim().is_empty() {
+    let (text, marks) = crate::marks::layout(&opened.parsed.lines);
+    let text = if text.trim().is_empty() {
         "(Ce message ne contient pas de texte.)".to_string()
     } else {
-        opened.parsed.text.trim_end().to_string()
+        text
     };
     Body::Ready {
         content: text_editor::Content::with_text(&text),
+        marks,
         opened,
     }
 }

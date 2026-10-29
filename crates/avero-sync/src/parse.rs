@@ -105,8 +105,32 @@ fn raw_header(message: &mail_parser::Message<'_>, name: &str) -> Option<String> 
     (!value.is_empty()).then_some(value)
 }
 
-/// Width used to wrap text converted from HTML.
-const HTML_TEXT_WIDTH: usize = 100;
+/// Width given to the HTML converter: wide enough that it never wraps a
+/// paragraph itself (the reader wraps to the pane).
+const HTML_TEXT_WIDTH: usize = 10_000;
+
+/// A piece of a line as the reader shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    /// Where a click goes: only `http` and `https` addresses.
+    pub link: Option<String>,
+    pub strong: bool,
+}
+
+/// One line (paragraph) of the message as the reader shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Line {
+    pub spans: Vec<Span>,
+    /// A title (`<h1>` to `<h6>`).
+    pub heading: bool,
+}
+
+impl Line {
+    fn plain(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+}
 
 /// An e-mail address with its optional display name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +172,12 @@ pub struct ParsedBody {
     /// brackets separated by spaces: what a reply's References starts with.
     pub references: Option<String>,
     /// Readable text: the text/plain part, else the HTML converted to text.
+    /// What replies quote and the search reads.
     pub text: String,
+    /// What the reader shows: the HTML part with its links and bold text
+    /// when there is one (it is what the sender meant to be seen), else
+    /// the text with its web addresses made links.
+    pub lines: Vec<Line>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -198,6 +227,7 @@ fn empty_body() -> ParsedBody {
         in_reply_to: None,
         references: None,
         text: String::new(),
+        lines: Vec::new(),
         attachments: Vec::new(),
     }
 }
@@ -216,7 +246,16 @@ fn body_of(message: &mail_parser::Message<'_>) -> ParsedBody {
     body.message_id = message.message_id().map(|id| format!("<{id}>"));
     body.in_reply_to = id_list(message.in_reply_to());
     body.references = id_list(message.references()).or_else(|| body.in_reply_to.clone());
-    body.text = normalize_text(&readable_text(message));
+    let html = html_lines(message);
+    body.text = match plain_text(message) {
+        Some(plain) => normalize_text(&plain),
+        None => normalize_text(&lines_text(&html)),
+    };
+    body.lines = if html.is_empty() {
+        body.text.lines().map(linkify).collect()
+    } else {
+        html
+    };
     body.attachments = message
         .attachments()
         .enumerate()
@@ -264,35 +303,210 @@ fn id_list(value: &mail_parser::HeaderValue<'_>) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-/// The message's text: its text/plain parts if it has any, else its HTML
-/// parts converted to text.
-fn readable_text(message: &mail_parser::Message<'_>) -> String {
-    let parts: Vec<&mail_parser::MessagePart<'_>> = message
+/// The message's text/plain parts, if it has any.
+fn plain_text(message: &mail_parser::Message<'_>) -> Option<String> {
+    let plain: Vec<&str> = message
         .text_body
         .iter()
         .filter_map(|&id| message.part(id))
-        .collect();
-    let plain: Vec<&str> = parts
-        .iter()
         .filter(|part| !part.is_text_html())
         .filter_map(|part| part.text_contents())
         .collect();
-    if !plain.is_empty() {
-        return plain.join("\n\n");
-    }
-    message
-        .html_body
-        .iter()
-        .filter_map(|&id| message.part(id))
-        .filter_map(|part| part.text_contents())
-        .map(html_to_text)
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    (!plain.is_empty()).then(|| plain.join("\n\n"))
 }
 
-/// HTML to readable text, entirely offline.
-fn html_to_text(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), HTML_TEXT_WIDTH).unwrap_or_default()
+/// The message's HTML parts as lines, entirely offline (nothing is
+/// fetched; an image only keeps its text when it is a link). Empty when
+/// the message has no HTML.
+fn html_lines(message: &mail_parser::Message<'_>) -> Vec<Line> {
+    let mut lines = Vec::new();
+    for part in message.html_body.iter().filter_map(|&id| message.part(id)) {
+        if !part.is_text_html() {
+            continue;
+        }
+        if let Some(html) = part.text_contents() {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.extend(html_to_lines(html));
+        }
+    }
+    tidy(lines)
+}
+
+/// HTML to lines. Layout tables (most newsletters) are read as blocks,
+/// one cell after the other, instead of being drawn as a grid.
+fn html_to_lines(html: &str) -> Vec<Line> {
+    use html2text::render::RichAnnotation;
+    let Ok(rendered) = html2text::config::rich()
+        .raw_mode(true)
+        .link_footnotes(false)
+        .lines_from_read(html.as_bytes(), HTML_TEXT_WIDTH)
+    else {
+        return Vec::new();
+    };
+    rendered
+        .into_iter()
+        .map(|rendered| {
+            let mut line = Line::default();
+            for piece in rendered.tagged_strings() {
+                let link = piece.tag.iter().find_map(|tag| match tag {
+                    RichAnnotation::Link(url) => Some(url.as_str()),
+                    _ => None,
+                });
+                let image = piece
+                    .tag
+                    .iter()
+                    .any(|tag| matches!(tag, RichAnnotation::Image(_)));
+                // An image's alternative text says little on its own
+                // ("logo", "spacer"); inside a link it names the link.
+                if image && link.is_none() {
+                    continue;
+                }
+                let strong = piece
+                    .tag
+                    .iter()
+                    .any(|tag| matches!(tag, RichAnnotation::Strong));
+                push_span(&mut line, &piece.s, link.and_then(web_link), strong);
+            }
+            heading_of(&mut line);
+            line
+        })
+        .collect()
+}
+
+/// Adds a piece to the line, joined to the previous one when it looks
+/// the same.
+fn push_span(line: &mut Line, text: &str, link: Option<String>, strong: bool) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = line.spans.last_mut()
+        && last.link == link
+        && last.strong == strong
+    {
+        last.text.push_str(text);
+        return;
+    }
+    line.spans.push(Span {
+        text: text.to_string(),
+        link,
+        strong,
+    });
+}
+
+/// The converter writes titles as `# Title`: the marks go, the line is
+/// a heading.
+fn heading_of(line: &mut Line) {
+    let Some(first) = line.spans.first_mut() else {
+        return;
+    };
+    let marks = first.text.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&marks) && first.text[marks..].starts_with(' ') {
+        first.text.drain(..=marks);
+        line.heading = true;
+    }
+}
+
+/// The address a link may open: `http` and `https` only (never
+/// `javascript:`, `file:` or the like).
+fn web_link(url: &str) -> Option<String> {
+    let url = url.trim();
+    let scheme = url.split_once(':')?.0;
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        .then(|| url.to_string())
+}
+
+/// A line of plain text, its web addresses made links.
+fn linkify(text: &str) -> Line {
+    let mut line = Line::default();
+    let mut rest = text;
+    while let Some(start) = find_url(rest) {
+        let (before, from) = rest.split_at(start);
+        let end = from
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
+            .unwrap_or(from.len());
+        let url = url_end(&from[..end]);
+        push_span(&mut line, before, None, false);
+        push_span(&mut line, url, web_link(url), false);
+        rest = &from[url.len()..];
+    }
+    push_span(&mut line, rest, None, false);
+    line
+}
+
+/// An address without the punctuation that ends the sentence around it
+/// (a closing bracket stays when the address opened one).
+fn url_end(url: &str) -> &str {
+    let mut url = url;
+    loop {
+        let Some(last) = url.chars().last() else {
+            return url;
+        };
+        let opened = url.matches('(').count() > url.matches(')').count() - usize::from(last == ')');
+        let trailing = matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ']' | '\'')
+            || (last == ')' && !opened);
+        if !trailing {
+            return url;
+        }
+        url = &url[..url.len() - last.len_utf8()];
+    }
+}
+
+/// Where the next `http://` or `https://` address starts.
+fn find_url(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("http") {
+        let at = from + found;
+        let after = &lower[at..];
+        let starts_word = at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric();
+        let scheme = if after.starts_with("https://") {
+            8
+        } else if after.starts_with("http://") {
+            7
+        } else {
+            0
+        };
+        let named = after[scheme.max(1)..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric());
+        if starts_word && scheme > 0 && named {
+            return Some(at);
+        }
+        from = at + 4;
+    }
+    None
+}
+
+/// Lines as plain text.
+fn lines_text(lines: &[Line]) -> String {
+    lines.iter().map(Line::plain).collect::<Vec<_>>().join("\n")
+}
+
+/// Like `normalize_text` for lines: no trailing spaces, at most one blank
+/// line in a row, none at the start or the end.
+fn tidy(lines: Vec<Line>) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut blank = false;
+    for mut line in lines {
+        if let Some(last) = line.spans.last_mut() {
+            let kept = last.text.trim_end().len();
+            last.text.truncate(kept);
+        }
+        line.spans.retain(|span| !span.text.is_empty());
+        if line.plain().trim().is_empty() {
+            blank = true;
+            continue;
+        }
+        if blank && !out.is_empty() {
+            out.push(Line::default());
+        }
+        blank = false;
+        out.push(line);
+    }
+    out
 }
 
 /// LF line ends, no trailing spaces, at most one blank line in a row, no
@@ -668,6 +882,112 @@ Content-Type: text/html; charset=utf-8\r\n\
         let body = parse_body(raw.as_bytes());
         assert_eq!(body.text, "Version texte");
         assert!(body.attachments.is_empty());
+        // The reader shows the HTML, with its bold text.
+        assert_eq!(
+            body.lines,
+            vec![Line {
+                spans: vec![span("Version ", None), strong("HTML")],
+                heading: false,
+            }]
+        );
+    }
+
+    fn span(text: &str, link: Option<&str>) -> Span {
+        Span {
+            text: text.into(),
+            link: link.map(str::to_string),
+            strong: false,
+        }
+    }
+
+    fn strong(text: &str) -> Span {
+        Span {
+            strong: true,
+            ..span(text, None)
+        }
+    }
+
+    fn html_message(html: &str) -> String {
+        format!("From: a@b.c\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n")
+    }
+
+    #[test]
+    fn a_newsletter_reads_as_lines_with_links() {
+        let raw = html_message(
+            "<table width=\"100%\"><tr><td><img src=\"https://cdn.ex/logo.png\" alt=\"Logo\"></td>\
+             <td><a href=\"https://shop.ex/view\">Voir en ligne</a></td></tr>\
+             <tr><td colspan=\"2\"><h1>Les soldes</h1><p>Profitez de <strong>-30 %</strong> \
+             jusqu'à dimanche.</p><p><a href=\"https://shop.ex/p/1\"><img src=\"https://cdn.ex/1.jpg\" \
+             alt=\"Pull\"></a></p></td></tr></table>",
+        );
+        let body = parse_body(raw.as_bytes());
+        let link = |text: &str, url: &str| Line {
+            spans: vec![span(text, Some(url))],
+            heading: false,
+        };
+        assert_eq!(
+            body.lines,
+            vec![
+                link("Voir en ligne", "https://shop.ex/view"),
+                Line {
+                    spans: vec![span("Les soldes", None)],
+                    heading: true,
+                },
+                Line::default(),
+                Line {
+                    spans: vec![
+                        span("Profitez de ", None),
+                        strong("-30 %"),
+                        span(" jusqu'à dimanche.", None),
+                    ],
+                    heading: false,
+                },
+                Line::default(),
+                link("Pull", "https://shop.ex/p/1"),
+            ]
+        );
+        // No grid, no numbered references, no addresses at the end.
+        for drawn in ['─', '│', '['] {
+            assert!(!body.text.contains(drawn), "{}", body.text);
+        }
+        assert!(!body.text.contains("https://"), "{}", body.text);
+    }
+
+    #[test]
+    fn only_web_links_can_be_clicked() {
+        let raw = html_message(
+            "<a href=\"javascript:alert(1)\">a</a> <a href=\"file:///C:/x\">b</a> \
+             <a href=\"HTTPS://ex.com/c\">c</a>",
+        );
+        let body = parse_body(raw.as_bytes());
+        let links: Vec<_> = body.lines[0]
+            .spans
+            .iter()
+            .filter_map(|s| s.link.as_deref())
+            .collect();
+        assert_eq!(links, ["HTTPS://ex.com/c"]);
+    }
+
+    #[test]
+    fn web_addresses_in_plain_text_become_links() {
+        let line = linkify("Voir https://ex.com/a, ou (http://ex.com/b_(c)). Fin");
+        assert_eq!(
+            line.spans,
+            vec![
+                span("Voir ", None),
+                span("https://ex.com/a", Some("https://ex.com/a")),
+                span(", ou (", None),
+                span("http://ex.com/b_(c)", Some("http://ex.com/b_(c)")),
+                span("). Fin", None),
+            ]
+        );
+        assert_eq!(linkify("rien ici http:// shttps://x").spans.len(), 1);
+        let body = parse_body(b"From: a@b.c\r\n\r\nLigne 1\r\n\r\nhttps://ex.com\r\n");
+        assert_eq!(body.lines.len(), 3);
+        assert_eq!(
+            body.lines[2].spans[0].link.as_deref(),
+            Some("https://ex.com")
+        );
     }
 
     const MIXED_WITH_PDF: &str = "From: a@b.c\r\n\

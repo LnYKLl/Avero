@@ -171,8 +171,9 @@ fn body_text<'a>(entry: &'a Entry, index: usize, fill: bool) -> Element<'a, Mess
     match &entry.body {
         Body::NotLoaded | Body::Loading => notice(Icon::Loader, "Chargement du message…", false),
         Body::Failed(error) => notice(Icon::Alert, error, true),
-        Body::Ready { content, .. } => {
+        Body::Ready { content, marks, .. } => {
             let editor = text_editor(content)
+                .highlight_with::<crate::marks::Highlighter>(marks.clone(), crate::marks::format)
                 .on_action(move |action| Message::ReaderAction(index, action))
                 // Read-only: only the Ctrl keys (copy, select all) stay
                 // here, the others go to the shortcuts (J, K, E…).

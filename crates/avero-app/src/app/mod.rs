@@ -314,6 +314,8 @@ pub enum Body {
         opened: Arc<OpenedBody>,
         /// Read-only editor: lets the user select and copy the text.
         content: text_editor::Content,
+        /// Its links and bold text.
+        marks: crate::marks::Marks,
     },
     Failed(String),
 }
