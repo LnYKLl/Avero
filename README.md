@@ -49,7 +49,7 @@ You need the stable Rust toolchain (https://rustup.rs). Then, from this folder:
 cargo run --release -p avero-app
 ```
 
-The first build takes a few minutes. The app draws its UI in software (tiny-skia), which keeps memory low (about 25 MB private memory in demo mode, see `docs/memory.md`). To use the GPU renderer (wgpu) instead, add `--features gpu`.
+The first build takes a few minutes. The app draws its UI on the GPU (wgpu) for smooth scrolling, and falls back to software rendering (tiny-skia) when no GPU is usable. Software rendering uses far less memory (about 25 MB private memory in demo mode instead of about 175 MB, see `docs/memory.md`): set `ICED_BACKEND=tiny-skia`, or build with `--no-default-features`.
 
 ### Try it without an account (demo mode)
 

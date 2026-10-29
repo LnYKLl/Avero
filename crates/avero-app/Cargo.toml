@@ -12,8 +12,8 @@ avero-oauth = { path = "../avero-oauth" }
 avero-sync = { path = "../avero-sync" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 directories = "6"
-# iced's default features minus `wgpu`: software rendering (tiny-skia) by
-# default, which uses far less memory. See docs/memory.md.
+# iced's default features minus `wgpu`, which the default `gpu` feature
+# below adds back. See docs/memory.md.
 # `svg` draws the Lucide icons, `tokio` gives `time::every` (auto sync).
 iced = { version = "0.14", default-features = false, features = ["advanced", "tiny-skia", "crisp", "web-colors", "linux-theme-detection", "x11", "wayland", "svg", "tokio"] }
 # Same version as the one iced uses for SVG: rasterises the window icon.
@@ -54,8 +54,11 @@ windows-sys = { version = "0.61", features = [
 winresource = { version = "0.1.34", default-features = false }
 
 [features]
-# `cargo build --features gpu` adds the GPU renderer (wgpu). iced then
-# prefers it and falls back to tiny-skia if no GPU is available.
+# GPU rendering (wgpu) by default: smooth scrolling at any scale, for about
+# 150 MB more memory. iced falls back to tiny-skia when no GPU is usable;
+# ICED_BACKEND=tiny-skia forces it, and `--no-default-features` leaves wgpu
+# out of the build.
+default = ["gpu"]
 gpu = ["iced/wgpu"]
 
 [dev-dependencies]
