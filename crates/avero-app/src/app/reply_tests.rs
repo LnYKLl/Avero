@@ -138,7 +138,7 @@ fn quick_reply_opens_the_full_composer_with_the_text() {
 }
 
 #[test]
-fn quick_reply_keys_send_with_ctrl_enter_and_keep_the_letters() {
+fn quick_reply_keys_send_with_command_enter_and_keep_the_letters() {
     use iced::keyboard::{Key, Modifiers, key};
     let press = |key: Key, modifiers, status, text: Option<&str>| KeyPress {
         key: key.clone(),
@@ -150,13 +150,15 @@ fn quick_reply_keys_send_with_ctrl_enter_and_keep_the_letters() {
     };
     let focused = Status::Focused { is_hovered: false };
     let enter = || Key::Named(key::Named::Enter);
-    let sends = quick_reply_binding(press(enter(), Modifiers::CTRL, focused, None));
+    let sends = quick_reply_binding(press(enter(), Modifiers::COMMAND, focused, None));
     assert!(matches!(
         sends,
         Some(Binding::Custom(Message::QuickReply(QuickMsg::Send)))
     ));
     // Not focused: the key is not the field's.
-    assert!(quick_reply_binding(press(enter(), Modifiers::CTRL, Status::Active, None)).is_none());
+    assert!(
+        quick_reply_binding(press(enter(), Modifiers::COMMAND, Status::Active, None)).is_none()
+    );
     // A letter typed in the field stays there (the one-key shortcuts
     // never see it).
     let letter = quick_reply_binding(press(
