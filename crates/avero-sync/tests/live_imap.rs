@@ -1,6 +1,6 @@
 //! Tests of the real IMAP client.
 
-use avero_core::model::{FolderRole, NewAccount, ServerConfig};
+use avero_core::model::{AuthKind, Credentials, FolderRole, NewAccount, Security, ServerConfig};
 use avero_core::store::Store;
 use avero_sync::imap::ImapSource;
 use avero_sync::source::SyncError;
@@ -13,9 +13,10 @@ async fn bad_host_is_connect_error() {
         host: "127.0.0.1".to_string(),
         port: 1,
         username: "nobody".to_string(),
+        security: Security::Tls,
     };
     let start = Instant::now();
-    let result = ImapSource::connect(&cfg, "secret").await;
+    let result = ImapSource::connect(&cfg, &Credentials::Password("secret".into())).await;
     assert!(matches!(result, Err(SyncError::Connect(_))));
     assert!(start.elapsed() < Duration::from_secs(10));
 }
@@ -32,6 +33,7 @@ async fn live_sync_against_real_server() {
         host,
         port: 993,
         username: user.clone(),
+        security: Security::Tls,
     };
 
     let store = Store::open_in_memory().unwrap();
@@ -40,11 +42,16 @@ async fn live_sync_against_real_server() {
             name: "live".to_string(),
             email: user,
             imap: imap.clone(),
+            smtp: imap.clone(),
+            auth: AuthKind::Password,
         })
         .unwrap();
 
-    let mut source = ImapSource::connect(&imap, &pass).await.unwrap();
-    let report = sync_account(&store, &mut source, account.id).await.unwrap();
+    let creds = Credentials::Password(pass);
+    let mut source = ImapSource::connect(&imap, &creds).await.unwrap();
+    let report = sync_account(&store, &mut source, account.id, |_| {})
+        .await
+        .unwrap();
 
     assert!(report.folders >= 1);
     let folders = store.folders(account.id).unwrap();

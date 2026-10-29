@@ -1,70 +1,71 @@
-//! The thin icon bar on the left of the window.
+//! The ink rail on the left: logo, Courrier, Rechercher, Écrire, then
+//! Réglages and "Ajouter un compte" at the bottom.
 
-use crate::app::Message;
-use iced::widget::{button, center, column, container, space, text, tooltip};
-use iced::{Element, Fill, Theme, border};
+use super::tip;
+use crate::app::{AddMsg, App, ComposeMsg, Message, Screen};
+use crate::icons::{self, Icon, Tone};
+use crate::theme;
+use iced::widget::{button, center, column, container, space, tooltip};
+use iced::{Alignment, Color, Element, Fill};
 
 /// Width of the rail, in pixels.
-const WIDTH: f32 = 48.0;
+pub const WIDTH: f32 = 64.0;
 
-/// Mails (the current screen), Calendar and Big clean-up (not there yet),
-/// and Settings at the bottom.
-pub fn view<'a>() -> Element<'a, Message> {
+pub fn view(app: &App) -> Element<'_, Message> {
+    let mail = app.screen == Screen::Mail && app.composer.is_none();
+    let writing = app.screen == Screen::Mail && app.composer.is_some();
+    let settings = app.screen == Screen::Settings;
     let rail = column![
-        icon("✉", "Mails", true),
-        icon("▦", "Calendrier — Bientôt", false),
-        icon("♻", "Grand nettoyage — Bientôt", false),
+        container(icons::icon(Icon::Logo, 36.0, Tone::Original)).padding([4, 0]),
+        space().height(14),
+        item(Icon::Inbox, "Courrier", mail, Message::ShowMail),
+        item(
+            Icon::Search,
+            "Rechercher (Ctrl+F)",
+            false,
+            Message::Key(
+                iced::keyboard::Key::Character("f".into()),
+                iced::keyboard::Modifiers::COMMAND,
+            ),
+        ),
+        item(
+            Icon::Compose,
+            "Écrire (Ctrl+N)",
+            writing,
+            Message::Compose(ComposeMsg::New),
+        ),
         space().height(Fill),
-        icon("⚙", "Réglages — Bientôt", false),
+        item(Icon::Settings, "Réglages", settings, Message::ShowSettings),
+        item(
+            Icon::Plus,
+            "Ajouter un compte",
+            false,
+            Message::Add(AddMsg::Open(None)),
+        ),
     ]
-    .spacing(8)
-    .padding([10, 0])
-    .align_x(iced::Center);
+    .spacing(6)
+    .padding([16, 0])
+    .align_x(Alignment::Center);
 
     container(rail)
         .width(WIDTH)
         .height(Fill)
-        .style(|theme: &Theme| {
-            let palette = theme.extended_palette();
-            container::Style {
-                background: Some(palette.background.weak.color.into()),
-                ..container::Style::default()
-            }
-        })
+        .style(theme::rail)
         .into()
 }
 
-/// One rail button. None of them sends a message yet: Mails is the only
-/// screen, so it is simply drawn as active.
-fn icon<'a>(glyph: &'a str, label: &'a str, active: bool) -> Element<'a, Message> {
-    let button = button(center(text(glyph).size(18)))
-        .width(34)
-        .height(34)
+/// One rail button with its tooltip on the right.
+fn item<'a>(icon: Icon, label: &'a str, active: bool, on_press: Message) -> Element<'a, Message> {
+    let tone = if active {
+        Tone::Fixed(Color::WHITE)
+    } else {
+        Tone::Rail
+    };
+    let button = button(center(icons::icon(icon, 20.0, tone)))
+        .width(42)
+        .height(42)
         .padding(0)
-        .style(move |theme: &Theme, _status| {
-            let palette = theme.extended_palette();
-            let (background, text_color) = if active {
-                (
-                    Some(palette.primary.base.color.into()),
-                    palette.primary.base.text,
-                )
-            } else {
-                (None, palette.background.strong.color)
-            };
-            button::Style {
-                background,
-                text_color,
-                border: border::rounded(8),
-                ..button::Style::default()
-            }
-        });
-
-    tooltip(
-        button,
-        container(text(label).size(13))
-            .padding(6)
-            .style(container::rounded_box),
-        tooltip::Position::Right,
-    )
-    .into()
+        .on_press(on_press)
+        .style(theme::rail_button(active));
+    tip(button, label, tooltip::Position::Right)
 }

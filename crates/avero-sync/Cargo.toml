@@ -8,11 +8,18 @@ license = "GPL-3.0-or-later"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 avero-core = { path = "../avero-core" }
 futures = "0.3.34"
+html2text = "0.17.4"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-native-certs"] }
 mail-parser = "0.11"
 rustls-native-certs = "0.8"
 thiserror = "2"
 tokio = { version = "1.54", features = ["net", "time", "rt"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+
+[features]
+# Test builds only: trust the extra CA named by AVERO_TEST_CA_PEM (local
+# end-to-end tests, docs/e2e-local.md). Never enabled by avero-app.
+test-ca = []
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["macros", "rt", "io-util", "test-util"] }
