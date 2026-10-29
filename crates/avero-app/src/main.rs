@@ -7,9 +7,11 @@ mod auth;
 mod background;
 mod compose;
 mod demo;
+mod diag;
 mod icons;
 mod instance;
 mod later;
+mod marks;
 mod notify;
 mod oauth_setup;
 mod paths;
@@ -127,6 +129,13 @@ fn boot(opened: Option<Store>) -> (App, Task<Message>) {
             let screen = match std::env::var("AVERO_DEMO_SCREEN").as_deref() {
                 Ok("settings") => Some(Message::ShowSettings),
                 Ok("cleanup") => Some(Message::ShowCleanup),
+                Ok("newsletter") => {
+                    let _ = app.update(Message::TabSelected(
+                        avero_core::category::Category::Newsletter,
+                    ));
+                    // The first letter of Le Monde: an HTML mail.
+                    Some(Message::MessageSelected(2))
+                }
                 _ => None,
             };
             if let Some(screen) = screen {
@@ -137,6 +146,10 @@ fn boot(opened: Option<Store>) -> (App, Task<Message>) {
         }
         None => {
             let db_path = paths::database_path();
+            if let Some(dir) = db_path.parent() {
+                diag::open(dir);
+            }
+            diag::diag!("Avero {} démarre", env!("CARGO_PKG_VERSION"));
             // Checked in `main` before the window opened.
             let store = opened.unwrap_or_else(|| Store::open(&db_path).expect("open database"));
             let backend = Backend::Live {

@@ -15,6 +15,7 @@
 
 use crate::auth::{self, AccessToken, OAuthSecret};
 use crate::background::oauth_message;
+use crate::diag::diag;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
@@ -859,20 +860,46 @@ impl<C: Connector> WatchTask<C> {
     /// starts again once they are fixed (the settings change).
     async fn watch(&self) {
         let mut delay = self.retry.first;
+        let id = self.account.id.0;
+        let mut connected_before = false;
         loop {
             match self.login.connect_watch(&self.account).await {
                 Ok(mut watcher) => {
-                    while let Ok(change) = watcher.wait().await {
-                        delay = self.retry.first;
-                        if change != Change::Quiet && self.changed.send(change).is_err() {
-                            return;
+                    diag!("compte {id} : surveillance de la réception connectée");
+                    // A new watcher only sees what comes from now on: mail
+                    // that came while the last connection was lost needs
+                    // a sync.
+                    if connected_before && self.changed.send(Change::Arrived).is_err() {
+                        return;
+                    }
+                    connected_before = true;
+                    loop {
+                        match watcher.wait().await {
+                            Ok(change) => {
+                                diag!("compte {id} : surveillance : {change:?}");
+                                delay = self.retry.first;
+                                if change != Change::Quiet && self.changed.send(change).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                diag!("compte {id} : surveillance interrompue : {error}");
+                                break;
+                            }
                         }
                     }
                 }
                 Err(error) if matches!(error.kind, ErrorKind::Auth | ErrorKind::Reconnect) => {
+                    diag!(
+                        "compte {id} : surveillance arrêtée (identifiants) : {}",
+                        error.message
+                    );
                     return;
                 }
-                Err(_) => {}
+                Err(error) => diag!(
+                    "compte {id} : surveillance : connexion impossible : {}",
+                    error.message
+                ),
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(self.retry.max);
@@ -1042,7 +1069,10 @@ impl<C: Connector> Worker<C> {
                     self.sync_after_change(SyncScope::Inbox);
                 }
                 // The watcher ended on its own (credentials refused).
-                Wake::Watch(None) => self.watch = None,
+                Wake::Watch(None) => {
+                    diag!("compte {} : plus de surveillance", self.account.id.0);
+                    self.watch = None;
+                }
             }
         }
     }
@@ -1099,6 +1129,15 @@ impl<C: Connector> Worker<C> {
             }
             Job::Sync { reply } => self.request_sync(reply),
             Job::Watch { reply } => {
+                diag!(
+                    "compte {} : abonnement aux nouvelles (surveillance {})",
+                    self.account.id.0,
+                    if self.watch.is_none() {
+                        "lancée"
+                    } else {
+                        "déjà en route"
+                    }
+                );
                 self.events = Some(reply);
                 if self.watch.is_none() {
                     self.start_watch();
@@ -1216,6 +1255,7 @@ impl<C: Connector> Worker<C> {
 
     async fn stop_watch(&mut self) {
         if let Some(running) = self.watch.take() {
+            diag!("compte {} : surveillance arrêtée", self.account.id.0);
             running.stop().await;
         }
     }
@@ -1257,8 +1297,21 @@ impl<C: Connector> Worker<C> {
     /// it, the watch subscriber gets one more sync right after it.
     fn sync_after_change(&mut self, scope: SyncScope) {
         let Some(events) = self.events.clone() else {
+            diag!(
+                "compte {} : changement ignoré (pas d'abonné)",
+                self.account.id.0
+            );
             return;
         };
+        diag!(
+            "compte {} : synchro {scope:?} demandée par la surveillance{}",
+            self.account.id.0,
+            if self.sync.is_some() {
+                " (après celle en cours)"
+            } else {
+                ""
+            }
+        );
         match &mut self.sync {
             Some(running) => {
                 if !running.rerun_for_change {
@@ -1333,6 +1386,7 @@ impl<C: Connector> Worker<C> {
     }
 
     fn start_sync(&mut self, replies: Vec<Reply>, scope: SyncScope) {
+        diag!("compte {} : synchro {scope:?} lancée", self.account.id.0);
         let listeners: Listeners = Arc::new(Mutex::new(replies));
         let (cancel, cancelled) = oneshot::channel();
         let (finished, done) = oneshot::channel();
@@ -1367,6 +1421,18 @@ impl<C: Connector> Worker<C> {
             return;
         };
         let SyncEnd { result, arrivals } = end;
+        match &result {
+            Ok(()) => diag!(
+                "compte {} : synchro finie, {} nouveau(x) message(s)",
+                self.account.id.0,
+                arrivals.len()
+            ),
+            Err(error) => diag!(
+                "compte {} : synchro en échec : {}",
+                self.account.id.0,
+                error.message
+            ),
+        }
         if !arrivals.is_empty()
             && let Some(events) = &self.events
         {
@@ -3010,6 +3076,10 @@ mod tests {
         fake.server.watching.notified().await;
         assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 4);
         assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
+        // Mail may have come while the connection was lost: a sync, on
+        // its own.
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
         // The new connection still reports changes.
         fake.inbox.send(Ok(Change::Arrived)).unwrap();
         let event = next_final(&mut events).await;
