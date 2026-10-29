@@ -172,6 +172,43 @@ fn quick_reply_keys_send_with_command_enter_and_keep_the_letters() {
     assert!(matches!(newline, Some(Binding::Enter)));
 }
 
+// ------------------------------------------------------------- links
+
+#[test]
+fn a_link_is_checked_when_the_button_is_released() {
+    let mut app = reading_marie();
+    // A release with no link pressed (a selection) opens nothing.
+    let _ = app.update(Message::ReaderReleased);
+    assert!(app.overlay.is_none());
+
+    app.reading.as_mut().unwrap().pressed_link = Some(crate::marks::Link {
+        url: "https://evil.example/login".into(),
+        label: "www.banque.fr".into(),
+    });
+    let _ = app.update(Message::ReaderReleased);
+    let Some(Overlay::OpenLink(link)) = &app.overlay else {
+        panic!("{:?}", app.overlay);
+    };
+    assert_eq!(link.host, "evil.example");
+    assert_eq!(link.warnings.len(), 1);
+    assert!(app.reading.as_ref().unwrap().pressed_link.is_none());
+
+    // "Copier l'adresse" closes the dialog without opening anything.
+    let _ = app.update(Message::CopyLinkConfirmed);
+    assert!(app.overlay.is_none());
+}
+
+#[test]
+fn only_web_links_reach_the_dialog() {
+    let mut app = reading_marie();
+    app.reading.as_mut().unwrap().pressed_link = Some(crate::marks::Link {
+        url: "file:///C:/Windows/system32".into(),
+        label: "facture.pdf".into(),
+    });
+    let _ = app.update(Message::ReaderReleased);
+    assert!(app.overlay.is_none());
+}
+
 // ------------------------------------------------------ search on the server
 
 fn search(app: &mut App, text: &str) {

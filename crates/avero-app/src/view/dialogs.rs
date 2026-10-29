@@ -42,7 +42,62 @@ pub fn view<'a>(app: &'a App, overlay: &'a Overlay) -> Element<'a, Message> {
         Overlay::Later(picker) => later_picker(app, picker),
         Overlay::SpaceEditor(form) => space_editor(app, form),
         Overlay::ConfirmDeleteSpace { name, .. } => confirm_delete_space(name),
+        Overlay::OpenLink(link) => open_link(link),
     }
+}
+
+/// A link of a message, before it opens: the site it really leads to,
+/// its full address, and what looks wrong about it.
+fn open_link(link: &crate::links::Checked) -> Element<'_, Message> {
+    let mut body = column![
+        text("Ce lien mène vers le site")
+            .size(13)
+            .style(theme::muted),
+        text(&link.host).size(17).font(SEMIBOLD),
+        text(link.shown_url())
+            .size(12)
+            .style(theme::muted)
+            .wrapping(iced::widget::text::Wrapping::Glyph),
+    ]
+    .spacing(6);
+    let suspicious = !link.warnings.is_empty();
+    if suspicious {
+        let mut warnings = Column::new().spacing(6);
+        for warning in &link.warnings {
+            warnings = warnings.push(
+                row![
+                    icons::icon(Icon::Alert, 15.0, Tone::Fixed(theme::LIGHT.danger)),
+                    text(warning.describe(&link.host)).size(13),
+                ]
+                .spacing(8),
+            );
+        }
+        body = body.push(space().height(6)).push(
+            container(warnings)
+                .padding(12)
+                .width(Fill)
+                .style(theme::note),
+        );
+    }
+    let (confirm, style): (&str, ButtonStyle) = if suspicious {
+        ("Ouvrir quand même", theme::danger)
+    } else {
+        ("Ouvrir", theme::primary)
+    };
+    let actions = row![
+        button(text("Copier l'adresse").size(13).font(MEDIUM))
+            .padding([8, 14])
+            .on_press(Message::CopyLinkConfirmed)
+            .style(theme::secondary),
+        buttons(confirm, Some(Message::OpenLinkConfirmed), style),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    card_width(
+        "Ouvrir le lien",
+        column![body, actions].spacing(18).into(),
+        460.0,
+    )
 }
 
 /// A space: its name, icon, colour and accounts.

@@ -144,6 +144,8 @@ pub enum Overlay {
         space: SpaceId,
         name: String,
     },
+    /// A link of a message, checked, before it opens.
+    OpenLink(crate::links::Checked),
 }
 
 /// "Changer le mot de passe".
@@ -275,6 +277,9 @@ pub struct Reading {
     pub category: Option<Category>,
     /// How to unsubscribe from that message's list, if it offers it.
     pub unsubscribe: Option<UnsubscribeOffer>,
+    /// The link under the mouse button pressed in the text: checked when
+    /// the button is released, unless the press became a selection.
+    pub pressed_link: Option<crate::marks::Link>,
 }
 
 impl Reading {
@@ -404,6 +409,11 @@ pub enum Message {
 
     /// Selection or scrolling in the text of a reader entry.
     ReaderAction(usize, text_editor::Action),
+    /// The mouse button released over the text of a reader entry.
+    ReaderReleased,
+    /// "Ouvrir" and "Copier l'adresse" in the dialog of a link.
+    OpenLinkConfirmed,
+    CopyLinkConfirmed,
     /// Unfolds (or folds) a message of the conversation being read.
     EntryToggled(usize),
     Answer(Mode),
@@ -930,6 +940,17 @@ impl App {
                 }
                 Task::none()
             }
+            Message::OpenLinkConfirmed | Message::CopyLinkConfirmed => {
+                let Some(Overlay::OpenLink(link)) = self.overlay.take() else {
+                    return Task::none();
+                };
+                if matches!(message, Message::OpenLinkConfirmed) {
+                    self.update(Message::OpenUrl(link.url))
+                } else {
+                    let toast = self.toast("Adresse du lien copiée", false);
+                    Task::batch([iced::clipboard::write(link.url), toast])
+                }
+            }
             Message::CopyText(text) => {
                 let toast = self.toast(format!("Copié : {text}"), false);
                 Task::batch([iced::clipboard::write(text), toast])
@@ -1022,6 +1043,7 @@ impl App {
             | Message::SelectAll(_)
             | Message::LoadMore
             | Message::ReaderAction(..)
+            | Message::ReaderReleased
             | Message::EntryToggled(_)
             | Message::Answer(_)
             | Message::Archive

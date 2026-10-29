@@ -17,13 +17,20 @@ pub enum Mark {
     Strong,
 }
 
+/// A link of the message: where it goes, and its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub url: String,
+    pub label: String,
+}
+
 /// One marked piece of a line: its byte range, and where it goes if it
 /// is a link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Marked {
     range: Range<usize>,
     mark: Mark,
-    link: Option<String>,
+    link: Option<Link>,
 }
 
 /// The marks of a whole message, line by line. Shared, and compared by
@@ -39,13 +46,13 @@ impl PartialEq for Marks {
 
 impl Marks {
     /// The link under column `column` (a byte index) of line `line`.
-    pub fn link_at(&self, line: usize, column: usize) -> Option<&str> {
+    pub fn link_at(&self, line: usize, column: usize) -> Option<&Link> {
         self.0
             .get(line)?
             .iter()
             .find(|marked| marked.range.start <= column && column < marked.range.end)?
             .link
-            .as_deref()
+            .as_ref()
     }
 }
 
@@ -72,7 +79,10 @@ pub fn layout(lines: &[Line]) -> (String, Marks) {
                 marked.push(Marked {
                     range: range.clone(),
                     mark,
-                    link: span.link.clone(),
+                    link: span.link.clone().map(|url| Link {
+                        url,
+                        label: span.text.clone(),
+                    }),
                 });
             }
             text.push_str(&span.text);
@@ -177,8 +187,12 @@ mod tests {
         let (text, marks) = layout(&lines);
         assert_eq!(text, "Titre\n\nVoir ici et là");
         assert_eq!(marks.link_at(2, 4), None);
-        assert_eq!(marks.link_at(2, 5), Some("https://ex.com"));
-        assert_eq!(marks.link_at(2, 7), Some("https://ex.com"));
+        let link = Link {
+            url: "https://ex.com".into(),
+            label: "ici".into(),
+        };
+        assert_eq!(marks.link_at(2, 5), Some(&link));
+        assert_eq!(marks.link_at(2, 7), Some(&link));
         assert_eq!(marks.link_at(2, 8), None);
         assert_eq!(marks.link_at(0, 0), None);
         assert_eq!(marks.link_at(9, 0), None);
