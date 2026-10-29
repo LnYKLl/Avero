@@ -14,7 +14,7 @@ Supported platforms: Windows, macOS and Linux. The interface is in French.
 
 ## Features
 
-- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Gmail and Microsoft accounts can sign in with "Continuer avec Google / Microsoft" in the browser (OAuth2, PKCE). Other providers use a password or an app password. The IMAP and SMTP logins are tested before the account is saved.
+- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Accounts use a password or an app password; Outlook.com, which takes no password, signs in with Microsoft in the browser (OAuth2, PKCE) after a one-time assistant. The IMAP and SMTP logins are tested before the account is saved.
 - **Unified inbox** for all accounts, with a filter per account and the usual folders (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille). Messages received by several of your accounts appear once.
 - **Reading**: plain text (HTML is converted to text locally, nothing is downloaded from the web), attachments saved with the system "Save as" dialog, messages marked as read automatically.
 - **Acting**: reply, reply all, forward (with the original attachments), write a new message with attachments (25 MB max), archive, delete (to the trash; from the trash, deleted for good after a confirmation), mark as unread. An archive or delete only leaves the local copy once the server has confirmed it; if it fails, the message comes back with the reason.
@@ -62,14 +62,11 @@ AVERO_DEMO=1 cargo run --release -p avero-app
 
 Demo mode uses an in-memory database with three made-up accounts and about forty French messages. Nothing touches the network or your real data. `AVERO_DEMO=empty` shows the welcome screen; `AVERO_DEMO=google-setup` (or `microsoft-setup`) opens the connection assistant (nothing is saved). `AVERO_THEME=dark` (or `light`) forces a theme without saving it.
 
-### Gmail
+### Gmail, Outlook and the others
 
-- **With the Google button**: Google requires every app to have its own OAuth client, created by its owner in the Google Cloud console, so Avero cannot ship one. The first time, Avero opens a built-in assistant ("Configurer la connexion Google", about 5 minutes, once): each step has a button that opens the right console page, then you paste the client id and secret and Avero signs you in straight away. After that, every Gmail account is one click. The ids can be viewed (masked), changed or removed in Settings → "Connexion Google / Microsoft". Details and the manual way (`oauth.json`, compile-time variables): [docs/oauth-setup.md](docs/oauth-setup.md) (French).
-
-  ![Google connection assistant](docs/screenshots/google-setup.png)
-- **With an app password**: turn on 2-step verification on your Google account, create an app password at https://myaccount.google.com/apppasswords, and paste it in Avero (spaces are removed automatically).
-
-Outlook.com / Hotmail accounts only work with the Microsoft button, which also needs a client id: the same assistant guides you through the Microsoft Entra app registration (only the application id is needed).
+- **Gmail** (and Yahoo, iCloud, AOL): turn on 2-step verification on your account, create an app password (for Google: https://myaccount.google.com/apppasswords), and paste it in Avero (spaces are removed automatically). Avero shows the right link when you type your address.
+- **Outlook.com / Hotmail / Live**: Microsoft no longer accepts passwords in mail apps, only its own sign-in (OAuth), which needs an application id registered by each user. Avero explains this and opens a built-in assistant ("Configurer la connexion Microsoft", once, free): each step has a button to the right Microsoft Entra page, then you paste the application id and Avero signs you in. It can be changed or removed in Settings → "Connexion Outlook". Details: [docs/oauth-setup.md](docs/oauth-setup.md) (French).
+- **Everything else** (Orange, Free, SFR, OVH, your own domain…): your usual password.
 
 ## Where files are kept
 

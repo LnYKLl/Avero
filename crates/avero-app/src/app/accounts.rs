@@ -288,10 +288,6 @@ impl App {
                     && form.stage == Stage::Detecting
                 {
                     form.apply_detection(config, configured);
-                    if let Some(provider) = form.needs_setup() {
-                        form.stage = Stage::Setup(provider);
-                        return Task::none();
-                    }
                     return iced::widget::operation::focus(PASSWORD_ID);
                 }
                 Task::none()

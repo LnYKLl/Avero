@@ -127,37 +127,16 @@ fn credentials_step(form: &AccountForm) -> Element<'_, Message> {
         && let Some(provider) = form.oauth_provider()
     {
         step = step.push(oauth_button(provider));
-        if form.allows_password() {
-            step = step.push(
-                container(
-                    button(text("Utiliser plutôt un mot de passe d'application").size(13))
-                        .on_press(Message::Add(AddMsg::UsePassword))
-                        .style(theme::link),
-                )
-                .center_x(Fill),
-            );
-        }
         if let Some(error) = &form.error {
             step = step.push(error_line(error));
         }
         return step.into();
     }
-    let setup_link = form.setup_offer().map(|provider| {
-        container(
-            button(
-                text(format!(
-                    "Configurer plutôt la connexion {} (une seule fois)",
-                    auth::provider_name(provider)
-                ))
-                .size(13),
-            )
-            .on_press(Message::Add(AddMsg::ShowSetup(provider)))
-            .style(theme::link),
-        )
-        .center_x(Fill)
-    });
     if !form.shows_password() {
-        return step.extend(setup_link.map(Element::from)).into();
+        if let Some(provider) = form.setup_offer() {
+            step = step.push(setup_offer(provider));
+        }
+        return step.into();
     }
 
     let label = if form.app_password() {
@@ -215,7 +194,39 @@ fn credentials_step(form: &AccountForm) -> Element<'_, Message> {
             .on_press(Message::Add(AddMsg::SubmitPassword))
             .style(theme::primary),
     )
-    .extend(setup_link.map(Element::from))
+    .into()
+}
+
+/// For an address that takes no password (Outlook.com): why, and the
+/// assistant that registers the user's own connection.
+fn setup_offer<'a>(provider: Provider) -> Element<'a, Message> {
+    let name = auth::provider_name(provider);
+    column![
+        container(
+            text(format!(
+                "{name} n'accepte plus les mots de passe dans les logiciels de messagerie. \
+                 Pour ajouter cette adresse, enregistrez une fois votre propre connexion \
+                 {name} : c'est gratuit, et l'assistant vous guide (une dizaine de minutes)."
+            ))
+            .size(13),
+        )
+        .padding(12)
+        .width(Fill)
+        .style(theme::note),
+        button(
+            container(
+                text(format!("Configurer la connexion {name}"))
+                    .size(14)
+                    .font(MEDIUM)
+            )
+            .center_x(Fill)
+        )
+        .width(Fill)
+        .padding([10, 16])
+        .on_press(Message::Add(AddMsg::ShowSetup(provider)))
+        .style(theme::primary),
+    ]
+    .spacing(14)
     .into()
 }
 

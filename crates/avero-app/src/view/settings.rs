@@ -25,7 +25,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         text("Réglages").size(26).font(SEMIBOLD),
         section("Comptes", accounts(app)),
         section("Espaces", spaces(app)),
-        section("Connexion Google / Microsoft", oauth_clients(app)),
+        section("Connexion Outlook", oauth_clients(app)),
         section("Notifications", notifications(app)),
         section("Lecture", reading(app)),
         section("Règles", rules(app)),
@@ -278,13 +278,14 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
     .into()
 }
 
-/// The OAuth clients behind "Continuer avec Google / Microsoft".
+/// The OAuth clients behind "Continuer avec Microsoft" (Outlook takes no
+/// password). Google only for those who set it up before: Gmail takes an
+/// app password.
 fn oauth_clients(app: &App) -> Element<'_, Message> {
     let mut list = Column::new();
-    for (index, provider) in [Provider::Google, Provider::Microsoft]
-        .into_iter()
-        .enumerate()
-    {
+    let google = app.oauth_clients.contains_key(&Provider::Google);
+    let providers = std::iter::once(Provider::Microsoft).chain(google.then_some(Provider::Google));
+    for (index, provider) in providers.enumerate() {
         if index > 0 {
             list = list.push(hr());
         }
@@ -294,9 +295,10 @@ fn oauth_clients(app: &App) -> Element<'_, Message> {
         .push(
             container(
                 text(
-                    "Google et Microsoft demandent que chaque application soit enregistrée par \
-                     son propriétaire. L'assistant vous guide une seule fois ; ensuite chaque \
-                     compte se connecte en un clic.",
+                    "Outlook et Hotmail n'acceptent plus les mots de passe : chacun enregistre \
+                     sa propre connexion Microsoft, une seule fois, avec l'assistant. Les autres \
+                     adresses, Gmail compris, se connectent avec un mot de passe ou un mot de \
+                     passe d'application.",
                 )
                 .size(12)
                 .style(theme::muted),

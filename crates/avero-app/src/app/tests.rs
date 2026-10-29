@@ -663,7 +663,7 @@ fn google_button_without_client_opens_the_assistant() {
 }
 
 #[test]
-fn gmail_address_without_client_opens_the_assistant() {
+fn gmail_address_asks_the_app_password() {
     use crate::account_form::Stage;
     let mut app = app_with(|_| {});
     let _ = app.update(Message::Add(AddMsg::Open(None)));
@@ -677,13 +677,32 @@ fn gmail_address_without_client_opens_the_assistant() {
         generation,
         avero_autoconfig::known("jean@gmail.com"),
     )));
-    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
-    let _ = app.update(Message::Add(AddMsg::UsePassword));
+    // No assistant: Gmail takes an app password.
     assert_eq!(form(&app).stage, Stage::Credentials);
     assert!(form(&app).shows_password());
-    // ... and back to the assistant from the credentials.
-    let _ = app.update(Message::Add(AddMsg::ShowSetup(Provider::Google)));
-    assert_eq!(form(&app).stage, Stage::Setup(Provider::Google));
+    assert!(form(&app).app_password());
+}
+
+#[test]
+fn outlook_address_offers_its_assistant() {
+    use crate::account_form::Stage;
+    let mut app = app_with(|_| {});
+    let _ = app.update(Message::Add(AddMsg::Open(None)));
+    let _ = app.update(Message::Add(AddMsg::Field(
+        Field::Email,
+        "jean@hotmail.fr".into(),
+    )));
+    let _ = app.update(Message::Add(AddMsg::SubmitEmail));
+    let generation = form(&app).generation;
+    let _ = app.update(Message::Add(AddMsg::Detected(
+        generation,
+        avero_autoconfig::known("jean@hotmail.fr"),
+    )));
+    assert_eq!(form(&app).stage, Stage::Credentials);
+    assert!(!form(&app).shows_password());
+    assert_eq!(form(&app).setup_offer(), Some(Provider::Microsoft));
+    let _ = app.update(Message::Add(AddMsg::ShowSetup(Provider::Microsoft)));
+    assert_eq!(form(&app).stage, Stage::Setup(Provider::Microsoft));
 }
 
 const GOOGLE_ID: &str = "1234567890-abcdef.apps.googleusercontent.com";
