@@ -2,32 +2,67 @@
 //!
 //! Each worker owns a thread with a small tokio runtime, its own `Store`
 //! connection (a SQLite connection cannot be shared between threads) and
-//! a cached IMAP session, reconnected when it breaks. Jobs for the same
-//! account run one after the other; different accounts run in parallel.
+//! a cached IMAP session, reconnected when it breaks. The user's jobs for
+//! the same account run one after the other; different accounts run in
+//! parallel. A sync runs beside them on a thread of its own, with its own
+//! IMAP session and `Store` connection, so opening a message never waits
+//! for a long first sync. Once the UI subscribes ([`WorkerHandle::watch`]),
+//! a third connection, on a thread of its own too, watches the inbox
+//! (IMAP IDLE, or polling) and asks for a sync whenever it changes.
 //!
 //! The UI sends a [`Job`] holding a [`Reply`] sender and reads the
 //! [`Event`]s from the matching stream (see [`request`]).
 
 use crate::auth::{self, AccessToken, OAuthSecret};
 use crate::background::oauth_message;
+use crate::diag::diag;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
-use avero_core::{Account, AccountFilter, Credentials, FolderRole, MessageRef};
-use avero_sync::imap::ImapSource;
+use avero_core::{
+    Account, AccountFilter, AccountId, Credentials, DraftCopy, FolderRole, MessageRef, ServerConfig,
+};
+use avero_sync::imap::{ImapSource, ImapWatch};
 use avero_sync::parse::{guarded, parse_body};
+use avero_sync::search::{SEARCH_LIMIT, ServerHits, search_server};
 use avero_sync::smtp::{self, Outgoing, SendError};
 use avero_sync::source::{MailSource, SyncError};
-use avero_sync::sync::sync_account;
+use avero_sync::sync::{Arrival, SyncReport, sync_account, sync_inbox};
+use avero_sync::watch::{Change, InboxWatch};
 use iced::futures::stream::{self, BoxStream};
 use iced::futures::{Stream, StreamExt};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 
 /// How many of the newest inbox messages get their body downloaded in
 /// the background after a sync.
 pub const PREFETCH: usize = 30;
+
+/// How long the inbox watcher waits before connecting again after a
+/// failure: `first`, doubled after each new failure, at most `max`. And
+/// `updates`: how long the worker waits, after the server reported flag
+/// changes or deletions in the inbox, before syncing it (the ones that
+/// come meanwhile join that sync).
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    first: Duration,
+    max: Duration,
+    updates: Duration,
+}
+
+const WATCH_RETRY: Retry = Retry {
+    first: Duration::from_secs(10),
+    max: Duration::from_secs(10 * 60),
+    updates: Duration::from_secs(10),
+};
+
+/// For how long after the worker changed the inbox (flags, moves,
+/// deletions) the flag changes and deletions the server reports are
+/// taken for the echo of that change, and not synced.
+const OWN_ECHO: Duration = Duration::from_secs(10);
 
 /// Where the worker sends what happens to one job.
 pub type Reply = UnboundedSender<Event>;
@@ -79,11 +114,27 @@ pub fn refresh_error(
     AccountError::new(kind, oauth_message(provider, error))
 }
 
-/// Where archived or deleted messages go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where moved messages go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Destination {
     Archive,
     Trash,
+    /// The account's spam folder ("Spam").
+    Junk,
+    /// Back to the inbox ("Pas spam").
+    Inbox,
+}
+
+impl Destination {
+    /// The folder role it goes to.
+    pub fn role(self) -> FolderRole {
+        match self {
+            Destination::Archive => FolderRole::Archive,
+            Destination::Trash => FolderRole::Trash,
+            Destination::Junk => FolderRole::Junk,
+            Destination::Inbox => FolderRole::Inbox,
+        }
+    }
 }
 
 /// Something the worker reports back.
@@ -102,6 +153,14 @@ pub enum Event {
     Done(Result<(), AccountError>),
     /// A message was sent; `Ok(Some(warning))` if the Sent copy failed.
     Sent(Result<Option<String>, String>),
+    /// A draft was saved in the drafts folder: where its copy now is
+    /// (`None` when the server would not say).
+    DraftSaved(Result<Option<DraftCopy>, String>),
+    /// Unread messages that just came into the inbox, to notify. Sent
+    /// once per sync, to the [`Job::Watch`] subscriber only.
+    NewMail(Vec<Arrival>),
+    /// A search on the server is done (see [`Job::SearchServer`]).
+    Found(Result<ServerHits, String>),
     /// The worker is not running any more.
     Gone,
 }
@@ -120,8 +179,9 @@ pub enum Job {
         access: AccessToken,
         reply: Reply,
     },
-    /// The account was renamed or its servers changed.
-    UpdateAccount(Account),
+    /// The account was renamed or its servers changed (boxed: an account
+    /// is much bigger than the other jobs).
+    UpdateAccount(Box<Account>),
     Sync {
         reply: Reply,
     },
@@ -134,8 +194,14 @@ pub enum Job {
         seen: bool,
         reply: Reply,
     },
-    /// Moves messages (already hidden in the list) to the archive or the
-    /// trash; their rows are deleted once the server confirms, shown
+    /// Stars or unstars messages (`\Flagged`), already changed locally.
+    SetFlagged {
+        targets: Vec<MessageRef>,
+        flagged: bool,
+        reply: Reply,
+    },
+    /// Moves messages (already hidden in the list) to the archive, the
+    /// trash, the spam folder or the inbox; their rows are deleted once the server confirms, shown
     /// again otherwise.
     Move {
         targets: Vec<MessageRef>,
@@ -150,6 +216,38 @@ pub enum Job {
     },
     Send {
         outgoing: Box<Outgoing>,
+        reply: Reply,
+    },
+    /// Saves a draft (`raw`, see `smtp::draft_message`) in the account's
+    /// drafts folder, flagged `\Draft`, then deletes its previous copies:
+    /// `replace`, and any other with the same Message-ID.
+    SaveDraft {
+        raw: Vec<u8>,
+        message_id: String,
+        replace: Option<DraftCopy>,
+        reply: Reply,
+    },
+    /// Deletes the copy of a draft from the server (it was sent, or
+    /// thrown away, or saved on another account).
+    DropDraft {
+        copy: DraftCopy,
+        reply: Reply,
+    },
+    /// "Chercher aussi sur le serveur": searches the inbox, sent,
+    /// archive and "all messages" folders for `query` and stores the
+    /// messages found that were missing (see `search::search_server`).
+    /// Stops once `cancel` gets a value or its sender is dropped (the
+    /// search changed): no `Found` then, the stream just ends.
+    SearchServer {
+        query: String,
+        cancel: oneshot::Receiver<()>,
+        reply: Reply,
+    },
+    /// Starts watching the inbox. `reply` then gets what the worker does
+    /// on its own: the syncs it starts because the inbox changed (their
+    /// `Progress` and `Synced`), and `NewMail` after every sync that
+    /// found some. It stays open as long as the worker runs.
+    Watch {
         reply: Reply,
     },
     /// Stops the worker, deleting the account's secret if asked.
@@ -175,17 +273,30 @@ pub struct WorkerSetup {
 impl WorkerHandle {
     /// Starts the worker thread of an account.
     pub fn spawn(setup: WorkerSetup) -> WorkerHandle {
+        WorkerHandle::spawn_with(setup, Imap, WATCH_RETRY)
+    }
+
+    /// Starts a worker that opens its IMAP sessions with `connector`.
+    fn spawn_with<C: Connector>(setup: WorkerSetup, connector: C, retry: Retry) -> WorkerHandle {
         let (jobs, receiver) = mpsc::unbounded_channel();
         let name = format!("avero-account-{}", setup.account.id.0);
         let _ = std::thread::Builder::new()
             .name(name)
-            .spawn(move || run_thread(setup, receiver));
+            .spawn(move || run_thread(setup, connector, retry, receiver));
         WorkerHandle { jobs }
     }
 
     /// Sends a job that needs no answer.
     pub fn send(&self, job: Job) {
         let _ = self.jobs.send(job);
+    }
+
+    /// Starts watching the inbox; the stream gives what the worker does
+    /// on its own (see [`Job::Watch`]) and ends with the worker.
+    pub fn watch(&self) -> BoxStream<'static, Event> {
+        let (reply, events) = mpsc::unbounded_channel();
+        self.send(Job::Watch { reply });
+        drain(events).boxed()
     }
 
     /// A stream that sends the job when first polled, then yields its
@@ -206,9 +317,10 @@ enum Pending {
 }
 
 impl Event {
-    /// Whether this event ends a job (everything but `Progress`).
+    /// Whether this event ends a job (everything but `Progress` and
+    /// `NewMail`).
     pub fn is_final(&self) -> bool {
-        !matches!(self, Event::Progress)
+        !matches!(self, Event::Progress | Event::NewMail(_))
     }
 }
 
@@ -252,7 +364,12 @@ pub fn drain(events: UnboundedReceiver<Event>) -> impl Stream<Item = Event> {
     })
 }
 
-fn run_thread(setup: WorkerSetup, mut jobs: UnboundedReceiver<Job>) {
+fn run_thread<C: Connector>(
+    setup: WorkerSetup,
+    connector: C,
+    retry: Retry,
+    mut jobs: UnboundedReceiver<Job>,
+) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -261,7 +378,7 @@ fn run_thread(setup: WorkerSetup, mut jobs: UnboundedReceiver<Job>) {
     };
     runtime.block_on(async move {
         match Store::open(&setup.db_path) {
-            Ok(store) => Worker::new(setup, store).run(jobs).await,
+            Ok(store) => Worker::new(setup, connector, retry, store).run(jobs).await,
             Err(e) => {
                 let message = format!("Erreur de la base locale : {e}");
                 while let Some(job) = jobs.recv().await {
@@ -288,14 +405,23 @@ fn refuse(job: Job, message: &str) {
         Job::Send { reply, .. } => {
             let _ = reply.send(Event::Sent(Err(message.to_string())));
         }
+        Job::SaveDraft { reply, .. } => {
+            let _ = reply.send(Event::DraftSaved(Err(message.to_string())));
+        }
+        Job::SearchServer { reply, .. } => {
+            let _ = reply.send(Event::Found(Err(message.to_string())));
+        }
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
+        | Job::SetFlagged { reply, .. }
         | Job::Move { reply, .. }
-        | Job::DeleteForever { reply, .. } => {
+        | Job::DeleteForever { reply, .. }
+        | Job::DropDraft { reply, .. } => {
             let _ = reply.send(Event::Done(Err(error())));
         }
-        Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
+        // Nothing will happen on its own: the stream just ends.
+        Job::Watch { .. } | Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
     }
 }
 
@@ -306,140 +432,77 @@ enum Flow {
     Stop,
 }
 
-struct Worker {
-    account: Account,
-    store: Store,
-    secrets: Arc<dyn SecretStore>,
-    config_dir: PathBuf,
-    token: Option<AccessToken>,
-    session: Option<ImapSource>,
-    /// Archive folder path, once looked up (`Some(None)`: there is none).
-    archive: Option<Option<String>>,
-    prefetch: VecDeque<MessageRef>,
-    prefetch_reply: Option<Reply>,
-    prefetched: usize,
+/// Opens logged-in IMAP sessions. The real one is [`Imap`]; tests use a
+/// fake server.
+// Only used with generics, never as `dyn`. The sessions it opens stay on
+// the thread that opened them, so they need not be `Send`.
+#[allow(async_fn_in_trait)]
+pub trait Connector: Send + Sync + 'static {
+    type Source: MailSource;
+    type Watch: InboxWatch;
+    async fn connect(
+        &self,
+        cfg: &ServerConfig,
+        creds: &Credentials,
+    ) -> Result<Self::Source, SyncError>;
+    /// A session that watches the inbox.
+    async fn watch(
+        &self,
+        cfg: &ServerConfig,
+        creds: &Credentials,
+    ) -> Result<Self::Watch, SyncError>;
 }
 
-impl Worker {
-    fn new(setup: WorkerSetup, store: Store) -> Worker {
-        Worker {
-            account: setup.account,
-            store,
-            secrets: setup.secrets,
-            config_dir: setup.config_dir,
-            token: None,
-            session: None,
-            archive: None,
-            prefetch: VecDeque::new(),
-            prefetch_reply: None,
-            prefetched: 0,
-        }
+/// The real IMAP server.
+pub struct Imap;
+
+impl Connector for Imap {
+    type Source = ImapSource;
+    type Watch = ImapWatch;
+
+    async fn connect(
+        &self,
+        cfg: &ServerConfig,
+        creds: &Credentials,
+    ) -> Result<ImapSource, SyncError> {
+        ImapSource::connect(cfg, creds).await
     }
 
-    /// Handles jobs as they come; when idle, downloads queued bodies one
-    /// at a time so user actions never wait for the whole prefetch.
-    async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
-        loop {
-            let job = if self.prefetch.is_empty() {
-                match jobs.recv().await {
-                    Some(job) => job,
-                    None => break,
-                }
-            } else {
-                match jobs.try_recv() {
-                    Ok(job) => job,
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        self.prefetch_one().await;
-                        continue;
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            };
-            if self.handle(job).await == Flow::Stop {
-                break;
-            }
-        }
+    async fn watch(&self, cfg: &ServerConfig, creds: &Credentials) -> Result<ImapWatch, SyncError> {
+        ImapWatch::connect(cfg, creds).await
     }
+}
 
-    async fn handle(&mut self, job: Job) -> Flow {
-        match job {
-            Job::SetPassword { password, reply } => {
-                let result = self.store_secret(&password);
-                self.session = None;
-                let _ = reply.send(Event::Done(result));
-            }
-            Job::SetOAuth {
-                refresh_token,
-                access,
-                reply,
-            } => {
-                let result = match refresh_token {
-                    Some(token) => self.store_secret(
-                        &OAuthSecret {
-                            refresh_token: token,
-                        }
-                        .to_json(),
-                    ),
-                    None => Ok(()),
-                };
-                self.token = Some(access);
-                self.session = None;
-                let _ = reply.send(Event::Done(result));
-            }
-            Job::UpdateAccount(account) => {
-                self.account = account;
-                self.session = None;
-            }
-            Job::Sync { reply } => self.sync(reply).await,
-            Job::FetchBody { target, reply } => {
-                let result = self.download_body(&target).await;
-                let _ = reply.send(Event::Body {
-                    row_id: target.row_id,
-                    result: result.map_err(|e| e.message),
-                });
-            }
-            Job::SetSeen {
-                targets,
-                seen,
-                reply,
-            } => {
-                let result = self.set_seen(&targets, seen).await;
-                let _ = reply.send(Event::Done(result));
-            }
-            Job::Move { targets, to, reply } => {
-                let result = self.move_to(&targets, to).await;
-                let _ = reply.send(Event::Done(result));
-            }
-            Job::DeleteForever { targets, reply } => {
-                let result = self.delete_forever(&targets).await;
-                let _ = reply.send(Event::Done(result));
-            }
-            Job::Send { outgoing, reply } => {
-                let result = self.send(&outgoing).await;
-                let _ = reply.send(Event::Sent(result));
-            }
-            Job::Shutdown { delete_secret } => {
-                if delete_secret {
-                    let _ = self.secrets.delete(self.account.id);
-                }
-                return Flow::Stop;
-            }
-        }
-        Flow::Continue
-    }
+/// How an account logs in, shared by its IMAP connections (the one for
+/// the user's actions, and those of the sync and of the inbox watcher,
+/// on other threads).
+struct Login<C> {
+    connector: C,
+    secrets: Arc<dyn SecretStore>,
+    config_dir: PathBuf,
+    /// The OAuth access token in memory. All connections use the same
+    /// one: a token refreshed by one serves the others. The lock is held
+    /// during a refresh so they never refresh at the same time.
+    token: tokio::sync::Mutex<Option<AccessToken>>,
+}
 
-    fn store_secret(&self, secret: &str) -> Result<(), AccountError> {
-        self.secrets.set(self.account.id, secret).map_err(|e| {
+impl<C: Connector> Login<C> {
+    fn store_secret(&self, account: AccountId, secret: &str) -> Result<(), AccountError> {
+        self.secrets.set(account, secret).map_err(|e| {
             AccountError::new(ErrorKind::Other, format!("Coffre-fort inaccessible : {e}"))
         })
     }
 
+    async fn set_token(&self, token: Option<AccessToken>) {
+        *self.token.lock().await = token;
+    }
+
     /// What to log in with: the stored password, or a fresh OAuth access
     /// token (refreshed when it expires within a minute).
-    async fn credentials(&mut self) -> Result<Credentials, AccountError> {
-        let user = self.account.imap.username.clone();
-        let Some(provider) = auth::provider_of(self.account.auth) else {
-            return match self.secrets.get(self.account.id) {
+    async fn credentials(&self, account: &Account) -> Result<Credentials, AccountError> {
+        let user = account.imap.username.clone();
+        let Some(provider) = auth::provider_of(account.auth) else {
+            return match self.secrets.get(account.id) {
                 Ok(Some(password)) => Ok(Credentials::Password(password)),
                 Ok(None) => Err(AccountError::new(ErrorKind::Auth, "Mot de passe manquant")),
                 Err(e) => Err(AccountError::new(
@@ -448,22 +511,26 @@ impl Worker {
                 )),
             };
         };
-        if let Some(token) = self.token.as_ref().filter(|t| t.is_fresh(auth::now())) {
+        let mut slot = self.token.lock().await;
+        if let Some(token) = slot.as_ref().filter(|t| t.is_fresh(auth::now())) {
             return Ok(Credentials::OAuth2 {
                 user,
                 access_token: token.token.clone(),
             });
         }
-        let token = self.refresh(provider).await?;
-        Ok(Credentials::OAuth2 {
-            user,
-            access_token: token,
-        })
+        let token = self.refresh(account, provider).await?;
+        let access_token = token.token.clone();
+        *slot = Some(token);
+        Ok(Credentials::OAuth2 { user, access_token })
     }
 
-    async fn refresh(&mut self, provider: avero_oauth::Provider) -> Result<String, AccountError> {
+    async fn refresh(
+        &self,
+        account: &Account,
+        provider: avero_oauth::Provider,
+    ) -> Result<AccessToken, AccountError> {
         let reconnect = || AccountError::new(ErrorKind::Reconnect, "Reconnexion nécessaire");
-        let secret = match self.secrets.get(self.account.id) {
+        let secret = match self.secrets.get(account.id) {
             Ok(Some(text)) => OAuthSecret::from_json(&text).ok_or_else(reconnect)?,
             Ok(None) => return Err(reconnect()),
             Err(e) => {
@@ -486,106 +553,927 @@ impl Worker {
             Ok(tokens) => {
                 if let Some(rotated) = tokens.refresh_token {
                     self.store_secret(
+                        account.id,
                         &OAuthSecret {
                             refresh_token: rotated,
                         }
                         .to_json(),
                     )?;
                 }
-                self.token = Some(AccessToken {
-                    token: tokens.access_token.clone(),
+                Ok(AccessToken {
+                    token: tokens.access_token,
                     expires_at: tokens.expires_at,
-                });
-                Ok(tokens.access_token)
+                })
             }
             Err(e) => Err(refresh_error(provider, &e)),
         }
     }
 
-    async fn connect(&mut self) -> Result<ImapSource, AccountError> {
-        let creds = self.credentials().await?;
-        ImapSource::connect(&self.account.imap, &creds)
-            .await
-            .map_err(|e| self.classify(e))
+    async fn connect(&self, account: &Account) -> Result<C::Source, AccountError> {
+        let creds = self.credentials(account).await?;
+        match self.connector.connect(&account.imap, &creds).await {
+            Ok(session) => Ok(session),
+            Err(error) => Err(self.classify(account, error).await),
+        }
     }
 
-    /// Runs `op` on the IMAP session, connecting first if needed. A lost
-    /// or silent connection is retried once on a new session.
+    /// Opens a session that watches the inbox.
+    async fn connect_watch(&self, account: &Account) -> Result<C::Watch, AccountError> {
+        let creds = self.credentials(account).await?;
+        match self.connector.watch(&account.imap, &creds).await {
+            Ok(watch) => Ok(watch),
+            Err(error) => Err(self.classify(account, error).await),
+        }
+    }
+
+    /// French message for a server or database error.
+    async fn classify(&self, account: &Account, error: SyncError) -> AccountError {
+        if matches!(error, SyncError::Auth(_)) && account.auth != avero_core::AuthKind::Password {
+            // A refused token: forget it so the next try refreshes.
+            self.set_token(None).await;
+        }
+        user_error(&error, account)
+    }
+
+    /// Runs `op` on `session`, connecting first if needed. A lost or
+    /// silent connection is retried once on a new session; a timeout only
+    /// if `retry_timeout` (not for an APPEND, which the server may have
+    /// done anyway).
     async fn with_session<T>(
-        &mut self,
-        op: impl AsyncFnMut(&mut ImapSource, &Store) -> Result<T, SyncError>,
-    ) -> Result<T, AccountError> {
-        self.with_session_retrying(true, op).await
-    }
-
-    /// Like `with_session`; a timeout is retried only if `retry_timeout`
-    /// (not for an APPEND, which the server may have done anyway).
-    async fn with_session_retrying<T>(
-        &mut self,
+        &self,
+        account: &Account,
+        store: &Store,
+        session: &mut Option<C::Source>,
         retry_timeout: bool,
-        mut op: impl AsyncFnMut(&mut ImapSource, &Store) -> Result<T, SyncError>,
+        mut op: impl AsyncFnMut(&mut C::Source, &Store) -> Result<T, SyncError>,
     ) -> Result<T, AccountError> {
         for attempt in 0..2 {
-            let mut session = match self.session.take() {
-                Some(session) => session,
-                None => self.connect().await?,
+            let mut current = match session.take() {
+                Some(current) => current,
+                None => self.connect(account).await?,
             };
-            match op(&mut session, &self.store).await {
+            match op(&mut current, store).await {
                 Ok(value) => {
-                    self.session = Some(session);
+                    *session = Some(current);
                     return Ok(value);
                 }
                 Err(SyncError::Connect(_)) if attempt == 0 => continue,
                 Err(SyncError::Timeout(_)) if attempt == 0 && retry_timeout => continue,
                 Err(error @ (SyncError::Connect(_) | SyncError::Timeout(_))) => {
-                    return Err(self.classify(error));
+                    return Err(self.classify(account, error).await);
                 }
                 Err(error) => {
-                    self.session = Some(session);
-                    return Err(self.classify(error));
+                    *session = Some(current);
+                    return Err(self.classify(account, error).await);
                 }
             }
         }
         unreachable!("the loop returns on its second attempt")
     }
+}
 
-    /// French message for a server or database error.
-    fn classify(&mut self, error: SyncError) -> AccountError {
-        if matches!(error, SyncError::Auth(_))
-            && self.account.auth != avero_core::AuthKind::Password
-        {
-            // A refused token: forget it so the next try refreshes.
-            self.token = None;
+/// The replies waiting for a sync: they get its `Progress` events, then
+/// its `Synced`.
+type Listeners = Arc<Mutex<Vec<Reply>>>;
+
+fn lock(listeners: &Listeners) -> std::sync::MutexGuard<'_, Vec<Reply>> {
+    // A panic while holding the lock leaves a usable list.
+    listeners.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How a sync ended.
+struct SyncEnd {
+    result: Result<(), AccountError>,
+    /// The new inbox messages it found and did not tell about yet (when
+    /// it failed before every folder was synced: even if it failed later,
+    /// in another folder).
+    arrivals: Vec<Arrival>,
+}
+
+impl SyncEnd {
+    fn failed(error: AccountError) -> SyncEnd {
+        SyncEnd {
+            result: Err(error),
+            arrivals: Vec::new(),
         }
-        user_error(&error, &self.account)
+    }
+}
+
+/// A sync running on its own thread, with its own IMAP session and its
+/// own `Store` connection, so the worker keeps serving the user's jobs.
+struct RunningSync {
+    listeners: Listeners,
+    /// Dropping it (or sending) stops the sync at its next pause.
+    cancel: Option<oneshot::Sender<()>>,
+    /// How it ended; closed without a value if the sync was stopped.
+    done: oneshot::Receiver<SyncEnd>,
+    /// The settings version it started with (see `Worker::version`).
+    version: u64,
+    /// Sync requests that must not join this one (the settings changed,
+    /// or the inbox changed after it started): they get a new sync once
+    /// this one ends.
+    next: Vec<Reply>,
+    /// Whether the watch subscriber is already in `next`.
+    rerun_for_change: bool,
+}
+
+impl RunningSync {
+    /// Stops the sync and waits until its thread has let go of the
+    /// session and the secrets.
+    async fn stop(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = (&mut self.done).await;
+    }
+}
+
+/// How long a sync waits before trying again when the database stayed
+/// locked by another connection (see `Store::BUSY_TIMEOUT`).
+const BUSY_RETRY: Duration = Duration::from_secs(2);
+
+/// Runs `op`, and once more after `pause` if it failed because another
+/// connection held the database too long. A sync can safely run again:
+/// it starts where the batches already saved left off.
+async fn once_more_if_busy<T>(
+    pause: Duration,
+    mut op: impl AsyncFnMut() -> Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    match op().await {
+        Err(SyncError::Store(e)) if e.is_busy() => {
+            tokio::time::sleep(pause).await;
+            op().await
+        }
+        other => other,
+    }
+}
+
+/// What a sync brings up to date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncScope {
+    /// Every folder synced (see `sync_account`).
+    Account,
+    /// The inbox only (see `sync_inbox`): after flag changes or
+    /// deletions there.
+    Inbox,
+}
+
+/// What a sync thread needs.
+struct SyncTask<C> {
+    account: Account,
+    db_path: PathBuf,
+    login: Arc<Login<C>>,
+    listeners: Listeners,
+    scope: SyncScope,
+    /// Where new mail is told (`Event::NewMail`) as soon as every folder
+    /// is synced: the watch subscriber, if any.
+    news: Option<Reply>,
+}
+
+impl<C: Connector> SyncTask<C> {
+    fn run(self, cancel: oneshot::Receiver<()>, done: oneshot::Sender<SyncEnd>) {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            let _ = done.send(SyncEnd::failed(AccountError::new(
+                ErrorKind::Other,
+                "Impossible de lancer la synchronisation",
+            )));
+            return;
+        };
+        runtime.block_on(async move {
+            tokio::select! {
+                end = self.sync() => {
+                    let _ = done.send(end);
+                }
+                // Asked to stop, or the worker is gone.
+                _ = cancel => {}
+            }
+        });
     }
 
-    async fn sync(&mut self, reply: Reply) {
+    async fn sync(&self) -> SyncEnd {
+        let store = match Store::open(&self.db_path) {
+            Ok(store) => store,
+            Err(e) => {
+                return SyncEnd::failed(AccountError::new(
+                    ErrorKind::Other,
+                    format!("Erreur de la base locale : {e}"),
+                ));
+            }
+        };
         let id = self.account.id;
-        let progress = reply.clone();
+        let scope = self.scope;
+        let listeners = &self.listeners;
+        let news = &self.news;
+        let mut session = None;
+        let mut arrivals: Vec<Arrival> = Vec::new();
+        // The UIDs already told about (see `SyncTask::news`).
+        let mut told: Vec<u32> = Vec::new();
         let result = self
-            .with_session(async |session, store| {
-                sync_account(store, session, id, |_| {
-                    let _ = progress.send(Event::Progress);
-                })
-                .await
-            })
-            .await;
+            .login
+            .with_session(
+                &self.account,
+                &store,
+                &mut session,
+                true,
+                async |session, store| {
+                    // Kept up to date after every batch, so what an
+                    // attempt found survives its failure.
+                    let mut found = Vec::new();
+                    let mut progress = |report: &SyncReport| {
+                        found.clone_from(&report.arrivals);
+                        for reply in lock(listeners).iter() {
+                            let _ = reply.send(Event::Progress);
+                        }
+                        // Every folder is done: the new mail is told now,
+                        // not after the completion of old messages.
+                        if report.folders_synced
+                            && let Some(news) = news
+                        {
+                            let fresh: Vec<Arrival> = report
+                                .arrivals
+                                .iter()
+                                .filter(|a| !told.contains(&a.uid))
+                                .cloned()
+                                .collect();
+                            if !fresh.is_empty() {
+                                told.extend(fresh.iter().map(|a| a.uid));
+                                let _ = news.send(Event::NewMail(fresh));
+                            }
+                        }
+                    };
+                    let result = once_more_if_busy(BUSY_RETRY, async || match scope {
+                        SyncScope::Account => sync_account(store, session, id, &mut progress).await,
+                        SyncScope::Inbox => sync_inbox(store, session, id, &mut progress).await,
+                    })
+                    .await;
+                    // A retried attempt may fetch a batch again.
+                    for arrival in found {
+                        if !arrivals.iter().any(|known| known.uid == arrival.uid) {
+                            arrivals.push(arrival);
+                        }
+                    }
+                    result
+                },
+            )
+            .await
+            .map(|_| ());
+        // What was told already is not told again at the end.
+        arrivals.retain(|a| !told.contains(&a.uid));
+        SyncEnd { result, arrivals }
+    }
+}
+
+/// What the inbox watcher needs; it runs on its own thread, with its own
+/// IMAP session.
+struct WatchTask<C> {
+    account: Account,
+    login: Arc<Login<C>>,
+    retry: Retry,
+    /// Gets each change of the inbox.
+    changed: UnboundedSender<Change>,
+}
+
+impl<C: Connector> WatchTask<C> {
+    /// Watches until cancelled; `_done` is dropped when the thread ends.
+    fn run(self, cancel: oneshot::Receiver<()>, _done: oneshot::Sender<()>) {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            tokio::select! {
+                () = self.watch() => {}
+                // Asked to stop, or the worker is gone.
+                _ = cancel => {}
+            }
+        });
+    }
+
+    /// Connects, waits for changes, and connects again after a failure,
+    /// a little later each time. Ends when the server refuses the
+    /// credentials: trying again could get the account locked. Watching
+    /// starts again once they are fixed (the settings change).
+    async fn watch(&self) {
+        let mut delay = self.retry.first;
+        let id = self.account.id.0;
+        let mut connected_before = false;
+        loop {
+            match self.login.connect_watch(&self.account).await {
+                Ok(mut watcher) => {
+                    diag!("compte {id} : surveillance de la réception connectée");
+                    // A new watcher only sees what comes from now on: mail
+                    // that came while the last connection was lost needs
+                    // a sync.
+                    if connected_before && self.changed.send(Change::Arrived).is_err() {
+                        return;
+                    }
+                    connected_before = true;
+                    loop {
+                        match watcher.wait().await {
+                            Ok(change) => {
+                                diag!("compte {id} : surveillance : {change:?}");
+                                delay = self.retry.first;
+                                if change != Change::Quiet && self.changed.send(change).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                diag!("compte {id} : surveillance interrompue : {error}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) if matches!(error.kind, ErrorKind::Auth | ErrorKind::Reconnect) => {
+                    diag!(
+                        "compte {id} : surveillance arrêtée (identifiants) : {}",
+                        error.message
+                    );
+                    return;
+                }
+                Err(error) => diag!(
+                    "compte {id} : surveillance : connexion impossible : {}",
+                    error.message
+                ),
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(self.retry.max);
+        }
+    }
+}
+
+/// An inbox watcher running on its own thread.
+struct RunningWatch {
+    /// Each change of the inbox; closed when the watcher ends on its own
+    /// (credentials refused).
+    changes: UnboundedReceiver<Change>,
+    /// Dropping it (or sending) stops the watcher.
+    cancel: Option<oneshot::Sender<()>>,
+    /// Closed when the watcher's thread is done.
+    done: oneshot::Receiver<()>,
+}
+
+impl RunningWatch {
+    /// Stops the watcher and waits until its thread has let go of the
+    /// session and the secrets.
+    async fn stop(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = (&mut self.done).await;
+    }
+}
+
+/// What woke the worker loop up.
+enum Wake {
+    Job(Option<Job>),
+    Synced(SyncEnd),
+    /// The inbox changed (`Some`), or the watcher ended (`None`).
+    Watch(Option<Change>),
+    /// The time to sync the inbox after flag changes came.
+    Updates,
+}
+
+/// Waits for the running sync to end; never ends when none runs.
+async fn sync_end(sync: &mut Option<RunningSync>) -> SyncEnd {
+    match sync {
+        Some(running) => (&mut running.done)
+            .await
+            .unwrap_or_else(|_| SyncEnd::failed(sync_stopped())),
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits until `due`; never ends when it is `None`.
+async fn wait_until(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits for news from the watcher; never ends when none runs.
+async fn watch_news(watch: &mut Option<RunningWatch>) -> Option<Change> {
+    match watch {
+        Some(running) => running.changes.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn sync_stopped() -> AccountError {
+    AccountError::new(ErrorKind::Other, "La synchronisation s'est arrêtée")
+}
+
+struct Worker<C: Connector> {
+    account: Account,
+    store: Store,
+    db_path: PathBuf,
+    login: Arc<Login<C>>,
+    /// The session for the user's actions (the sync has its own).
+    session: Option<C::Source>,
+    /// Bumped when the account's settings or secret change, so that a
+    /// sync started before is not taken for an up-to-date one.
+    version: u64,
+    sync: Option<RunningSync>,
+    /// Where what the worker does on its own goes (see [`Job::Watch`]);
+    /// the inbox is only watched once it is set.
+    events: Option<Reply>,
+    watch: Option<RunningWatch>,
+    retry: Retry,
+    /// Archive folder path, once looked up (`Some(None)`: there is none).
+    archive: Option<Option<String>>,
+    prefetch: VecDeque<MessageRef>,
+    prefetch_replies: Vec<Reply>,
+    prefetched: usize,
+    /// When the inbox is synced after the flag changes or deletions the
+    /// server reported (see `Retry::updates`).
+    updates_due: Option<tokio::time::Instant>,
+    /// Until when those reports are the echo of the worker's own changes
+    /// of the inbox (see `OWN_ECHO`).
+    own_echo_until: Option<tokio::time::Instant>,
+}
+
+impl<C: Connector> Worker<C> {
+    fn new(setup: WorkerSetup, connector: C, retry: Retry, store: Store) -> Worker<C> {
+        Worker {
+            account: setup.account,
+            store,
+            db_path: setup.db_path,
+            login: Arc::new(Login {
+                connector,
+                secrets: setup.secrets,
+                config_dir: setup.config_dir,
+                token: tokio::sync::Mutex::new(None),
+            }),
+            session: None,
+            version: 0,
+            sync: None,
+            events: None,
+            watch: None,
+            retry,
+            archive: None,
+            prefetch: VecDeque::new(),
+            prefetch_replies: Vec::new(),
+            prefetched: 0,
+            updates_due: None,
+            own_echo_until: None,
+        }
+    }
+
+    /// Handles jobs as they come, the end of the sync running beside
+    /// them and the inbox watcher's news; when idle, downloads queued
+    /// bodies one at a time so user actions never wait for the whole
+    /// prefetch.
+    async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
+        loop {
+            let updates_due = self.updates_due;
+            let wake = if self.prefetch.is_empty() {
+                tokio::select! {
+                    job = jobs.recv() => Wake::Job(job),
+                    end = sync_end(&mut self.sync) => Wake::Synced(end),
+                    news = watch_news(&mut self.watch) => Wake::Watch(news),
+                    () = wait_until(updates_due) => Wake::Updates,
+                }
+            } else if let Some(end) = self.sync_ended() {
+                Wake::Synced(end)
+            } else if let Some(news) = self.watch_news_now() {
+                Wake::Watch(news)
+            } else if updates_due.is_some_and(|due| due <= tokio::time::Instant::now()) {
+                Wake::Updates
+            } else {
+                match jobs.try_recv() {
+                    Ok(job) => Wake::Job(Some(job)),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        self.prefetch_one().await;
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => Wake::Job(None),
+                }
+            };
+            match wake {
+                Wake::Job(Some(job)) => {
+                    if self.handle(job).await == Flow::Stop {
+                        break;
+                    }
+                }
+                Wake::Job(None) => break,
+                Wake::Synced(end) => self.finish_sync(end).await,
+                Wake::Watch(Some(change)) => self.inbox_changed(change),
+                Wake::Updates => {
+                    self.updates_due = None;
+                    self.sync_after_change(SyncScope::Inbox);
+                }
+                // The watcher ended on its own (credentials refused).
+                Wake::Watch(None) => {
+                    diag!("compte {} : plus de surveillance", self.account.id.0);
+                    self.watch = None;
+                }
+            }
+        }
+    }
+
+    /// The end of the running sync if it has ended, without waiting.
+    fn sync_ended(&mut self) -> Option<SyncEnd> {
+        let running = self.sync.as_mut()?;
+        match running.done.try_recv() {
+            Ok(end) => Some(end),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(SyncEnd::failed(sync_stopped())),
+        }
+    }
+
+    /// The watcher's news if there is some, without waiting.
+    fn watch_news_now(&mut self) -> Option<Option<Change>> {
+        let running = self.watch.as_mut()?;
+        match running.changes.try_recv() {
+            Ok(change) => Some(Some(change)),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => Some(None),
+        }
+    }
+
+    async fn handle(&mut self, job: Job) -> Flow {
+        match job {
+            Job::SetPassword { password, reply } => {
+                let result = self.login.store_secret(self.account.id, &password);
+                self.settings_changed().await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::SetOAuth {
+                refresh_token,
+                access,
+                reply,
+            } => {
+                let result = match refresh_token {
+                    Some(token) => self.login.store_secret(
+                        self.account.id,
+                        &OAuthSecret {
+                            refresh_token: token,
+                        }
+                        .to_json(),
+                    ),
+                    None => Ok(()),
+                };
+                self.login.set_token(Some(access)).await;
+                self.settings_changed().await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::UpdateAccount(account) => {
+                self.account = *account;
+                self.settings_changed().await;
+            }
+            Job::Sync { reply } => self.request_sync(reply),
+            Job::Watch { reply } => {
+                diag!(
+                    "compte {} : abonnement aux nouvelles (surveillance {})",
+                    self.account.id.0,
+                    if self.watch.is_none() {
+                        "lancée"
+                    } else {
+                        "déjà en route"
+                    }
+                );
+                self.events = Some(reply);
+                if self.watch.is_none() {
+                    self.start_watch();
+                }
+            }
+            Job::FetchBody { target, reply } => {
+                let result = self.download_body(&target).await;
+                let _ = reply.send(Event::Body {
+                    row_id: target.row_id,
+                    result: result.map_err(|e| e.message),
+                });
+            }
+            Job::SetSeen {
+                targets,
+                seen,
+                reply,
+            } => {
+                let result = self.set_seen(&targets, seen).await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::SetFlagged {
+                targets,
+                flagged,
+                reply,
+            } => {
+                let result = self.set_flagged(&targets, flagged).await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::Move { targets, to, reply } => {
+                let result = self.move_to(&targets, to).await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::DeleteForever { targets, reply } => {
+                let result = self.delete_forever(&targets).await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::Send { outgoing, reply } => {
+                let result = self.send(&outgoing).await;
+                let _ = reply.send(Event::Sent(result));
+            }
+            Job::SaveDraft {
+                raw,
+                message_id,
+                replace,
+                reply,
+            } => {
+                let result = self.save_draft(&raw, &message_id, replace).await;
+                let _ = reply.send(Event::DraftSaved(result));
+            }
+            Job::DropDraft { copy, reply } => {
+                let result = self.drop_draft(&copy.folder, &[copy.uid]).await;
+                let _ = reply.send(Event::Done(result));
+            }
+            Job::SearchServer {
+                query,
+                cancel,
+                reply,
+            } => {
+                // Cancelled: the reply is dropped without a word.
+                if let Some(result) = self.search_server(&query, cancel).await {
+                    let _ = reply.send(Event::Found(result.map_err(|e| e.message)));
+                }
+            }
+            Job::Shutdown { delete_secret } => {
+                // The sync and watcher threads must be done with the
+                // secret before it is deleted (a refresh could store a
+                // new one).
+                if let Some(running) = self.sync.take() {
+                    running.stop().await;
+                }
+                self.stop_watch().await;
+                if delete_secret {
+                    let _ = self.login.secrets.delete(self.account.id);
+                }
+                return Flow::Stop;
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Forgets the session; the next sync uses the new settings, and the
+    /// inbox watcher starts again with them (also after refused
+    /// credentials, which may be fixed now).
+    async fn settings_changed(&mut self) {
+        self.session = None;
+        self.version += 1;
+        if self.events.is_some() {
+            self.stop_watch().await;
+            self.start_watch();
+        }
+    }
+
+    /// Starts watching the inbox on a thread of its own.
+    fn start_watch(&mut self) {
+        let (changed, changes) = mpsc::unbounded_channel();
+        let (cancel, cancelled) = oneshot::channel();
+        let (finished, done) = oneshot::channel();
+        let task = WatchTask {
+            account: self.account.clone(),
+            login: self.login.clone(),
+            retry: self.retry,
+            changed,
+        };
+        // If the thread cannot start, `changes` closes: the worker then
+        // goes without watching, like after refused credentials.
+        let _ = std::thread::Builder::new()
+            .name(format!("avero-watch-{}", self.account.id.0))
+            .spawn(move || task.run(cancelled, finished));
+        self.watch = Some(RunningWatch {
+            changes,
+            cancel: Some(cancel),
+            done,
+        });
+    }
+
+    async fn stop_watch(&mut self) {
+        if let Some(running) = self.watch.take() {
+            diag!("compte {} : surveillance arrêtée", self.account.id.0);
+            running.stop().await;
+        }
+    }
+
+    /// The watcher reported a change of the inbox. New mail: a sync at
+    /// once. Flag changes or deletions: the inbox is synced a little
+    /// later (those that come meanwhile join), unless the worker just
+    /// changed the inbox itself (the server tells every session, the
+    /// watcher's too).
+    fn inbox_changed(&mut self, change: Change) {
+        let now = tokio::time::Instant::now();
+        match change {
+            Change::Arrived => {
+                // The whole sync covers the inbox's flags too.
+                self.updates_due = None;
+                self.sync_after_change(SyncScope::Account);
+            }
+            Change::Updated => {
+                let echo = self.own_echo_until.is_some_and(|until| now < until);
+                if !echo && self.updates_due.is_none() {
+                    self.updates_due = Some(now + self.retry.updates);
+                }
+            }
+            Change::Quiet => {}
+        }
+    }
+
+    /// Notes that the worker changes the inbox (see `OWN_ECHO`); for
+    /// changes of another folder, nothing to note (only the inbox is
+    /// watched).
+    fn changing(&mut self, folder: &str) {
+        if folder.eq_ignore_ascii_case("INBOX") {
+            self.own_echo_until = Some(tokio::time::Instant::now() + OWN_ECHO);
+        }
+    }
+
+    /// The inbox changed: a sync must start after this moment. The one
+    /// running may have passed the inbox already, so instead of joining
+    /// it, the watch subscriber gets one more sync right after it.
+    fn sync_after_change(&mut self, scope: SyncScope) {
+        let Some(events) = self.events.clone() else {
+            diag!(
+                "compte {} : changement ignoré (pas d'abonné)",
+                self.account.id.0
+            );
+            return;
+        };
+        diag!(
+            "compte {} : synchro {scope:?} demandée par la surveillance{}",
+            self.account.id.0,
+            if self.sync.is_some() {
+                " (après celle en cours)"
+            } else {
+                ""
+            }
+        );
+        match &mut self.sync {
+            Some(running) => {
+                if !running.rerun_for_change {
+                    running.rerun_for_change = true;
+                    running.next.push(events);
+                }
+            }
+            None => self.start_sync(vec![events], scope),
+        }
+    }
+
+    /// Searches the server for `query` on the user's session; `None` if
+    /// `cancel` fired first. The session in use then goes with the
+    /// search (a command cut in the middle leaves it unusable); the next
+    /// job opens a new one.
+    async fn search_server(
+        &mut self,
+        query: &str,
+        cancel: oneshot::Receiver<()>,
+    ) -> Option<Result<ServerHits, AccountError>> {
+        let id = self.account.id;
+        let searching = self.with_session(async |session, store| {
+            search_server(store, session, id, query, SEARCH_LIMIT).await
+        });
+        tokio::select! {
+            result = searching => Some(result),
+            _ = cancel => None,
+        }
+    }
+
+    /// Runs `op` on the user's IMAP session, connecting first if needed.
+    async fn with_session<T>(
+        &mut self,
+        op: impl AsyncFnMut(&mut C::Source, &Store) -> Result<T, SyncError>,
+    ) -> Result<T, AccountError> {
+        self.with_session_retrying(true, op).await
+    }
+
+    /// Like `with_session`; a timeout is retried only if `retry_timeout`.
+    async fn with_session_retrying<T>(
+        &mut self,
+        retry_timeout: bool,
+        op: impl AsyncFnMut(&mut C::Source, &Store) -> Result<T, SyncError>,
+    ) -> Result<T, AccountError> {
+        self.login
+            .with_session(
+                &self.account,
+                &self.store,
+                &mut self.session,
+                retry_timeout,
+                op,
+            )
+            .await
+    }
+
+    /// Only one sync runs at a time. A request during a sync joins it
+    /// (it gets the same events): starting another right after would
+    /// download almost nothing more. But if the settings or the secret
+    /// changed since the running sync started, its result may be stale:
+    /// the request then gets a new sync, run as soon as this one ends.
+    fn request_sync(&mut self, reply: Reply) {
+        let version = self.version;
+        if let Some(running) = &mut self.sync {
+            if running.version == version {
+                lock(&running.listeners).push(reply);
+            } else {
+                running.next.push(reply);
+            }
+            return;
+        }
+        self.start_sync(vec![reply], SyncScope::Account);
+    }
+
+    fn start_sync(&mut self, replies: Vec<Reply>, scope: SyncScope) {
+        diag!("compte {} : synchro {scope:?} lancée", self.account.id.0);
+        let listeners: Listeners = Arc::new(Mutex::new(replies));
+        let (cancel, cancelled) = oneshot::channel();
+        let (finished, done) = oneshot::channel();
+        let task = SyncTask {
+            account: self.account.clone(),
+            db_path: self.db_path.clone(),
+            login: self.login.clone(),
+            listeners: listeners.clone(),
+            scope,
+            news: self.events.clone(),
+        };
+        // If the thread cannot start, `finished` is dropped and the
+        // listeners get `sync_stopped`.
+        let _ = std::thread::Builder::new()
+            .name(format!("avero-sync-{}", self.account.id.0))
+            .spawn(move || task.run(cancelled, finished));
+        self.sync = Some(RunningSync {
+            listeners,
+            cancel: Some(cancel),
+            done,
+            version: self.version,
+            next: Vec::new(),
+            rerun_for_change: false,
+        });
+    }
+
+    /// Answers the replies of the sync that ended, tells the watch
+    /// subscriber about new mail, queues the prefetch, and starts the
+    /// sync that was asked meanwhile, if any.
+    async fn finish_sync(&mut self, end: SyncEnd) {
+        let Some(running) = self.sync.take() else {
+            return;
+        };
+        let SyncEnd { result, arrivals } = end;
+        match &result {
+            Ok(()) => diag!(
+                "compte {} : synchro finie, {} nouveau(x) message(s)",
+                self.account.id.0,
+                arrivals.len()
+            ),
+            Err(error) => diag!(
+                "compte {} : synchro en échec : {}",
+                self.account.id.0,
+                error.message
+            ),
+        }
+        if !arrivals.is_empty()
+            && let Some(events) = &self.events
+        {
+            let _ = events.send(Event::NewMail(arrivals));
+        }
+        if running.version == self.version && self.events.is_some() {
+            match &result {
+                // No watching with refused credentials (the watcher
+                // would try them again and again).
+                Err(error) if matches!(error.kind, ErrorKind::Auth | ErrorKind::Reconnect) => {
+                    self.stop_watch().await;
+                }
+                // Accepted again (the server had refused them for a
+                // while): watch again.
+                Ok(()) if self.watch.is_none() => self.start_watch(),
+                _ => {}
+            }
+        }
+        let replies = std::mem::take(&mut *lock(&running.listeners));
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 let archive = self.archive_path().await.is_some();
-                self.queue_prefetch(reply.clone());
-                let _ = reply.send(Event::Synced(Ok(archive)));
+                self.queue_prefetch(replies.clone());
+                for reply in &replies {
+                    let _ = reply.send(Event::Synced(Ok(archive)));
+                }
             }
             Err(error) => {
-                let _ = reply.send(Event::Synced(Err(error)));
+                for reply in &replies {
+                    let _ = reply.send(Event::Synced(Err(error.clone())));
+                }
             }
+        }
+        if !running.next.is_empty() {
+            self.start_sync(running.next, SyncScope::Account);
         }
     }
 
     /// Queues the newest inbox messages that have no cached body. The
-    /// reply stays open until they are all downloaded.
-    fn queue_prefetch(&mut self, reply: Reply) {
+    /// replies stay open until they are all downloaded.
+    fn queue_prefetch(&mut self, replies: Vec<Reply>) {
         let filter = AccountFilter::Only(self.account.id);
         let items = self
             .store
@@ -603,7 +1491,11 @@ impl Worker {
             .into_iter()
             .collect();
         self.prefetched = 0;
-        self.prefetch_reply = (!self.prefetch.is_empty()).then_some(reply);
+        self.prefetch_replies = if self.prefetch.is_empty() {
+            Vec::new()
+        } else {
+            replies
+        };
     }
 
     async fn prefetch_one(&mut self) {
@@ -615,13 +1507,13 @@ impl Worker {
             self.prefetch.clear();
         }
         self.prefetched += 1;
-        if (self.prefetch.is_empty() || self.prefetched.is_multiple_of(5))
-            && let Some(reply) = &self.prefetch_reply
-        {
-            let _ = reply.send(Event::Progress);
+        if self.prefetch.is_empty() || self.prefetched.is_multiple_of(5) {
+            for reply in &self.prefetch_replies {
+                let _ = reply.send(Event::Progress);
+            }
         }
         if self.prefetch.is_empty() {
-            self.prefetch_reply = None;
+            self.prefetch_replies.clear();
         }
     }
 
@@ -632,10 +1524,11 @@ impl Worker {
         }
         let raw = self
             .with_session(async |session, _store| {
-                session.select(&target.folder_path).await?;
+                select_unchanged(session, &target.folder_path, target.uid_validity).await?;
                 session.fetch_body(target.uid).await
             })
-            .await?;
+            .await;
+        let raw = self.resync_if_changed(raw)?;
         let Some(raw) = raw else {
             return Err(AccountError::new(
                 ErrorKind::Other,
@@ -660,19 +1553,47 @@ impl Worker {
     /// again (on failure too: the next sync brings the truth back).
     async fn set_seen(&mut self, targets: &[MessageRef], seen: bool) -> Result<(), AccountError> {
         let mut result = Ok(());
-        for (folder, (uids, _rows)) in by_folder(targets) {
+        for (folder, group) in by_folder(targets) {
+            self.changing(&folder);
             result = self
                 .with_session(async |session, _store| {
-                    session.select(&folder).await?;
-                    session.set_seen(&uids, seen).await
+                    select_unchanged(session, &folder, group.uid_validity).await?;
+                    session.set_seen(&group.uids, seen).await
                 })
                 .await;
+            result = self.resync_if_changed(result);
             if result.is_err() {
                 break;
             }
         }
         let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
         let _ = self.store.confirm_seen(&rows);
+        result
+    }
+
+    /// Sends the star, then lets the server's flags apply to these rows
+    /// again (like `set_seen`).
+    async fn set_flagged(
+        &mut self,
+        targets: &[MessageRef],
+        flagged: bool,
+    ) -> Result<(), AccountError> {
+        let mut result = Ok(());
+        for (folder, group) in by_folder(targets) {
+            self.changing(&folder);
+            result = self
+                .with_session(async |session, _store| {
+                    select_unchanged(session, &folder, group.uid_validity).await?;
+                    session.set_flagged(&group.uids, flagged).await
+                })
+                .await;
+            result = self.resync_if_changed(result);
+            if result.is_err() {
+                break;
+            }
+        }
+        let rows: Vec<i64> = targets.iter().map(|t| t.row_id).collect();
+        let _ = self.store.confirm_flagged(&rows);
         result
     }
 
@@ -688,29 +1609,43 @@ impl Worker {
         &mut self,
         targets: &[MessageRef],
         skip: Option<&str>,
-        op: impl AsyncFn(&mut ImapSource, &[u32]) -> Result<(), SyncError>,
+        op: impl AsyncFn(&mut C::Source, &[u32]) -> Result<(), SyncError>,
     ) -> Result<(), AccountError> {
         let mut result = Ok(());
-        for (folder, (uids, rows)) in by_folder(targets) {
+        for (folder, group) in by_folder(targets) {
             if result.is_err() || skip == Some(folder.as_str()) {
-                self.show(&rows);
+                self.show(&group.rows);
                 continue;
             }
+            self.changing(&folder);
             let done = self
                 .with_session(async |session, _store| {
-                    session.select(&folder).await?;
-                    op(session, &uids).await
+                    select_unchanged(session, &folder, group.uid_validity).await?;
+                    op(session, &group.uids).await
                 })
                 .await;
-            match done {
+            match self.resync_if_changed(done) {
                 Ok(()) => {
-                    let _ = self.store.delete_messages(&rows);
+                    let _ = self.store.delete_messages(&group.rows);
                 }
                 Err(error) => {
-                    self.show(&rows);
+                    self.show(&group.rows);
                     result = Err(error);
                 }
             }
+        }
+        result
+    }
+
+    /// After an action refused because its folder changed on the server
+    /// (see `select_unchanged`), a sync brings the folder's messages again
+    /// under their new UIDs.
+    fn resync_if_changed<T>(&mut self, result: Result<T, AccountError>) -> Result<T, AccountError> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.message == FOLDER_CHANGED)
+        {
+            self.sync_after_change(SyncScope::Account);
         }
         result
     }
@@ -729,9 +1664,9 @@ impl Worker {
     ) -> Result<(), AccountError> {
         let destination = match to {
             Destination::Archive => self.archive_path().await,
-            Destination::Trash => self
+            Destination::Trash | Destination::Junk | Destination::Inbox => self
                 .store
-                .folder_by_role(self.account.id, FolderRole::Trash)
+                .folder_by_role(self.account.id, to.role())
                 .ok()
                 .flatten()
                 .map(|f| f.path),
@@ -742,6 +1677,8 @@ impl Worker {
             let what = match to {
                 Destination::Archive => "Aucun dossier d'archives sur ce compte",
                 Destination::Trash => "Aucune corbeille sur ce compte",
+                Destination::Junk => "Aucun dossier spam sur ce compte",
+                Destination::Inbox => "Aucune réception sur ce compte",
             };
             return Err(AccountError::new(ErrorKind::Other, what));
         };
@@ -787,7 +1724,11 @@ impl Worker {
         if self.account.smtp.host.trim().is_empty() {
             return Err(SMTP_MISSING.to_string());
         }
-        let creds = self.credentials().await.map_err(|e| e.message)?;
+        let creds = self
+            .login
+            .credentials(&self.account)
+            .await
+            .map_err(|e| e.message)?;
         let raw = smtp::send(&self.account.smtp, &creds, outgoing)
             .await
             .map_err(|e| send_message(&e, &self.account))?;
@@ -819,17 +1760,122 @@ impl Worker {
     }
 }
 
+impl<C: Connector> Worker<C> {
+    /// Appends the new version of a draft, finds its UID by its
+    /// Message-ID, then deletes the older versions (failing to delete
+    /// them only leaves a duplicate: the save itself worked).
+    async fn save_draft(
+        &mut self,
+        raw: &[u8],
+        message_id: &str,
+        replace: Option<DraftCopy>,
+    ) -> Result<Option<DraftCopy>, String> {
+        let drafts = self
+            .store
+            .folder_by_role(self.account.id, FolderRole::Drafts)
+            .ok()
+            .flatten()
+            .ok_or_else(|| NO_DRAFTS_FOLDER.to_string())?;
+        let path = drafts.path.clone();
+        // Never retried after a timeout: the draft may already be there.
+        self.with_session_retrying(false, async |session, _store| {
+            session.append_draft(&path, raw).await
+        })
+        .await
+        .map_err(|e| e.message)?;
+        let found = self
+            .with_session(async |session, _store| {
+                session.select(&path).await?;
+                session.search_message_id(message_id).await
+            })
+            .await
+            .unwrap_or_default();
+        // UIDs only grow: the newest copy is the one just added.
+        let replaced = replace
+            .filter(|old| old.account == self.account.id && old.folder == path)
+            .map(|old| old.uid);
+        let newest = found.iter().copied().filter(|&u| Some(u) != replaced).max();
+        let mut older: Vec<u32> = found.into_iter().filter(|&u| Some(u) != newest).collect();
+        if let Some(uid) = replaced
+            && !older.contains(&uid)
+        {
+            older.push(uid);
+        }
+        if !older.is_empty() {
+            let _ = self.drop_draft(&path, &older).await;
+        }
+        Ok(newest.map(|uid| DraftCopy {
+            account: self.account.id,
+            folder: path,
+            uid,
+        }))
+    }
+
+    /// Deletes draft copies, and their rows in the list. Without UIDPLUS
+    /// they are only marked `\Deleted` (see `MailSource::discard`).
+    async fn drop_draft(&mut self, folder: &str, uids: &[u32]) -> Result<(), AccountError> {
+        self.with_session(async |session, _store| {
+            session.select(folder).await?;
+            session.discard(uids).await
+        })
+        .await?;
+        let known = self.store.folders(self.account.id).unwrap_or_default();
+        if let Some(local) = known.iter().find(|f| f.path == folder) {
+            for &uid in uids {
+                if let Ok(Some(row)) = self.store.message_row(local.id, uid) {
+                    let _ = self.store.delete_messages(&[row]);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shown when an account has no drafts folder.
+pub const NO_DRAFTS_FOLDER: &str =
+    "Aucun dossier « Brouillons » sur ce compte : le brouillon reste sur cet ordinateur";
+
 /// Shown when an account has no SMTP server (accounts made before V1).
 pub const SMTP_MISSING: &str =
     "Le serveur d'envoi de ce compte n'est pas configuré (Réglages › Serveurs).";
 
+/// Shown when an action was refused because its folder changed on the
+/// server (a new UIDVALIDITY): the UIDs known here name other messages.
+pub const FOLDER_CHANGED: &str = "Ce dossier a changé sur le serveur : action annulée, \
+     la liste va être mise à jour";
+
+/// Selects `folder`, and refuses to go on (`SyncError::FolderChanged`)
+/// when its UIDVALIDITY is not `expected` any more: the UIDs read before
+/// would name other messages. `None` (never synced) checks nothing.
+async fn select_unchanged<S: MailSource>(
+    session: &mut S,
+    folder: &str,
+    expected: Option<u32>,
+) -> Result<(), SyncError> {
+    let status = session.select(folder).await?;
+    if expected.is_some_and(|known| known != status.uid_validity) {
+        return Err(SyncError::FolderChanged(folder.to_string()));
+    }
+    Ok(())
+}
+
+/// The messages of one folder an action is about.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FolderGroup {
+    uids: Vec<u32>,
+    rows: Vec<i64>,
+    /// The folder's UIDVALIDITY when they were read (see `MessageRef`).
+    uid_validity: Option<u32>,
+}
+
 /// Groups messages by folder: their UIDs and row ids, in order.
-fn by_folder(targets: &[MessageRef]) -> BTreeMap<String, (Vec<u32>, Vec<i64>)> {
-    let mut groups: BTreeMap<String, (Vec<u32>, Vec<i64>)> = BTreeMap::new();
+fn by_folder(targets: &[MessageRef]) -> BTreeMap<String, FolderGroup> {
+    let mut groups: BTreeMap<String, FolderGroup> = BTreeMap::new();
     for target in targets {
-        let (uids, rows) = groups.entry(target.folder_path.clone()).or_default();
-        uids.push(target.uid);
-        rows.push(target.row_id);
+        let group = groups.entry(target.folder_path.clone()).or_default();
+        group.uids.push(target.uid);
+        group.rows.push(target.row_id);
+        group.uid_validity = group.uid_validity.or(target.uid_validity);
     }
     groups
 }
@@ -859,6 +1905,7 @@ pub fn user_error(error: &SyncError, account: &Account) -> AccountError {
             ErrorKind::Other,
             format!("Erreur de la base locale : {detail}"),
         ),
+        SyncError::FolderChanged(_) => AccountError::new(ErrorKind::Other, FOLDER_CHANGED),
     }
 }
 
@@ -881,9 +1928,13 @@ fn send_message(error: &SendError, account: &Account) -> String {
 mod tests {
     use super::*;
     use avero_core::secrets::MemorySecrets;
-    use avero_core::{AccountColor, AccountId, AuthKind, FolderId, NewAccount, ServerConfig};
+    use avero_core::{
+        AccountColor, AccountId, AuthKind, FolderId, Listing, NewAccount, ServerConfig, ServerFlags,
+    };
+    use avero_sync::source::{FetchedHeader, FolderStatus, RemoteFolder};
     use iced::futures::StreamExt;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn refresh_errors_are_classified() {
@@ -909,7 +1960,11 @@ mod tests {
     }
 
     fn temp_db(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("avero-worker-{}-{tag}.db", std::process::id()))
+        let path =
+            std::env::temp_dir().join(format!("avero-worker-{}-{tag}.db", std::process::id()));
+        // Left by an earlier run that had the same process id.
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     fn account_at(db: &Path, host: &str, port: u16, auth: AuthKind) -> Account {
@@ -1086,6 +2141,40 @@ mod tests {
         assert!(store.message.starts_with("Erreur de la base locale : "));
     }
 
+    #[tokio::test]
+    async fn a_locked_database_is_tried_once_more() {
+        let busy = || {
+            SyncError::Store(avero_core::store::StoreError::Sqlite(
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), None),
+            ))
+        };
+        let mut calls = 0;
+        let result = once_more_if_busy(Duration::ZERO, async || {
+            calls += 1;
+            if calls == 1 { Err(busy()) } else { Ok(calls) }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 2);
+
+        // Twice locked, or another error: no more tries.
+        let mut calls = 0;
+        let result: Result<(), SyncError> = once_more_if_busy(Duration::ZERO, async || {
+            calls += 1;
+            Err(busy())
+        })
+        .await;
+        assert!(matches!(result, Err(SyncError::Store(_))));
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let result: Result<(), SyncError> = once_more_if_busy(Duration::ZERO, async || {
+            calls += 1;
+            Err(SyncError::Protocol("no".into()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
     #[test]
     fn targets_are_grouped_by_folder() {
         let target = |folder: &str, uid| MessageRef {
@@ -1094,10 +2183,16 @@ mod tests {
             folder_id: FolderId(1),
             folder_path: folder.into(),
             uid,
+            uid_validity: Some(7),
         };
         let groups = by_folder(&[target("INBOX", 3), target("Spam", 9), target("INBOX", 1)]);
-        assert_eq!(groups["INBOX"], (vec![3, 1], vec![3, 1]));
-        assert_eq!(groups["Spam"], (vec![9], vec![9]));
+        let group = |uids: Vec<u32>, rows: Vec<i64>| FolderGroup {
+            uids,
+            rows,
+            uid_validity: Some(7),
+        };
+        assert_eq!(groups["INBOX"], group(vec![3, 1], vec![3, 1]));
+        assert_eq!(groups["Spam"], group(vec![9], vec![9]));
     }
 
     #[tokio::test]
@@ -1188,6 +2283,7 @@ mod tests {
             date: 1,
             seen: false,
             has_attachments: false,
+            ..Default::default()
         };
         store.insert_messages(inbox.id, &[message]).unwrap();
         let rows: Vec<i64> = store
@@ -1230,7 +2326,826 @@ mod tests {
             })
             .collect()
             .await;
-        store.apply_flags(inbox.id, 1, 1, &[(1, false)]).unwrap();
+        let unread = ServerFlags {
+            uid: 1,
+            seen: false,
+            flagged: false,
+        };
+        store.apply_flags(inbox.id, 1, 1, &[unread]).unwrap();
         assert_eq!(store.inbox_uids(inbox.id).unwrap(), vec![(1, false)]);
+    }
+
+    #[tokio::test]
+    async fn star_goes_to_the_server_then_its_flag_applies_again() {
+        let fake = fake_worker("star");
+        let row = fake.target.row_id;
+        fake.store.set_flagged(&[row], true).unwrap();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetFlagged {
+                targets: vec![fake.target.clone()],
+                flagged: true,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Done(Ok(())))),
+            "{events:?}"
+        );
+        assert_eq!(*fake.server.stars.lock().unwrap(), vec![(1, true)]);
+        // Confirmed: what the server says counts again.
+        let starred = |store: &Store| {
+            store
+                .list(&Listing::Starred, AccountFilter::All, false, 10, 0)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(starred(&fake.store), 1);
+        let inbox = fake.target.folder_id;
+        let plain = ServerFlags {
+            uid: 1,
+            seen: false,
+            flagged: false,
+        };
+        fake.store.apply_flags(inbox, 1, 1, &[plain]).unwrap();
+        assert_eq!(starred(&fake.store), 0);
+        fake.worker.send(Job::Shutdown {
+            delete_secret: false,
+        });
+    }
+
+    /// Saves a draft on the fake server and returns where it went.
+    async fn save_draft(
+        fake: &Fake,
+        version: u32,
+        replace: Option<DraftCopy>,
+    ) -> Result<Option<DraftCopy>, String> {
+        let raw = format!("Message-ID: <d1@x.fr>\r\nSubject: v{version}\r\n\r\nx").into_bytes();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SaveDraft {
+                raw,
+                message_id: "<d1@x.fr>".into(),
+                replace,
+                reply,
+            })
+            .collect()
+            .await;
+        match events.last() {
+            Some(Event::DraftSaved(result)) => result.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The UIDs left in the fake drafts folder.
+    fn draft_uids(fake: &Fake) -> Vec<u32> {
+        fake.server
+            .drafts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.0)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn draft_replaces_its_previous_copy_and_goes_when_dropped() {
+        let fake = fake_worker("drafts");
+        assert_eq!(
+            save_draft(&fake, 1, None).await,
+            Err(NO_DRAFTS_FOLDER.to_string())
+        );
+        fake.store
+            .upsert_folder(fake.account, "Drafts", FolderRole::Drafts)
+            .unwrap();
+        let first = save_draft(&fake, 1, None).await.unwrap().unwrap();
+        assert_eq!((first.folder.as_str(), first.uid), ("Drafts", 11));
+        let raw = String::from_utf8(fake.server.drafts.lock().unwrap()[0].2.clone()).unwrap();
+        assert!(raw.contains("Subject: v1"), "{raw}");
+        // The next save replaces it (found by its UID).
+        let second = save_draft(&fake, 2, Some(first)).await.unwrap().unwrap();
+        assert_eq!(second.uid, 12);
+        assert_eq!(draft_uids(&fake), vec![12]);
+        // A copy the computer did not know (same Message-ID) goes too.
+        fake.server.drafts.lock().unwrap().push((
+            13,
+            "Drafts".into(),
+            b"Message-ID: <d1@x.fr>\r\n\r\nold".to_vec(),
+        ));
+        let third = save_draft(&fake, 3, Some(second)).await.unwrap().unwrap();
+        assert_eq!(draft_uids(&fake), vec![third.uid]);
+        // Sent or thrown away: dropped.
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::DropDraft { copy: third, reply })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Done(Ok(())))),
+            "{events:?}"
+        );
+        assert!(draft_uids(&fake).is_empty());
+    }
+
+    /// A fake IMAP server whose folder list waits until `open` turns
+    /// true: a sync on it lasts as long as the test wants.
+    ///
+    /// Its inbox watchers wait for what the test sends on `inbox`: a
+    /// change, or an error (the connection drops).
+    struct FakeServer {
+        open: tokio::sync::watch::Receiver<bool>,
+        /// Signalled when a folder list starts (the sync is running).
+        listing: tokio::sync::Notify,
+        lists: AtomicUsize,
+        /// SELECTs of a folder (a sync of the inbox alone lists nothing).
+        selects: AtomicUsize,
+        connects: AtomicUsize,
+        dropped: AtomicUsize,
+        inbox: tokio::sync::Mutex<UnboundedReceiver<Result<Change, ()>>>,
+        /// Signalled when a watcher starts waiting.
+        watching: tokio::sync::Notify,
+        /// Watcher connections tried, and dropped.
+        watch_connects: AtomicUsize,
+        watch_dropped: AtomicUsize,
+        /// How many watcher connections fail before one succeeds.
+        watch_failures: AtomicUsize,
+        /// The watcher's login is refused.
+        watch_refused: std::sync::atomic::AtomicBool,
+        /// Every `(uid, starred)` sent by `set_flagged`.
+        stars: std::sync::Mutex<Vec<(u32, bool)>>,
+        /// The drafts folder: `(uid, folder, raw)` of each draft appended
+        /// and not deleted.
+        drafts: std::sync::Mutex<Vec<(u32, String, Vec<u8>)>>,
+    }
+
+    struct FakeConnector(Arc<FakeServer>);
+
+    impl Connector for FakeConnector {
+        type Source = FakeSession;
+        type Watch = FakeWatch;
+
+        async fn connect(
+            &self,
+            _cfg: &ServerConfig,
+            _creds: &Credentials,
+        ) -> Result<FakeSession, SyncError> {
+            self.0.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(FakeSession(self.0.clone()))
+        }
+
+        async fn watch(
+            &self,
+            _cfg: &ServerConfig,
+            _creds: &Credentials,
+        ) -> Result<FakeWatch, SyncError> {
+            let server = &self.0;
+            server.watch_connects.fetch_add(1, Ordering::SeqCst);
+            if server.watch_refused.load(Ordering::SeqCst) {
+                return Err(SyncError::Auth("NO refused".into()));
+            }
+            let failures = server.watch_failures.load(Ordering::SeqCst);
+            if failures > 0 {
+                server.watch_failures.store(failures - 1, Ordering::SeqCst);
+                return Err(SyncError::Connect("unreachable".into()));
+            }
+            Ok(FakeWatch(server.clone()))
+        }
+    }
+
+    struct FakeWatch(Arc<FakeServer>);
+
+    impl Drop for FakeWatch {
+        fn drop(&mut self) {
+            self.0.watch_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl InboxWatch for FakeWatch {
+        async fn wait(&mut self) -> Result<Change, SyncError> {
+            let mut inbox = self.0.inbox.lock().await;
+            self.0.watching.notify_one();
+            match inbox.recv().await {
+                Some(Ok(change)) => Ok(change),
+                Some(Err(())) | None => Err(SyncError::Connect("lost".into())),
+            }
+        }
+    }
+
+    struct FakeSession(Arc<FakeServer>);
+
+    impl Drop for FakeSession {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl MailSource for FakeSession {
+        async fn list_folders(&mut self) -> Result<Vec<RemoteFolder>, SyncError> {
+            self.0.lists.fetch_add(1, Ordering::SeqCst);
+            self.0.listing.notify_one();
+            let mut open = self.0.open.clone();
+            let _ = open.wait_for(|open| *open).await;
+            Ok(Vec::new())
+        }
+        async fn select(&mut self, _path: &str) -> Result<FolderStatus, SyncError> {
+            self.0.selects.fetch_add(1, Ordering::SeqCst);
+            Ok(FolderStatus {
+                uid_validity: 1,
+                uid_next: Some(2),
+                exists: 1,
+            })
+        }
+        async fn fetch_headers(
+            &mut self,
+            _from_uid: u32,
+            _to_uid: Option<u32>,
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_headers_by_seq(
+            &mut self,
+            _from_seq: u32,
+            _to_seq: u32,
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_uids(&mut self, _from_uid: u32) -> Result<Vec<u32>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_flags(
+            &mut self,
+            _from_uid: u32,
+            _to_uid: u32,
+        ) -> Result<Vec<ServerFlags>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_sizes(
+            &mut self,
+            _from_uid: u32,
+            _to_uid: u32,
+        ) -> Result<Vec<(u32, u32)>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_body(&mut self, _uid: u32) -> Result<Option<Vec<u8>>, SyncError> {
+            Ok(Some(b"Subject: s\r\n\r\nBonjour".to_vec()))
+        }
+        async fn set_seen(&mut self, _uids: &[u32], _seen: bool) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<(), SyncError> {
+            let mut stars = self.0.stars.lock().unwrap();
+            stars.extend(uids.iter().map(|&uid| (uid, flagged)));
+            Ok(())
+        }
+        async fn move_to(&mut self, _uids: &[u32], _dest: &str) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn delete_permanently(&mut self, uids: &[u32]) -> Result<(), SyncError> {
+            self.0
+                .drafts
+                .lock()
+                .unwrap()
+                .retain(|d| !uids.contains(&d.0));
+            Ok(())
+        }
+        async fn append(
+            &mut self,
+            _folder: &str,
+            _raw: &[u8],
+            _seen: bool,
+        ) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn append_draft(&mut self, folder: &str, raw: &[u8]) -> Result<(), SyncError> {
+            let mut drafts = self.0.drafts.lock().unwrap();
+            let uid = drafts.iter().map(|d| d.0).max().unwrap_or(10) + 1;
+            drafts.push((uid, folder.to_string(), raw.to_vec()));
+            Ok(())
+        }
+        async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError> {
+            let drafts = self.0.drafts.lock().unwrap();
+            let header = format!("Message-ID: {message_id}");
+            Ok(drafts
+                .iter()
+                .filter(|d| String::from_utf8_lossy(&d.2).contains(&header))
+                .map(|d| d.0)
+                .collect())
+        }
+        async fn search_text(&mut self, _query: &str) -> Result<Vec<u32>, SyncError> {
+            Ok(Vec::new())
+        }
+        async fn fetch_headers_of(
+            &mut self,
+            _uids: &[u32],
+        ) -> Result<Vec<FetchedHeader>, SyncError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A worker on a fake server, with one inbox message (no body yet)
+    /// and an archive folder.
+    struct Fake {
+        worker: WorkerHandle,
+        server: Arc<FakeServer>,
+        open: tokio::sync::watch::Sender<bool>,
+        /// What the inbox watchers see next.
+        inbox: UnboundedSender<Result<Change, ()>>,
+        target: MessageRef,
+        store: Store,
+        secrets: Arc<MemorySecrets>,
+        account: AccountId,
+    }
+
+    fn fake_worker(tag: &str) -> Fake {
+        let db = temp_db(tag);
+        let account = account_at(&db, "imap.fake", 993, AuthKind::Password);
+        let store = Store::open(&db).unwrap();
+        let inbox = store
+            .upsert_folder(account.id, "INBOX", FolderRole::Inbox)
+            .unwrap();
+        store
+            .upsert_folder(account.id, "Archive", FolderRole::Archive)
+            .unwrap();
+        let message = avero_core::NewMessage {
+            uid: 1,
+            message_id: None,
+            subject: "s".into(),
+            from_name: None,
+            from_addr: "x@y.z".into(),
+            date: 1,
+            seen: false,
+            has_attachments: false,
+            ..Default::default()
+        };
+        store.insert_messages(inbox.id, &[message]).unwrap();
+        let rows: Vec<i64> = store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap()
+            .into_iter()
+            .flat_map(|i| i.row_ids)
+            .collect();
+        let target = store.message_refs(&rows).unwrap().remove(0);
+        let secrets = Arc::new(MemorySecrets::new());
+        secrets.set(account.id, "pw").unwrap();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let (inbox, changes) = mpsc::unbounded_channel();
+        let server = Arc::new(FakeServer {
+            open: gate,
+            listing: tokio::sync::Notify::new(),
+            lists: AtomicUsize::new(0),
+            selects: AtomicUsize::new(0),
+            connects: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            inbox: tokio::sync::Mutex::new(changes),
+            watching: tokio::sync::Notify::new(),
+            watch_connects: AtomicUsize::new(0),
+            watch_dropped: AtomicUsize::new(0),
+            watch_failures: AtomicUsize::new(0),
+            watch_refused: std::sync::atomic::AtomicBool::new(false),
+            stars: std::sync::Mutex::new(Vec::new()),
+            drafts: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let worker = WorkerHandle::spawn_with(
+            WorkerSetup {
+                account: account.clone(),
+                db_path: db,
+                secrets: secrets.clone(),
+                config_dir: std::env::temp_dir().join("avero-worker-no-config"),
+            },
+            FakeConnector(server.clone()),
+            Retry {
+                first: Duration::from_millis(10),
+                max: Duration::from_millis(40),
+                updates: Duration::from_millis(150),
+            },
+        );
+        Fake {
+            worker,
+            server,
+            open,
+            inbox,
+            target,
+            store,
+            secrets,
+            account: account.id,
+        }
+    }
+
+    /// Starts a sync and collects its events in the background.
+    fn start_sync(worker: &WorkerHandle) -> tokio::task::JoinHandle<Vec<Event>> {
+        tokio::spawn(worker.request(|reply| Job::Sync { reply }).collect())
+    }
+
+    /// Waits until the worker has handled every job sent before.
+    async fn flush(worker: &WorkerHandle) {
+        let events: Vec<Event> = worker
+            .request(|reply| Job::SetSeen {
+                targets: Vec::new(),
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(matches!(events.last(), Some(Event::Done(Ok(())))));
+    }
+
+    /// The sync succeeded (the prefetch may add `Progress` events after).
+    fn synced_ok(events: &[Event]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Synced(Ok(true))))
+    }
+
+    #[tokio::test]
+    async fn server_search_answers_what_it_found() {
+        let fake = fake_worker("searchdone");
+        fake.open.send(true).unwrap();
+        let (_cancel, cancelled) = oneshot::channel();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SearchServer {
+                query: "facture".into(),
+                cancel: cancelled,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.as_slice(), [Event::Found(Ok(hits))] if hits.added == 0),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_server_search_frees_the_worker() {
+        let fake = fake_worker("searchcancel");
+        let (cancel, cancelled) = oneshot::channel();
+        let search = tokio::spawn(
+            fake.worker
+                .request(|reply| Job::SearchServer {
+                    query: "facture".into(),
+                    cancel: cancelled,
+                    reply,
+                })
+                .collect::<Vec<Event>>(),
+        );
+        // The search waits on the server's folder list.
+        fake.server.listing.notified().await;
+        drop(cancel);
+        let events = search.await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Found(_))),
+            "{events:?}"
+        );
+        // The worker serves the next jobs; the session cut in the middle
+        // was dropped.
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn body_is_served_during_a_slow_sync() {
+        let fake = fake_worker("readsync");
+        let sync = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        let target = fake.target.clone();
+        let events: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::FetchBody { target, reply })
+            .collect()
+            .await;
+        assert!(
+            matches!(events.last(), Some(Event::Body { result: Ok(()), .. })),
+            "{events:?}"
+        );
+        assert!(fake.store.body(fake.target.row_id).unwrap().is_some());
+        assert!(!sync.is_finished(), "the sync is still waiting");
+        fake.open.send(true).unwrap();
+        let events = sync.await.unwrap();
+        assert!(synced_ok(&events), "{events:?}");
+        // Two sessions: the user's and the sync's.
+        assert_eq!(fake.server.connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_asked_during_a_sync_joins_it() {
+        let fake = fake_worker("merge");
+        let first = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        let second = start_sync(&fake.worker);
+        flush(&fake.worker).await;
+        fake.open.send(true).unwrap();
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(synced_ok(&first), "{first:?}");
+        assert!(synced_ok(&second), "{second:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1, "one sync");
+    }
+
+    #[tokio::test]
+    async fn sync_asked_after_new_settings_runs_again() {
+        let fake = fake_worker("resync");
+        let first = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        let _: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetPassword {
+                password: "new".into(),
+                reply,
+            })
+            .collect()
+            .await;
+        let second = start_sync(&fake.worker);
+        flush(&fake.worker).await;
+        fake.open.send(true).unwrap();
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert!(synced_ok(&first), "{first:?}");
+        assert!(synced_ok(&second), "{second:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 2, "two syncs");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_sync_stops_it() {
+        let fake = fake_worker("stopsync");
+        let sync = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        fake.worker.send(Job::Shutdown {
+            delete_secret: true,
+        });
+        // The gate never opens: only the shutdown can end this sync.
+        let events = sync.await.unwrap();
+        assert!(
+            events.is_empty() || matches!(events.as_slice(), [Event::Gone]),
+            "{events:?}"
+        );
+        let later: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::Sync { reply })
+            .collect()
+            .await;
+        assert!(
+            later.is_empty() || matches!(later.as_slice(), [Event::Gone]),
+            "{later:?}"
+        );
+        assert_eq!(fake.secrets.get(fake.account).unwrap(), None);
+        // The sync's session was dropped, not left running.
+        assert_eq!(
+            fake.server.dropped.load(Ordering::SeqCst),
+            fake.server.connects.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Waits until `condition` holds (other threads are at work), at
+    /// most a few seconds.
+    async fn eventually(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    /// The next event of a watch stream that is not a `Progress`.
+    async fn next_final(events: &mut BoxStream<'static, Event>) -> Option<Event> {
+        let waiting = async {
+            loop {
+                match events.next().await {
+                    Some(Event::Progress) => continue,
+                    other => return other,
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("no event in time")
+    }
+
+    #[tokio::test]
+    async fn inbox_change_starts_a_sync() {
+        let fake = fake_worker("watch");
+        fake.open.send(true).unwrap();
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
+        fake.inbox.send(Ok(Change::Arrived)).unwrap();
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+        // A quiet round asks for nothing.
+        fake.server.watching.notified().await;
+        fake.inbox.send(Ok(Change::Quiet)).unwrap();
+        fake.server.watching.notified().await;
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn flag_changes_bring_one_inbox_sync_a_little_later() {
+        let fake = fake_worker("watchflags");
+        fake.open.send(true).unwrap();
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        let started = std::time::Instant::now();
+        // Three changes in a row (read, starred, moved elsewhere).
+        for _ in 0..3 {
+            fake.inbox.send(Ok(Change::Updated)).unwrap();
+            fake.server.watching.notified().await;
+        }
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), 0);
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        // The inbox alone, once.
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_action_on_a_folder_that_changed_is_refused_then_synced() {
+        let fake = fake_worker("uidvalidity");
+        fake.open.send(true).unwrap();
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        // Read when the inbox's UIDVALIDITY was 5; the server says 1 now:
+        // UID 1 is another message.
+        let mut target = fake.target.clone();
+        target.uid_validity = Some(5);
+        fake.store.set_hidden(&[target.row_id], true).unwrap();
+        let done: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::DeleteForever {
+                targets: vec![target.clone()],
+                reply,
+            })
+            .collect()
+            .await;
+        match done.last() {
+            Some(Event::Done(Err(error))) => assert_eq!(error.message, FOLDER_CHANGED),
+            other => panic!("{other:?}"),
+        }
+        // The row is shown again, and a sync follows.
+        let shown = fake
+            .store
+            .unified(FolderRole::Inbox, AccountFilter::All, 10, 0)
+            .unwrap();
+        assert_eq!(shown.len(), 1);
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+        // The same UIDVALIDITY as the server's: done.
+        target.uid_validity = Some(1);
+        let done: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetSeen {
+                targets: vec![target],
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        assert!(matches!(done.last(), Some(Event::Done(Ok(())))), "{done:?}");
+    }
+
+    #[tokio::test]
+    async fn the_echo_of_avero_s_own_changes_brings_no_sync() {
+        let fake = fake_worker("watchecho");
+        fake.open.send(true).unwrap();
+        let _events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        // The user marks a message of the inbox read; the server tells
+        // the watcher's session too.
+        let target = fake.target.clone();
+        let _: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetSeen {
+                targets: vec![target],
+                seen: true,
+                reply,
+            })
+            .collect()
+            .await;
+        let selected = fake.server.selects.load(Ordering::SeqCst);
+        fake.inbox.send(Ok(Change::Updated)).unwrap();
+        fake.server.watching.notified().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        flush(&fake.worker).await;
+        assert_eq!(fake.server.selects.load(Ordering::SeqCst), selected);
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn inbox_change_during_a_sync_gets_a_sync_after_it() {
+        let fake = fake_worker("watchsync");
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        // A sync is running (it may have passed the inbox already).
+        let first = start_sync(&fake.worker);
+        fake.server.listing.notified().await;
+        fake.inbox.send(Ok(Change::Arrived)).unwrap();
+        // The watcher sent the change and waits again; give the worker
+        // a moment to take it while the sync still runs.
+        fake.server.watching.notified().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 1);
+        fake.open.send(true).unwrap();
+        let first = first.await.unwrap();
+        assert!(synced_ok(&first), "{first:?}");
+        // The change did not just join the running sync: a second one
+        // started after it.
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        assert_eq!(fake.server.lists.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn watcher_reconnects_after_errors() {
+        let fake = fake_worker("rewatch");
+        fake.open.send(true).unwrap();
+        // The first two connections fail, then one drops while waiting.
+        fake.server.watch_failures.store(2, Ordering::SeqCst);
+        let mut events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 3);
+        fake.inbox.send(Err(())).unwrap();
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 4);
+        assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
+        // Mail may have come while the connection was lost: a sync, on
+        // its own.
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+        // The new connection still reports changes.
+        fake.inbox.send(Ok(Change::Arrived)).unwrap();
+        let event = next_final(&mut events).await;
+        assert!(matches!(event, Some(Event::Synced(Ok(true)))), "{event:?}");
+    }
+
+    #[tokio::test]
+    async fn refused_credentials_stop_watching_until_fixed() {
+        let fake = fake_worker("watchauth");
+        fake.server.watch_refused.store(true, Ordering::SeqCst);
+        let _events = fake.worker.watch();
+        eventually("the watcher's login", || {
+            fake.server.watch_connects.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // No new try on its own, even after several retry delays.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 1);
+        // A new password starts the watcher again.
+        fake.server.watch_refused.store(false, Ordering::SeqCst);
+        let _: Vec<Event> = fake
+            .worker
+            .request(|reply| Job::SetPassword {
+                password: "new".into(),
+                reply,
+            })
+            .collect()
+            .await;
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn new_settings_restart_the_watcher() {
+        let fake = fake_worker("watchupdate");
+        let _events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        let account = fake
+            .store
+            .accounts()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == fake.account)
+            .unwrap();
+        fake.worker.send(Job::UpdateAccount(Box::new(account)));
+        fake.server.watching.notified().await;
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 2);
+        assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_watcher() {
+        let fake = fake_worker("watchstop");
+        let events = fake.worker.watch();
+        fake.server.watching.notified().await;
+        fake.worker.send(Job::Shutdown {
+            delete_secret: true,
+        });
+        // The stream ends with the worker, without any event.
+        let events: Vec<Event> = tokio::time::timeout(Duration::from_secs(5), events.collect())
+            .await
+            .expect("the watch stream ends");
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(fake.secrets.get(fake.account).unwrap(), None);
+        // Its session was let go before the secret was deleted.
+        assert_eq!(fake.server.watch_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.server.watch_dropped.load(Ordering::SeqCst), 1);
     }
 }

@@ -1,13 +1,26 @@
 //! SQLite storage: accounts, folders, messages, cached bodies, the unified
 //! inbox query and local full-text search.
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+mod cleanup;
+mod drafts;
+mod filters;
+mod later;
+mod server_search;
+mod spaces;
+
+use spaces::filter_account;
+
+use crate::category::{classify, sender_key};
 use crate::{
-    Account, AccountColor, AccountFilter, AccountId, AuthKind, Folder, FolderId, FolderRole,
-    MessageRef, NewAccount, NewMessage, Security, ServerConfig, UnifiedItem,
+    Account, AccountColor, AccountFilter, AccountId, AuthKind, Category, Folder, FolderId,
+    FolderRole, Listing, MessageHeaders, MessageRef, NewAccount, NewMessage, Security,
+    ServerConfig, ServerFlags, UnifiedItem,
 };
 
 /// Error returned by every `Store` operation.
@@ -15,6 +28,42 @@ use crate::{
 pub enum StoreError {
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// An account with this e-mail address (case and spaces ignored) exists.
+    #[error("an account with this address already exists")]
+    DuplicateAccount,
+}
+
+impl StoreError {
+    /// Whether another connection held the database for too long (see
+    /// `BUSY_TIMEOUT`): trying again a little later may work.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+    }
+}
+
+/// How long a write waits for the write of another connection (the
+/// interface, each account's worker and sync, the spam filter's learning)
+/// before failing with "database is locked".
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts a transaction that writes. `BEGIN IMMEDIATE` takes the write
+/// lock at once, waiting up to `BUSY_TIMEOUT` if another connection holds
+/// it. A plain (deferred) transaction that reads first and writes later
+/// fails at once instead, without waiting: in WAL mode SQLite cannot let
+/// it write over a snapshot that another connection changed meanwhile.
+/// Every transaction of the `Store` that writes starts here.
+pub(crate) fn write_tx(conn: &Connection) -> Result<Transaction<'_>, StoreError> {
+    Ok(Transaction::new_unchecked(
+        conn,
+        TransactionBehavior::Immediate,
+    )?)
 }
 
 /// Length of `UnifiedItem::snippet`, in characters.
@@ -28,10 +77,117 @@ pub struct Store {
 /// Columns read by `account_from_row`, in order.
 const ACCOUNT_COLUMNS: &str = "id, name, email, color_r, color_g, color_b,
      imap_host, imap_port, imap_user, imap_security,
-     smtp_host, smtp_port, smtp_user, smtp_security, auth";
+     smtp_host, smtp_port, smtp_user, smtp_security, auth, signature";
 
 /// Columns read by `folder_from_row`, in order.
 const FOLDER_COLUMNS: &str = "id, account_id, path, role, uid_validity, last_seen_uid";
+
+/// Columns read by `item_from_row`, in order (`r` is a ranked group, `m`
+/// its message shown, `b` that message's cached body).
+const ITEM_COLUMNS: &str = "r.ids, r.accounts, m.subject, m.from_name, m.from_addr, m.date,
+     r.all_seen, r.any_attachment, substr(b.text, 1, 1000), m.thread_id, r.any_flagged,
+     r.snoozed_until";
+
+/// Which messages a list (and its unread count) takes, on `m` (a message)
+/// and `f` (its folder). Parameters: ?1 folder role, ?2 accounts (see
+/// `spaces::filter_account`), ?6 tab
+/// (category), ?7 sender, ?8 starred only, ?9 trash and spam left out;
+/// NULL or 0 means "no condition". ?10 is 1 for "Plus tard" (only the
+/// snoozed messages), else 0 (every list but that one leaves them out).
+/// ?3 (search), ?4 and ?5 (paging) are the caller's.
+const LIST_CONDITIONS: &str = "(?1 IS NULL OR f.role = ?1)
+     AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
+     AND m.hidden = 0
+     AND (?6 IS NULL OR COALESCE(m.category, 'important') = ?6)
+     AND (?7 IS NULL OR lower(trim(m.from_addr)) = ?7)
+     AND (?8 = 0 OR m.flagged = 1)
+     AND (?9 = 0 OR f.role NOT IN ('trash', 'junk'))
+     AND ?10 = EXISTS (SELECT 1 FROM snoozes s
+                       WHERE s.key = COALESCE(m.message_id, 'row:' || m.id)
+                         AND s.woke_at IS NULL)";
+
+/// Added to `LIST_CONDITIONS` for a small folder (sent, drafts, trash...):
+/// its messages are read through the `(folder_id, uid)` index instead of
+/// going through every message. Not for the inbox, nor for the lists over
+/// every folder: they hold most messages, and reading them all in order
+/// is faster.
+const SMALL_FOLDER: &str = "AND m.folder_id IN (
+         SELECT id FROM folders
+         WHERE role = ?1 AND (?2 IS NULL OR account_id IN (SELECT value FROM json_each(?2))))";
+
+/// The conditions of a `Listing`, as parameters of `LIST_CONDITIONS`.
+struct Scope {
+    role: Option<&'static str>,
+    category: Option<&'static str>,
+    sender: Option<String>,
+    starred: bool,
+    skip_trash: bool,
+    /// "Plus tard": the snoozed messages only.
+    snoozed: bool,
+}
+
+impl Scope {
+    /// `SMALL_FOLDER` when the listing is one folder other than the
+    /// inbox, else nothing.
+    fn folder_condition(&self) -> &'static str {
+        match self.role {
+            Some(role) if role != FolderRole::Inbox.as_str() => SMALL_FOLDER,
+            _ => "",
+        }
+    }
+
+    /// Every folder, no condition (a search).
+    fn everywhere() -> Scope {
+        Scope {
+            role: None,
+            category: None,
+            sender: None,
+            starred: false,
+            skip_trash: false,
+            snoozed: false,
+        }
+    }
+
+    fn of(listing: &Listing) -> Scope {
+        let mut scope = Scope::everywhere();
+        match listing {
+            Listing::Folder(role) => scope.role = Some(role.as_str()),
+            Listing::Tab(category) => {
+                scope.role = Some(FolderRole::Inbox.as_str());
+                scope.category = Some(category.as_str());
+            }
+            Listing::Starred => {
+                scope.starred = true;
+                scope.skip_trash = true;
+            }
+            Listing::Sender(addr) => scope.sender = Some(sender_key(addr)),
+            Listing::Snoozed => {
+                scope.snoozed = true;
+                scope.skip_trash = true;
+            }
+        }
+        scope
+    }
+}
+
+/// What a search looks for (see `Store::search_with`).
+struct Search<'a> {
+    /// The FTS query (see `fts_query`).
+    fts: &'a str,
+    /// Rows found otherwise, as a JSON array.
+    rows: String,
+}
+
+/// What makes two rows the same message: the Message-ID, or the row
+/// itself when there is none.
+const MESSAGE_KEY: &str = "COALESCE(m.message_id, 'row:' || m.id)";
+
+/// The rows a conversation shows (`?1` the conversation, `?2` the account
+/// or NULL, `?3` the folder role being listed): every folder but the
+/// trash and spam ones, unless the list is one of them.
+const THREAD_SCOPE: &str = "m.thread_id = ?1 AND m.hidden = 0
+     AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
+     AND (f.role NOT IN ('trash', 'junk') OR f.role = ?3)";
 
 impl Store {
     /// Opens (or creates) the database file, in WAL mode.
@@ -48,10 +204,34 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Store, StoreError> {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let store = Store { conn };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// The accounts deleted by the version 4 migration, which merged
+    /// accounts sharing one address, whose secrets are still to be
+    /// erased. The caller must erase them (the store cannot reach the
+    /// `SecretStore`), then call `secret_deleted`. They are kept in the
+    /// database until then, so a crash or a second opening of the
+    /// database loses none.
+    pub fn merged_accounts(&self) -> Result<Vec<AccountId>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account_id FROM pending_secret_deletions ORDER BY account_id")?;
+        let rows = stmt.query_map([], |row| Ok(AccountId(row.get(0)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The secret of a merged account (see `merged_accounts`) is erased.
+    pub fn secret_deleted(&self, id: AccountId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM pending_secret_deletions WHERE account_id = ?1",
+            params![id.0],
+        )?;
+        Ok(())
     }
 
     /// Applies the schema versions the database has not seen yet, each in
@@ -71,7 +251,7 @@ impl Store {
                 // be switched outside a transaction.
                 self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
                 let result = self.conn.execute_batch(&format!(
-                    "BEGIN;\n{sql}\nPRAGMA user_version = {target};\nCOMMIT;"
+                    "BEGIN IMMEDIATE;\n{sql}\nPRAGMA user_version = {target};\nCOMMIT;"
                 ));
                 if result.is_err() {
                     let _ = self.conn.execute_batch("ROLLBACK;");
@@ -80,6 +260,88 @@ impl Store {
                 result?;
             }
         }
+        if version < 4 {
+            self.migrate_to_v4()?;
+        }
+        if version < 5 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v5.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 5;")?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v6.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 6;")?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v7.sql"))?;
+            classify_unsorted(&tx)?;
+            tx.execute_batch("PRAGMA user_version = 7;")?;
+            tx.commit()?;
+        }
+        if version < 8 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v8.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 8;")?;
+            tx.commit()?;
+        }
+        if version < 9 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v9.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 9;")?;
+            tx.commit()?;
+        }
+        if version < 10 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v10.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 10;")?;
+            tx.commit()?;
+        }
+        if version < 11 {
+            let tx = write_tx(&self.conn)?;
+            tx.execute_batch(include_str!("schema_v11.sql"))?;
+            tx.execute_batch("PRAGMA user_version = 11;")?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Version 4: one account per address. Accounts with the same address
+    /// (case and spaces ignored) are merged into the oldest one, then a
+    /// unique index keeps it that way. Foreign keys stay on, so bodies go
+    /// with their messages. The merged accounts' secrets are left for the
+    /// app to erase (see `merged_accounts`).
+    fn migrate_to_v4(&self) -> Result<(), StoreError> {
+        let tx = write_tx(&self.conn)?;
+        let doomed: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM accounts
+                 WHERE id NOT IN (SELECT MIN(id) FROM accounts
+                                  GROUP BY lower(trim(email)))
+                 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        // The table of version 11, needed this early.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_secret_deletions (
+                 account_id  INTEGER PRIMARY KEY
+             );",
+        )?;
+        for id in &doomed {
+            delete_account_rows(&tx, AccountId(*id))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_secret_deletions (account_id) VALUES (?1)",
+                params![id],
+            )?;
+        }
+        tx.execute_batch(include_str!("schema_v4.sql"))?;
+        tx.execute_batch("PRAGMA user_version = 4;")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -87,8 +349,8 @@ impl Store {
     /// gone): hidden rows come back, server flags apply again.
     pub fn clear_pending(&self) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE messages SET seen_pending = 0, hidden = 0
-             WHERE seen_pending != 0 OR hidden != 0",
+            "UPDATE messages SET seen_pending = 0, flag_pending = 0, hidden = 0
+             WHERE seen_pending != 0 OR flag_pending != 0 OR hidden != 0",
             [],
         )?;
         Ok(())
@@ -100,7 +362,7 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
         let color = AccountColor::palette(count as usize);
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT INTO accounts
                  (name, email, color_r, color_g, color_b,
                   imap_host, imap_port, imap_user, imap_security,
@@ -122,15 +384,31 @@ impl Store {
                 new.smtp.security.as_str(),
                 new.auth.as_str(),
             ],
-        )?;
+        );
+        // The unique index on the address is the guarantee.
+        match inserted {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err(StoreError::DuplicateAccount);
+            }
+            other => {
+                other?;
+            }
+        }
+        let id = AccountId(self.conn.last_insert_rowid());
+        // The id of a merged account given again: its secret will be this
+        // account's, which must not be erased.
+        self.secret_deleted(id)?;
         Ok(Account {
-            id: AccountId(self.conn.last_insert_rowid()),
+            id,
             name: new.name,
             email: new.email,
             color,
             imap: new.imap,
             smtp: new.smtp,
             auth: new.auth,
+            signature: String::new(),
         })
     }
 
@@ -176,18 +454,20 @@ impl Store {
         Ok(())
     }
 
+    /// Changes the signature of an account (empty: none).
+    pub fn set_signature(&self, id: AccountId, signature: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE accounts SET signature = ?1 WHERE id = ?2",
+            params![signature, id.0],
+        )?;
+        Ok(())
+    }
+
     /// Removes an account with its folders, messages, bodies and search
     /// entries. Its secret is not touched (that is the `SecretStore`'s job).
     pub fn delete_account(&self, id: AccountId) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
-        // Bodies go by ON DELETE CASCADE, search entries by trigger.
-        tx.execute(
-            "DELETE FROM messages
-             WHERE folder_id IN (SELECT id FROM folders WHERE account_id = ?1)",
-            params![id.0],
-        )?;
-        tx.execute("DELETE FROM folders WHERE account_id = ?1", params![id.0])?;
-        tx.execute("DELETE FROM accounts WHERE id = ?1", params![id.0])?;
+        let tx = write_tx(&self.conn)?;
+        delete_account_rows(&tx, id)?;
         tx.commit()?;
         Ok(())
     }
@@ -243,7 +523,7 @@ impl Store {
 
     /// Forgets the folder's messages and records its new UID validity.
     pub fn reset_folder(&self, folder: FolderId, uid_validity: u32) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "DELETE FROM messages WHERE folder_id = ?1",
             params![folder.0],
@@ -257,18 +537,25 @@ impl Store {
     }
 
     /// Stores messages in one transaction; an existing `(folder, uid)` is ignored.
-    /// Each new message is also added to the search index (by trigger).
+    /// Each new message is also added to the search index (by trigger),
+    /// joins its conversation (see `link_thread`) and gets its tab (see
+    /// `category_for`).
     pub fn insert_messages(&self, folder: FolderId, msgs: &[NewMessage]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO messages
                      (folder_id, uid, message_id, subject, from_name, from_addr, date, seen,
-                      has_attachments)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      has_attachments, in_reply_to, refs, to_addrs, delivered_to,
+                      list_unsubscribe, list_unsubscribe_post, list_id, precedence,
+                      auto_submitted, headers_v2, flagged, category, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                         ?14, ?15, ?16, ?17, ?18, 1, ?19, ?20, ?21)",
             )?;
             for m in msgs {
-                stmt.execute(params![
+                let h = &m.headers;
+                let category = category_for(&tx, &m.from_addr, h)?;
+                let inserted = stmt.execute(params![
                     folder.0,
                     m.uid,
                     m.message_id,
@@ -278,7 +565,27 @@ impl Store {
                     m.date,
                     m.seen,
                     m.has_attachments,
+                    h.in_reply_to,
+                    joined(&h.references, " "),
+                    joined(&h.to, ", "),
+                    h.delivered_to,
+                    h.list_unsubscribe,
+                    h.list_unsubscribe_post,
+                    h.list_id,
+                    h.precedence,
+                    h.auto_submitted,
+                    m.flagged,
+                    category.as_str(),
+                    m.size,
                 ])?;
+                if inserted == 1 {
+                    let row = tx.last_insert_rowid();
+                    tx.execute(
+                        "UPDATE messages SET thread_id = id WHERE id = ?1",
+                        params![row],
+                    )?;
+                    link_thread(&tx, row, m.message_id.as_deref(), &m.headers)?;
+                }
             }
         }
         if let Some(max_uid) = msgs.iter().map(|m| m.uid).max() {
@@ -290,6 +597,133 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Marks every message of the folder as lacking its extra headers, so
+    /// that the next sync fetches them again (for a version of Avero that
+    /// reads more headers; used by tests to stand for old messages).
+    pub fn mark_headers_missing(&self, folder: FolderId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE messages SET headers_v2 = 0 WHERE folder_id = ?1",
+            params![folder.0],
+        )?;
+        Ok(())
+    }
+
+    /// UIDs of the folder's messages stored before their extra headers
+    /// were read (see `MessageHeaders`), newest first, at most `limit`.
+    pub fn missing_headers(&self, folder: FolderId, limit: usize) -> Result<Vec<u32>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages WHERE folder_id = ?1 AND headers_v2 = 0
+             ORDER BY uid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![folder.0, limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Saves the extra headers fetched again for messages stored before
+    /// version 5, and moves those messages into their conversations.
+    /// Every UID of `asked` is marked done, even if the server sent
+    /// nothing for it (the message is gone: no use asking again).
+    pub fn complete_headers(
+        &self,
+        folder: FolderId,
+        asked: &[u32],
+        fetched: &[NewMessage],
+    ) -> Result<(), StoreError> {
+        let tx = write_tx(&self.conn)?;
+        {
+            let mut find = tx.prepare(
+                "SELECT id, message_id, from_addr FROM messages
+                 WHERE folder_id = ?1 AND uid = ?2",
+            )?;
+            let mut update = tx.prepare(
+                "UPDATE messages SET in_reply_to = ?1, refs = ?2, to_addrs = ?3,
+                     delivered_to = ?4, list_unsubscribe = ?5, list_unsubscribe_post = ?6,
+                     list_id = ?7, precedence = ?8, auto_submitted = ?9, headers_v2 = 1,
+                     category = ?11
+                 WHERE id = ?10",
+            )?;
+            for m in fetched.iter().filter(|m| asked.contains(&m.uid)) {
+                let found: Option<(i64, Option<String>, String)> = find
+                    .query_row(params![folder.0, m.uid], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()?;
+                // The Message-ID stored at the time is the one that counts.
+                let Some((row, message_id, from_addr)) = found else {
+                    continue;
+                };
+                let h = &m.headers;
+                // Its list headers were unknown until now: sort it again.
+                let category = category_for(&tx, &from_addr, h)?;
+                update.execute(params![
+                    h.in_reply_to,
+                    joined(&h.references, " "),
+                    joined(&h.to, ", "),
+                    h.delivered_to,
+                    h.list_unsubscribe,
+                    h.list_unsubscribe_post,
+                    h.list_id,
+                    h.precedence,
+                    h.auto_submitted,
+                    row,
+                    category.as_str(),
+                ])?;
+
+                link_thread(&tx, row, message_id.as_deref(), h)?;
+            }
+            let mut done =
+                tx.prepare("UPDATE messages SET headers_v2 = 1 WHERE folder_id = ?1 AND uid = ?2")?;
+            for uid in asked {
+                done.execute(params![folder.0, uid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The extra headers of a stored message (all empty for a message
+    /// stored before version 5 whose headers were not fetched again yet).
+    pub fn headers(&self, row_id: i64) -> Result<Option<MessageHeaders>, StoreError> {
+        let headers = self
+            .conn
+            .query_row(
+                "SELECT in_reply_to, refs, to_addrs, delivered_to, list_unsubscribe,
+                        list_unsubscribe_post, list_id, precedence, auto_submitted
+                 FROM messages WHERE id = ?1",
+                params![row_id],
+                |row| {
+                    let refs: Option<String> = row.get(1)?;
+                    let to: Option<String> = row.get(2)?;
+                    Ok(MessageHeaders {
+                        in_reply_to: row.get(0)?,
+                        references: split_list(refs.as_deref(), ' '),
+                        to: split_list(to.as_deref(), ','),
+                        delivered_to: row.get(3)?,
+                        list_unsubscribe: row.get(4)?,
+                        list_unsubscribe_post: row.get(5)?,
+                        list_id: row.get(6)?,
+                        precedence: row.get(7)?,
+                        auto_submitted: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(headers)
+    }
+
+    /// The conversation a stored message belongs to.
+    pub fn thread_of(&self, row_id: i64) -> Result<Option<i64>, StoreError> {
+        let thread = self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id = ?1",
+                params![row_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(thread.flatten())
     }
 
     /// Moves the folder's last seen UID up to `uid` (it never goes down).
@@ -314,7 +748,133 @@ impl Store {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        self.grouped(Some(role), filter, None, limit, offset)
+        self.list(&Listing::Folder(role), filter, false, limit, offset)
+    }
+
+    /// The list for one folder role with one item per conversation (see
+    /// `list`).
+    pub fn threads(
+        &self,
+        role: FolderRole,
+        filter: AccountFilter,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<UnifiedItem>, StoreError> {
+        self.list(&Listing::Folder(role), filter, true, limit, offset)
+    }
+
+    /// The items of a listing (a folder, a tab of the inbox, the starred
+    /// messages, one sender's messages), the most recent first.
+    ///
+    /// Without `by_thread`, one item per message, copies merged like
+    /// `unified`. With it, one item per conversation: it shows the
+    /// conversation's newest message in the listing; its `row_ids` are
+    /// all the conversation's rows in the listing (every copy), so an
+    /// action on the item acts on all of them. It is unread when one of
+    /// these rows is.
+    ///
+    /// `count` and `senders` describe the whole conversation as the reader
+    /// shows it (see `thread_messages`): other folders included, except
+    /// the trash and spam ones (unless the listing is one of them).
+    pub fn list(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<UnifiedItem>, StoreError> {
+        let scope = Scope::of(listing);
+        let mut items = self.grouped(&scope, filter, None, by_thread, limit, offset)?;
+        if !by_thread {
+            return Ok(items);
+        }
+        let own = self.own_addresses()?;
+        let accounts = filter_account(&self.conn, filter)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT COALESCE(m.message_id, 'row:' || m.id), m.from_name, m.from_addr
+             FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE {THREAD_SCOPE}
+             ORDER BY m.date, m.id"
+        ))?;
+        for item in &mut items {
+            let Some(thread) = item.thread_id else {
+                continue;
+            };
+            let rows = stmt.query_map(params![thread, accounts, scope.role], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut messages = HashSet::new();
+            let mut people: Vec<(String, String)> = Vec::new();
+            for found in rows {
+                let (message, name, addr) = found?;
+                messages.insert(message);
+                let key = addr.trim().to_lowercase();
+                if people.iter().any(|(known, _)| *known == key) {
+                    continue;
+                }
+                let label = if own.contains(&key) {
+                    "moi".to_string()
+                } else {
+                    name.filter(|n| !n.trim().is_empty()).unwrap_or(addr)
+                };
+                people.push((key, label));
+            }
+            item.count = messages.len().max(1);
+            item.senders = people.into_iter().map(|(_, label)| label).collect();
+        }
+        Ok(items)
+    }
+
+    /// The messages of a conversation, oldest first, one item per message
+    /// (copies across accounts merged, the copy with a cached body first
+    /// in `row_ids`). Like `threads`, only accounts allowed by `filter`,
+    /// and no trash or spam unless `role` is one of them.
+    pub fn thread_messages(
+        &self,
+        thread: i64,
+        role: FolderRole,
+        filter: AccountFilter,
+    ) -> Result<Vec<UnifiedItem>, StoreError> {
+        let sql = format!(
+            "WITH sel AS (
+                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, m.flagged,
+                        COALESCE(m.message_id, 'row:' || m.id) AS k,
+                        EXISTS (SELECT 1 FROM bodies b WHERE b.message_row = m.id) AS cached
+                 FROM messages m JOIN folders f ON f.id = m.folder_id
+                 WHERE {THREAD_SCOPE}
+             ),
+             ranked AS (
+                 SELECT id,
+                        ROW_NUMBER() OVER best AS rn,
+                        group_concat(id) OVER whole AS ids,
+                        group_concat(account_id) OVER whole AS accounts,
+                        MIN(seen) OVER whole AS all_seen,
+                        MAX(has_attachments) OVER whole AS any_attachment,
+                        MAX(flagged) OVER whole AS any_flagged,
+                        NULL AS snoozed_until
+                 FROM sel
+                 WINDOW best AS (PARTITION BY k ORDER BY cached DESC, date DESC, id DESC),
+                        whole AS (PARTITION BY k ORDER BY cached DESC, date DESC, id DESC
+                                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+             )
+             SELECT {ITEM_COLUMNS}
+             FROM ranked r
+             JOIN messages m ON m.id = r.id
+             LEFT JOIN bodies b ON b.message_row = m.id
+             WHERE r.rn = 1
+             ORDER BY m.date, m.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![thread, filter_account(&self.conn, filter)?, role.as_str()],
+            |row| item_from_row(row, true),
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Local full-text search over subject, sender and cached bodies.
@@ -322,7 +882,8 @@ impl Store {
     /// Every word of `query` must match the start of a word (`fact` finds
     /// "factures"); accents and case are ignored. Any text is accepted:
     /// FTS syntax characters are neutralised. `role = None` searches every
-    /// folder. Results are merged like `unified` and sorted newest first.
+    /// folder. Results are merged like `unified` and sorted newest first:
+    /// one item per message, even when the list groups conversations.
     pub fn search(
         &self,
         query: &str,
@@ -330,37 +891,92 @@ impl Store {
         filter: AccountFilter,
         limit: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        match fts_query(query) {
-            Some(fts) => self.grouped(role, filter, Some(&fts), limit, 0),
-            None => Ok(Vec::new()),
-        }
+        self.search_with(query, role, filter, &[], limit)
     }
 
-    /// Shared by `unified` and `search`: one item per Message-ID (or per
-    /// row when it has none), showing the newest copy.
-    fn grouped(
+    /// `search`, plus the rows of `also` (in the folders and accounts
+    /// searched): the messages a search on the server found, whose text
+    /// may not be on this computer.
+    pub fn search_with(
         &self,
+        query: &str,
         role: Option<FolderRole>,
         filter: AccountFilter,
-        fts: Option<&str>,
+        also: &[i64],
+        limit: usize,
+    ) -> Result<Vec<UnifiedItem>, StoreError> {
+        let scope = match role {
+            Some(role) => Scope::of(&Listing::Folder(role)),
+            None => Scope::everywhere(),
+        };
+        let Some(fts) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<String> = also.iter().map(i64::to_string).collect();
+        let found = Search {
+            fts: &fts,
+            rows: format!("[{}]", rows.join(",")),
+        };
+        self.grouped(&scope, filter, Some(&found), false, limit, 0)
+    }
+
+    /// Shared by `list` and `search`: one item per Message-ID (or per row
+    /// when it has none), or per conversation when `by_thread`, showing
+    /// the newest row.
+    fn grouped(
+        &self,
+        scope: &Scope,
+        filter: AccountFilter,
+        search: Option<&Search>,
+        by_thread: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<UnifiedItem>, StoreError> {
-        // `None` means "no condition" (`?n IS NULL` is true).
-        let role = role.map(|r| r.as_str());
-        let account_id = filter_account(filter);
-        let fts_condition = match fts {
-            Some(_) => "AND m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3)",
-            None => "AND ?3 IS NULL",
+        let fts_condition = match search {
+            Some(_) => {
+                "AND (m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3)
+                      OR m.id IN (SELECT value FROM json_each(?11)))"
+            }
+            None => "AND ?3 IS NULL AND ?11 IS NULL",
         };
+        let key = if by_thread {
+            "m.thread_id"
+        } else {
+            MESSAGE_KEY
+        };
+        // "Plus tard" shows the next to wake first; the other lists the
+        // most recent first, a conversation back from "Plus tard" counting
+        // as new from the time it woke up.
+        let order = if scope.snoozed {
+            "r.snoozed_until, m.id"
+        } else {
+            "r.sort_date DESC, m.id DESC"
+        };
+        // The window functions below cost a sort of every row of the list
+        // (35,000 in a big inbox) for each page. Sorted by date, the page
+        // can only hold the groups whose date is at least that of the
+        // last group of the page: only their rows are ranked. Groups of
+        // the same date at the cut are all kept, so the page is the same.
+        // ("Plus tard" is sorted otherwise, and small.)
+        let cut = if scope.snoozed {
+            ""
+        } else {
+            "AND k IN (
+                 SELECT k FROM sel GROUP BY k
+                 HAVING MAX(sort_date) >= COALESCE(
+                     (SELECT MAX(sort_date) AS d FROM sel GROUP BY k
+                      ORDER BY d DESC LIMIT 1 OFFSET ?4 + ?5 - 1),
+                     -9223372036854775808))"
+        };
+        let folders = scope.folder_condition();
         let sql = format!(
-            "WITH sel AS (
-                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments,
-                        COALESCE(m.message_id, 'row:' || m.id) AS k
+            "WITH sel AS MATERIALIZED (
+                 SELECT m.id, f.account_id, m.date, m.seen, m.has_attachments, m.flagged,
+                        {key} AS k, s.until AS snoozed,
+                        MAX(m.date, COALESCE(s.woke_at, 0)) AS sort_date
                  FROM messages m JOIN folders f ON f.id = m.folder_id
-                 WHERE (?1 IS NULL OR f.role = ?1)
-                   AND (?2 IS NULL OR f.account_id = ?2)
-                   AND m.hidden = 0
+                 LEFT JOIN snoozes s ON s.key = {MESSAGE_KEY}
+                 WHERE {LIST_CONDITIONS} {folders}
                    {fts_condition}
              ),
              ranked AS (
@@ -369,49 +985,50 @@ impl Store {
                         group_concat(id) OVER whole AS ids,
                         group_concat(account_id) OVER whole AS accounts,
                         MIN(seen) OVER whole AS all_seen,
-                        MAX(has_attachments) OVER whole AS any_attachment
+                        MAX(has_attachments) OVER whole AS any_attachment,
+                        MAX(flagged) OVER whole AS any_flagged,
+                        MAX(sort_date) OVER whole AS sort_date,
+                        CASE WHEN ?10 THEN MIN(snoozed) OVER whole END AS snoozed_until
                  FROM sel
+                 WHERE true {cut}
                  WINDOW newest AS (PARTITION BY k ORDER BY date DESC, id DESC),
                         whole AS (PARTITION BY k ORDER BY date DESC, id DESC
                                   ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
              )
-             SELECT r.ids, r.accounts, m.subject, m.from_name, m.from_addr, m.date,
-                    r.all_seen, r.any_attachment, substr(b.text, 1, 1000)
+             SELECT {ITEM_COLUMNS}
              FROM ranked r
              JOIN messages m ON m.id = r.id
              LEFT JOIN bodies b ON b.message_row = m.id
              WHERE r.rn = 1
-             ORDER BY m.date DESC, m.id DESC
+             ORDER BY {order}
              LIMIT ?4 OFFSET ?5"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![role, account_id, fts, limit as i64, offset as i64],
-            |row| {
-                let ids: String = row.get(0)?;
-                let accounts: String = row.get(1)?;
-                let from_name: Option<String> = row.get(3)?;
-                let from_addr: String = row.get(4)?;
-                let body: Option<String> = row.get(8)?;
-                let mut accounts: Vec<AccountId> = parse_id_list(&accounts)
-                    .into_iter()
-                    .map(AccountId)
-                    .collect();
-                accounts.sort();
-                accounts.dedup();
-                Ok(UnifiedItem {
-                    row_ids: parse_id_list(&ids),
-                    accounts,
-                    subject: row.get(2)?,
-                    from_display: from_name.unwrap_or_else(|| from_addr.clone()),
-                    from_addr,
-                    date: row.get(5)?,
-                    seen: row.get(6)?,
-                    has_attachments: row.get(7)?,
-                    snippet: body.as_deref().map(snippet).unwrap_or_default(),
-                })
-            },
+            params![
+                scope.role,
+                filter_account(&self.conn, filter)?,
+                search.map(|s| s.fts),
+                limit as i64,
+                offset as i64,
+                scope.category,
+                scope.sender,
+                scope.starred,
+                scope.skip_trash,
+                scope.snoozed,
+                search.map(|s| s.rows.as_str()),
+            ],
+            |row| item_from_row(row, by_thread),
         )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The user's own addresses (of every account), lower case.
+    fn own_addresses(&self) -> Result<HashSet<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT lower(trim(email)) FROM accounts")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -421,15 +1038,85 @@ impl Store {
         role: FolderRole,
         filter: AccountFilter,
     ) -> Result<usize, StoreError> {
+        self.list_unread(&Listing::Folder(role), filter, false)
+    }
+
+    /// Number of conversations of the folder with an unread message
+    /// there (the unread items of `threads`).
+    pub fn unread_threads(
+        &self,
+        role: FolderRole,
+        filter: AccountFilter,
+    ) -> Result<usize, StoreError> {
+        self.list_unread(&Listing::Folder(role), filter, true)
+    }
+
+    /// Number of unread items of `list` (the same arguments, all pages).
+    pub fn list_unread(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+    ) -> Result<usize, StoreError> {
+        self.count_items(listing, filter, by_thread, true)
+    }
+
+    /// Number of items of `list`, read or not (the same arguments, all
+    /// pages): the counters of the side bar.
+    pub fn list_count(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+    ) -> Result<usize, StoreError> {
+        self.count_items(listing, filter, by_thread, false)
+    }
+
+    /// Number of items of `list`; only those not seen yet when
+    /// `unread_only`.
+    fn count_items(
+        &self,
+        listing: &Listing,
+        filter: AccountFilter,
+        by_thread: bool,
+        unread_only: bool,
+    ) -> Result<usize, StoreError> {
+        let scope = Scope::of(listing);
+        let having = if unread_only {
+            "HAVING MIN(m.seen) = 0"
+        } else {
+            ""
+        };
+        let key = if by_thread {
+            "m.thread_id"
+        } else {
+            MESSAGE_KEY
+        };
+        let none: Option<&str> = None;
+        let folders = scope.folder_condition();
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM (
-                 SELECT 1
-                 FROM messages m JOIN folders f ON f.id = m.folder_id
-                 WHERE f.role = ?1 AND (?2 IS NULL OR f.account_id = ?2) AND m.hidden = 0
-                 GROUP BY COALESCE(m.message_id, 'row:' || m.id)
-                 HAVING MIN(m.seen) = 0
-             )",
-            params![role.as_str(), filter_account(filter)],
+            &format!(
+                "SELECT COUNT(*) FROM (
+                     SELECT 1
+                     FROM messages m JOIN folders f ON f.id = m.folder_id
+                     WHERE {LIST_CONDITIONS} {folders}
+                       AND ?3 IS NULL AND ?4 IS NULL AND ?5 IS NULL
+                     GROUP BY {key}
+                     {having}
+                 )"
+            ),
+            params![
+                scope.role,
+                filter_account(&self.conn, filter)?,
+                none,
+                none,
+                none,
+                scope.category,
+                scope.sender,
+                scope.starred,
+                scope.skip_trash,
+                scope.snoozed,
+            ],
             |row| row.get(0),
         )?;
         Ok(count as usize)
@@ -439,7 +1126,7 @@ impl Store {
     /// Unknown rows are left out.
     pub fn message_refs(&self, row_ids: &[i64]) -> Result<Vec<MessageRef>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, f.account_id, f.id, f.path, m.uid
+            "SELECT m.id, f.account_id, f.id, f.path, m.uid, f.uid_validity
              FROM messages m JOIN folders f ON f.id = m.folder_id
              WHERE m.id = ?1",
         )?;
@@ -453,6 +1140,7 @@ impl Store {
                         folder_id: FolderId(row.get(2)?),
                         folder_path: row.get(3)?,
                         uid: row.get(4)?,
+                        uid_validity: row.get(5)?,
                     })
                 })
                 .optional()?;
@@ -483,7 +1171,7 @@ impl Store {
         text: &str,
         has_attachments: bool,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         tx.execute(
             "INSERT INTO bodies (message_row, raw, text) VALUES (?1, ?2, ?3)
              ON CONFLICT(message_row) DO UPDATE SET raw = excluded.raw, text = excluded.text",
@@ -500,7 +1188,7 @@ impl Store {
     /// Marks rows as read or unread locally. The change stays pending
     /// (the server's flag does not overwrite it) until `confirm_seen`.
     pub fn set_seen(&self, row_ids: &[i64], seen: bool) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET seen = ?1, seen_pending = seen_pending + 1 WHERE id = ?2",
@@ -516,7 +1204,7 @@ impl Store {
     /// One pending read/unread change of these rows reached the server
     /// (or failed): the server's flags apply again once none is left.
     pub fn confirm_seen(&self, row_ids: &[i64]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET seen_pending = MAX(seen_pending - 1, 0) WHERE id = ?1",
@@ -529,10 +1217,157 @@ impl Store {
         Ok(())
     }
 
+    /// Stars or unstars rows locally. Like `set_seen`, the change stays
+    /// pending (the server's flag does not overwrite it) until
+    /// `confirm_flagged`.
+    pub fn set_flagged(&self, row_ids: &[i64], flagged: bool) -> Result<(), StoreError> {
+        let tx = write_tx(&self.conn)?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET flagged = ?1, flag_pending = flag_pending + 1 WHERE id = ?2",
+            )?;
+            for &id in row_ids {
+                stmt.execute(params![flagged, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One pending star change of these rows reached the server (or
+    /// failed): the server's flag applies again once none is left.
+    pub fn confirm_flagged(&self, row_ids: &[i64]) -> Result<(), StoreError> {
+        let tx = write_tx(&self.conn)?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET flag_pending = MAX(flag_pending - 1, 0) WHERE id = ?1",
+            )?;
+            for &id in row_ids {
+                stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The starred rows of the conversations of `row_ids` (in any folder
+    /// but the trash and spam ones, of the accounts allowed by `filter`),
+    /// besides `row_ids` themselves: unstarring a conversation unstars
+    /// them too, so that it leaves "Favoris".
+    pub fn starred_in_threads(
+        &self,
+        row_ids: &[i64],
+        filter: AccountFilter,
+    ) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE m.thread_id = (SELECT thread_id FROM messages WHERE id = ?1)
+               AND m.flagged = 1 AND m.hidden = 0
+               AND (?2 IS NULL OR f.account_id IN (SELECT value FROM json_each(?2)))
+               AND f.role NOT IN ('trash', 'junk')
+             ORDER BY m.id",
+        )?;
+        let mut found: Vec<i64> = Vec::new();
+        for &id in row_ids {
+            let rows = stmt.query_map(params![id, filter_account(&self.conn, filter)?], |row| {
+                row.get(0)
+            })?;
+            for row in rows {
+                let row = row?;
+                if !row_ids.contains(&row) && !found.contains(&row) {
+                    found.push(row);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The tab of a stored message.
+    pub fn category(&self, row_id: i64) -> Result<Option<Category>, StoreError> {
+        let category: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT category FROM messages WHERE id = ?1",
+                params![row_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(category.map(|c| Category::parse(c.as_deref().unwrap_or(""))))
+    }
+
+    /// Puts a sender's messages in a tab, now and for the messages to
+    /// come (it wins over `classify`), along with the rows `also` (the
+    /// rest of the conversation being reclassified, whoever wrote it).
+    pub fn set_sender_category(
+        &self,
+        addr: &str,
+        category: Category,
+        also: &[i64],
+    ) -> Result<(), StoreError> {
+        let key = sender_key(addr);
+        let tx = write_tx(&self.conn)?;
+        if !key.is_empty() {
+            tx.execute(
+                "INSERT INTO senders (addr, category) VALUES (?1, ?2)
+                 ON CONFLICT(addr) DO UPDATE SET category = excluded.category",
+                params![key, category.as_str()],
+            )?;
+            tx.execute(
+                "UPDATE messages SET category = ?1 WHERE lower(trim(from_addr)) = ?2",
+                params![category.as_str(), key],
+            )?;
+        }
+        {
+            let mut stmt = tx.prepare("UPDATE messages SET category = ?1 WHERE id = ?2")?;
+            for &id in also {
+                stmt.execute(params![category.as_str(), id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The tab chosen by hand for a sender, if any.
+    pub fn sender_category(&self, addr: &str) -> Result<Option<Category>, StoreError> {
+        let category: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT category FROM senders WHERE addr = ?1",
+                params![sender_key(addr)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(category.flatten().map(|c| Category::parse(&c)))
+    }
+
+    /// Remembers that unsubscribing from a sender was asked at `at`
+    /// (Unix time in seconds).
+    pub fn mark_unsubscribed(&self, addr: &str, at: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO senders (addr, unsubscribed_at) VALUES (?1, ?2)
+             ON CONFLICT(addr) DO UPDATE SET unsubscribed_at = excluded.unsubscribed_at",
+            params![sender_key(addr), at],
+        )?;
+        Ok(())
+    }
+
+    /// When unsubscribing from a sender was asked, if it was.
+    pub fn unsubscribed_at(&self, addr: &str) -> Result<Option<i64>, StoreError> {
+        let at: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT unsubscribed_at FROM senders WHERE addr = ?1",
+                params![sender_key(addr)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(at.flatten())
+    }
+
     /// Hides rows from every list (while they are being moved on the
     /// server) or shows them again (the move failed).
     pub fn set_hidden(&self, row_ids: &[i64], hidden: bool) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare("UPDATE messages SET hidden = ?1 WHERE id = ?2")?;
             for &id in row_ids {
@@ -546,7 +1381,7 @@ impl Store {
     /// Removes rows locally (after a move or delete on the server), with
     /// their bodies and search entries.
     pub fn delete_messages(&self, row_ids: &[i64]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
             let mut stmt = tx.prepare("DELETE FROM messages WHERE id = ?1")?;
             for &id in row_ids {
@@ -567,31 +1402,37 @@ impl Store {
     }
 
     /// Applies the flags the server reported for the UIDs `from..=to` of a
-    /// folder: `present` holds `(uid, seen)` for every message the server
-    /// has in that range.
+    /// folder: `present` holds the flags of every message the server has
+    /// in that range.
     ///
-    /// Stored UIDs listed in `present` get its seen flag, unless a local
-    /// read/unread change is still on its way to the server. Stored UIDs in
-    /// the range but missing from `present` were expunged on the server and
-    /// are removed. UIDs outside the range are not touched.
+    /// Stored UIDs listed in `present` get its seen and starred flags,
+    /// unless a local change of that flag is still on its way to the
+    /// server. Stored UIDs in the range but missing from `present` were
+    /// expunged on the server and are removed. UIDs outside the range are
+    /// not touched.
     pub fn apply_flags(
         &self,
         folder: FolderId,
         from: u32,
         to: u32,
-        present: &[(u32, bool)],
+        present: &[ServerFlags],
     ) -> Result<(), StoreError> {
-        let listed: std::collections::HashSet<u32> = present.iter().map(|&(uid, _)| uid).collect();
+        let listed: std::collections::HashSet<u32> = present.iter().map(|f| f.uid).collect();
         let stored = self.inbox_uids(folder)?;
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = write_tx(&self.conn)?;
         {
-            let mut update = tx.prepare(
+            let mut seen = tx.prepare(
                 "UPDATE messages SET seen = ?1
                  WHERE folder_id = ?2 AND uid = ?3 AND seen != ?1 AND seen_pending = 0",
             )?;
-            for &(uid, seen) in present {
-                update.execute(params![seen, folder.0, uid])?;
+            let mut flagged = tx.prepare(
+                "UPDATE messages SET flagged = ?1
+                 WHERE folder_id = ?2 AND uid = ?3 AND flagged != ?1 AND flag_pending = 0",
+            )?;
+            for flags in present {
+                seen.execute(params![flags.seen, folder.0, flags.uid])?;
+                flagged.execute(params![flags.flagged, folder.0, flags.uid])?;
             }
             let mut delete =
                 tx.prepare("DELETE FROM messages WHERE folder_id = ?1 AND uid = ?2")?;
@@ -606,12 +1447,188 @@ impl Store {
     }
 }
 
-/// `None` for all accounts, else the account id (for `?n IS NULL OR ...`).
-fn filter_account(filter: AccountFilter) -> Option<i64> {
-    match filter {
-        AccountFilter::All => None,
-        AccountFilter::Only(id) => Some(id.0),
+/// Puts a just-stored message in its conversation, inside the caller's
+/// transaction.
+///
+/// A message names Message-IDs: its own, In-Reply-To and References.
+/// Messages naming a common id are in the same conversation, whatever
+/// their folder or account, and in whatever order they arrive: a parent
+/// stored after its replies names its own id, which the replies named
+/// already, so the conversations are merged then. Merging keeps the
+/// smallest conversation id (a row id; see `schema_v5.sql`). A message
+/// that names no id at all stays alone.
+///
+/// There is no grouping by subject when these headers are missing:
+/// automatic mail often shares one subject ("Votre facture", "Nouvelle
+/// connexion") and would be glued together wrongly; a reply without
+/// headers simply shows on its own line, as before conversations.
+///
+/// Conversations are never split again: when a message that linked two
+/// parts is deleted, they stay together.
+fn link_thread(
+    conn: &Connection,
+    row: i64,
+    message_id: Option<&str>,
+    headers: &MessageHeaders,
+) -> Result<(), StoreError> {
+    let mut ids: Vec<&str> = message_id
+        .into_iter()
+        .chain(headers.in_reply_to.as_deref())
+        .chain(headers.references.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(());
     }
+    let mut threads: Vec<i64> = vec![conn.query_row(
+        "SELECT thread_id FROM messages WHERE id = ?1",
+        params![row],
+        |r| r.get(0),
+    )?];
+    {
+        let mut link =
+            conn.prepare("INSERT OR IGNORE INTO thread_links (message_row, ref) VALUES (?1, ?2)")?;
+        let mut linked = conn.prepare(
+            "SELECT DISTINCT m.thread_id FROM thread_links l
+             JOIN messages m ON m.id = l.message_row
+             WHERE l.ref = ?1",
+        )?;
+        for id in &ids {
+            link.execute(params![row, id])?;
+            let found = linked.query_map(params![id], |r| r.get::<_, i64>(0))?;
+            for thread in found {
+                threads.push(thread?);
+            }
+        }
+    }
+    threads.sort_unstable();
+    threads.dedup();
+    let keep = threads[0];
+    let mut merge = conn.prepare("UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2")?;
+    for &other in &threads[1..] {
+        merge.execute(params![keep, other])?;
+    }
+    Ok(())
+}
+
+/// The tab of a message about to be stored or completed: the one chosen
+/// by hand for its sender, else what `classify` says.
+fn category_for(
+    conn: &Connection,
+    from_addr: &str,
+    headers: &MessageHeaders,
+) -> Result<Category, StoreError> {
+    let chosen: Option<Option<String>> = conn
+        .query_row(
+            "SELECT category FROM senders WHERE addr = ?1",
+            params![sender_key(from_addr)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match chosen.flatten() {
+        Some(category) => Category::parse(&category),
+        None => classify(from_addr, headers),
+    })
+}
+
+/// Gives a tab to the messages that have none (those stored before
+/// version 7), inside the caller's transaction.
+fn classify_unsorted(conn: &Connection) -> Result<(), StoreError> {
+    let unsorted: Vec<(i64, String, MessageHeaders)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, from_addr, list_unsubscribe, list_id, precedence, auto_submitted
+             FROM messages WHERE category IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                MessageHeaders {
+                    list_unsubscribe: row.get(2)?,
+                    list_id: row.get(3)?,
+                    precedence: row.get(4)?,
+                    auto_submitted: row.get(5)?,
+                    ..Default::default()
+                },
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut update = conn.prepare("UPDATE messages SET category = ?1 WHERE id = ?2")?;
+    for (id, from_addr, headers) in unsorted {
+        let category = category_for(conn, &from_addr, &headers)?;
+        update.execute(params![category.as_str(), id])?;
+    }
+    Ok(())
+}
+
+/// `None` for an empty list, else the items joined by `separator`.
+fn joined(items: &[String], separator: &str) -> Option<String> {
+    (!items.is_empty()).then(|| items.join(separator))
+}
+
+/// The items of a list stored by `joined` (`None` gives none).
+fn split_list(text: Option<&str>, separator: char) -> Vec<String> {
+    text.unwrap_or("")
+        .split(separator)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Deletes the rows an account owns, inside the caller's transaction.
+fn delete_account_rows(conn: &Connection, id: AccountId) -> Result<(), StoreError> {
+    // Bodies (and the account's place in its spaces) go by ON DELETE
+    // CASCADE, search entries by trigger.
+    conn.execute(
+        "DELETE FROM messages
+         WHERE folder_id IN (SELECT id FROM folders WHERE account_id = ?1)",
+        params![id.0],
+    )?;
+    conn.execute("DELETE FROM folders WHERE account_id = ?1", params![id.0])?;
+    conn.execute("DELETE FROM accounts WHERE id = ?1", params![id.0])?;
+    Ok(())
+}
+
+/// Builds a list item from a row of `ITEM_COLUMNS`. With `in_thread`, the
+/// item belongs to a conversation (its `thread_id` is set).
+fn item_from_row(row: &rusqlite::Row, in_thread: bool) -> rusqlite::Result<UnifiedItem> {
+    let ids: String = row.get(0)?;
+    let accounts: String = row.get(1)?;
+    let from_name: Option<String> = row.get(3)?;
+    let from_addr: String = row.get(4)?;
+    let body: Option<String> = row.get(8)?;
+    let thread: Option<i64> = row.get(9)?;
+    let flagged: bool = row.get(10)?;
+    let snoozed_until: Option<i64> = row.get(11)?;
+    let mut accounts: Vec<AccountId> = parse_id_list(&accounts)
+        .into_iter()
+        .map(AccountId)
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    let from_display = from_name.unwrap_or_else(|| from_addr.clone());
+    Ok(UnifiedItem {
+        row_ids: parse_id_list(&ids),
+        accounts,
+        subject: row.get(2)?,
+        senders: vec![from_display.clone()],
+        from_display,
+        from_addr,
+        date: row.get(5)?,
+        seen: row.get(6)?,
+        flagged,
+        has_attachments: row.get(7)?,
+
+        snippet: body.as_deref().map(snippet).unwrap_or_default(),
+        thread_id: thread.filter(|_| in_thread),
+        count: 1,
+        snoozed_until,
+    })
 }
 
 /// Parses a `group_concat` of integers ("3,1,7").
@@ -668,6 +1685,7 @@ fn account_from_row(row: &rusqlite::Row) -> rusqlite::Result<Account> {
             security: Security::parse(&smtp_security),
         },
         auth: AuthKind::parse(&auth),
+        signature: row.get(15)?,
     })
 }
 
@@ -708,11 +1726,11 @@ mod tests {
         }
     }
 
-    fn acct(store: &Store, email: &str) -> AccountId {
+    pub(super) fn acct(store: &Store, email: &str) -> AccountId {
         store.add_account(new_account(email)).unwrap().id
     }
 
-    fn inbox(store: &Store, account: AccountId) -> Folder {
+    pub(super) fn inbox(store: &Store, account: AccountId) -> Folder {
         store
             .upsert_folder(account, "INBOX", FolderRole::Inbox)
             .unwrap()
@@ -732,14 +1750,14 @@ mod tests {
             .collect()
     }
 
-    fn count(store: &Store, table: &str) -> i64 {
+    pub(super) fn count(store: &Store, table: &str) -> i64 {
         store
             .conn
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
     }
 
-    fn msg(uid: u32, message_id: Option<&str>, date: i64) -> NewMessage {
+    pub(super) fn msg(uid: u32, message_id: Option<&str>, date: i64) -> NewMessage {
         NewMessage {
             uid,
             message_id: message_id.map(|s| s.to_string()),
@@ -749,7 +1767,41 @@ mod tests {
             date,
             seen: false,
             has_attachments: false,
+            ..Default::default()
         }
+    }
+
+    /// A reply: `parent` in In-Reply-To, `refs` in References.
+    fn reply(uid: u32, id: &str, parent: Option<&str>, refs: &[&str], date: i64) -> NewMessage {
+        let mut m = msg(uid, Some(id), date);
+        m.headers.in_reply_to = parent.map(str::to_string);
+        m.headers.references = refs.iter().map(|r| r.to_string()).collect();
+        m
+    }
+
+    pub(super) fn folder(
+        store: &Store,
+        account: AccountId,
+        path: &str,
+        role: FolderRole,
+    ) -> FolderId {
+        store.upsert_folder(account, path, role).unwrap().id
+    }
+
+    fn threads_of(store: &Store, role: FolderRole) -> Vec<UnifiedItem> {
+        store.threads(role, AccountFilter::All, 200, 0).unwrap()
+    }
+
+    /// The conversation of each stored message, by subject.
+    fn thread_ids(store: &Store) -> std::collections::BTreeMap<String, i64> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT subject, thread_id FROM messages")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     #[test]
@@ -936,6 +1988,23 @@ mod tests {
     }
 
     #[test]
+    fn signature_is_kept_per_account() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let b = acct(&s, "b@x");
+        assert_eq!(s.accounts().unwrap()[0].signature, "");
+        s.set_signature(a, "Marie\nPâtisserie Durand").unwrap();
+        let imap = server("imap.new.com", 994, "u", Security::Tls);
+        // Changing the other settings keeps it.
+        s.update_account(a, "Perso", &imap, &imap, AuthKind::Password)
+            .unwrap();
+        let accounts = s.accounts().unwrap();
+        assert_eq!(accounts[0].signature, "Marie\nPâtisserie Durand");
+        assert_eq!(accounts[1].signature, "");
+        assert_eq!(accounts[1].id, b);
+    }
+
+    #[test]
     fn delete_account_removes_everything_it_owns() {
         let s = Store::open_in_memory().unwrap();
         let a = acct(&s, "a@x");
@@ -997,6 +2066,78 @@ mod tests {
     }
 
     #[test]
+    fn pages_are_the_same_with_many_lines_of_the_same_date() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let b = acct(&s, "b@x.fr");
+        let (fa, fb) = (inbox(&s, a), inbox(&s, b));
+        // Dates repeat (4 lines per date), some messages are in both
+        // inboxes, conversations span dates.
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for uid in 1..=40u32 {
+            let date = i64::from(uid / 4);
+            let id = format!("<{uid}@x>");
+            let m = if uid % 5 == 0 {
+                reply(uid, &id, Some(&format!("<{}@x>", uid - 3)), &[], date)
+            } else {
+                msg(uid, Some(&id), date)
+            };
+            if uid % 3 == 0 {
+                second.push(m.clone());
+            }
+            first.push(m);
+        }
+        s.insert_messages(fa.id, &first).unwrap();
+        s.insert_messages(fb.id, &second).unwrap();
+        for by_thread in [false, true] {
+            let listing = Listing::Folder(FolderRole::Inbox);
+            let whole = s
+                .list(&listing, AccountFilter::All, by_thread, 1000, 0)
+                .unwrap();
+            for size in [1, 3, 4, 7] {
+                let mut paged = Vec::new();
+                for page in 0..whole.len().div_ceil(size) {
+                    paged.extend(
+                        s.list(&listing, AccountFilter::All, by_thread, size, page * size)
+                            .unwrap(),
+                    );
+                }
+                assert_eq!(paged, whole, "pages of {size}, threads {by_thread}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_left_to_complete_is_found_through_an_index() {
+        let s = Store::open_in_memory().unwrap();
+        for (query, index) in [
+            (
+                "SELECT uid FROM messages WHERE folder_id = 1 AND headers_v2 = 0
+                 ORDER BY uid DESC LIMIT 500",
+                "messages_missing_headers",
+            ),
+            (
+                "SELECT uid FROM messages WHERE folder_id = 1 AND size IS NULL
+                 ORDER BY uid DESC LIMIT 500",
+                "messages_missing_sizes",
+            ),
+        ] {
+            let plan: Vec<String> = {
+                let mut stmt = s
+                    .conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                    .unwrap();
+                stmt.query_map([], |row| row.get(3))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect()
+            };
+            assert!(plan.iter().any(|step| step.contains(index)), "{plan:?}");
+        }
+    }
+
+    #[test]
     fn merged_item_shows_newest_copy_and_paginates_groups() {
         let s = Store::open_in_memory().unwrap();
         let a = acct(&s, "a@x");
@@ -1046,6 +2187,12 @@ mod tests {
         let only_a = AccountFilter::Only(a);
         assert_eq!(s.unread_count(FolderRole::Inbox, only_a).unwrap(), 1);
         assert_eq!(s.unread_count(FolderRole::Sent, all).unwrap(), 0);
+        // Read or not: the merged message, the read one and b's own.
+        let inbox_listing = Listing::Folder(FolderRole::Inbox);
+        assert_eq!(s.list_count(&inbox_listing, all, false).unwrap(), 3);
+        assert_eq!(s.list_count(&inbox_listing, only_a, false).unwrap(), 2);
+        let sent = Listing::Folder(FolderRole::Sent);
+        assert_eq!(s.list_count(&sent, all, false).unwrap(), 0);
     }
 
     #[test]
@@ -1119,6 +2266,7 @@ mod tests {
             account_id: a,
             folder_id: f.id,
             folder_path: "INBOX".into(),
+            uid_validity: None,
             uid,
         };
         assert_eq!(refs, vec![expected(rows[1], 5), expected(rows[0], 8)]);
@@ -1172,7 +2320,7 @@ mod tests {
 
         // 2 was expunged, 1 and 4 were read elsewhere; 7 is outside the
         // range asked, so it stays.
-        s.apply_flags(f.id, 1, 4, &[(1, true), (3, false), (4, true)])
+        s.apply_flags(f.id, 1, 4, &seen_flags(&[(1, true), (3, false), (4, true)]))
             .unwrap();
 
         assert_eq!(
@@ -1180,7 +2328,7 @@ mod tests {
             vec![(1, true), (3, false), (4, true), (7, false)]
         );
         // An empty range on the server: its stored messages are gone.
-        s.apply_flags(f.id, 5, 9, &[]).unwrap();
+        s.apply_flags(f.id, 5, 9, &seen_flags(&[])).unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap().len(), 3);
     }
 
@@ -1196,19 +2344,22 @@ mod tests {
         // Read locally; a sync that started before the SetSeen job still
         // sees the old flag on the server.
         s.set_seen(&[row1], true).unwrap();
-        s.apply_flags(f.id, 1, 2, &[(1, false), (2, true)]).unwrap();
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, false), (2, true)]))
+            .unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap(), vec![(1, true), (2, true)]);
 
         // Read, then unread at once: two changes pending.
         s.set_seen(&[row1], false).unwrap();
         s.confirm_seen(&[row1]).unwrap();
-        s.apply_flags(f.id, 1, 2, &[(1, true), (2, true)]).unwrap();
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, true), (2, true)]))
+            .unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap()[0], (1, false));
 
         // Both confirmed: the server's flag applies again.
         s.confirm_seen(&[row1]).unwrap();
         s.confirm_seen(&[row1]).unwrap();
-        s.apply_flags(f.id, 1, 2, &[(1, true), (2, true)]).unwrap();
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, true), (2, true)]))
+            .unwrap();
         assert_eq!(s.inbox_uids(f.id).unwrap()[0], (1, true));
     }
 
@@ -1240,7 +2391,7 @@ mod tests {
         s.set_seen(&rows, true).unwrap();
         s.clear_pending().unwrap();
         assert_eq!(inbox_rows(&s), rows);
-        s.apply_flags(f.id, 1, 2, &[(1, false), (2, false)])
+        s.apply_flags(f.id, 1, 2, &seen_flags(&[(1, false), (2, false)]))
             .unwrap();
         assert!(all_inbox(&s).iter().all(|i| !i.seen));
     }
@@ -1266,6 +2417,791 @@ mod tests {
         s.reset_folder(f.id, 2).unwrap();
         assert_eq!(count(&s, "bodies"), 0);
         assert_eq!(count(&s, "messages_fts"), 0);
+    }
+
+    #[test]
+    fn duplicate_address_is_refused_whatever_the_case() {
+        let s = Store::open_in_memory().unwrap();
+        acct(&s, "a@x.fr");
+        let err = s.add_account(new_account(" A@X.fr ")).unwrap_err();
+        assert!(matches!(err, StoreError::DuplicateAccount), "{err:?}");
+        assert_eq!(s.accounts().unwrap().len(), 1);
+    }
+
+    /// Another connection (another thread of Avero) holds the write lock
+    /// for `hold`, from the moment this returns.
+    fn lock_from_elsewhere(path: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let other = Connection::open(path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        other
+            .execute("UPDATE accounts SET name = name", [])
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            other.execute_batch("COMMIT;").unwrap();
+        })
+    }
+
+    #[test]
+    fn a_write_waits_for_another_connection_instead_of_failing() {
+        let path = std::env::temp_dir().join(format!("avero-busy-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        s.insert_messages(f.id, &[msg(1, Some("<1@x>"), 10)])
+            .unwrap();
+
+        // `insert_messages` reads (the sender's tab) before it writes.
+        let other = lock_from_elsewhere(&path, Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        s.insert_messages(f.id, &[msg(2, Some("<2@x>"), 20)])
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        other.join().unwrap();
+
+        let other = lock_from_elsewhere(&path, Duration::from_millis(300));
+        s.set_seen(&inbox_rows(&s), true).unwrap();
+        other.join().unwrap();
+        assert_eq!(count(&s, "messages"), 2);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_lock_held_too_long_is_a_busy_error() {
+        let path = std::env::temp_dir().join(format!("avero-busy-long-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::open(&path).unwrap();
+        acct(&s, "a@x.fr");
+        s.conn.busy_timeout(Duration::from_millis(50)).unwrap();
+        let other = lock_from_elsewhere(&path, Duration::from_millis(400));
+        let err = s.set_signature(AccountId(1), "x").unwrap_err();
+        assert!(err.is_busy(), "{err:?}");
+        other.join().unwrap();
+        assert!(!StoreError::DuplicateAccount.is_busy());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_account_given_a_merged_id_keeps_its_secret() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute_batch("INSERT INTO pending_secret_deletions VALUES (1), (5);")
+            .unwrap();
+        // The new account is number 1: its secret replaces the old one.
+        assert_eq!(acct(&s, "a@x.fr"), AccountId(1));
+        assert_eq!(s.merged_accounts().unwrap(), vec![AccountId(5)]);
+    }
+
+    #[test]
+    fn version_3_duplicates_are_merged_into_the_oldest() {
+        let path = std::env::temp_dir().join(format!("avero-merge-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            let first = acct(&s, "A@x.fr");
+            let second = acct(&s, "b@x.fr");
+            // Same address as `first`: only possible without the v4 index.
+            s.conn
+                .execute_batch("DROP INDEX accounts_email_unique;")
+                .unwrap();
+            let dup = acct(&s, "a@x.fr ");
+            for (account, uid) in [(first, 1), (second, 2), (dup, 3)] {
+                let f = inbox(&s, account);
+                s.insert_messages(f.id, &[msg(uid, None, 10)]).unwrap();
+            }
+            let dup_row = s
+                .message_refs(&inbox_rows(&s))
+                .unwrap()
+                .into_iter()
+                .find(|m| m.uid == 3)
+                .unwrap();
+            s.put_body(dup_row.row_id, b"raw", "texte", false).unwrap();
+            s.conn.execute_batch(UNDO_V8).unwrap();
+            s.conn.execute_batch(UNDO_V5).unwrap();
+            s.conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+            assert_eq!((first.0, dup.0), (1, 3));
+        }
+
+        let s = Store::open(&path).unwrap();
+
+        let ids: Vec<i64> = s.accounts().unwrap().iter().map(|a| a.id.0).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(s.merged_accounts().unwrap(), vec![AccountId(3)]);
+        assert_eq!(count(&s, "messages"), 2);
+        assert_eq!(count(&s, "folders"), 2);
+        assert_eq!(count(&s, "bodies"), 0);
+        assert!(s.add_account(new_account("a@X.fr")).is_err());
+        drop(s);
+        // Opened again (the app's check, or a crash before the secrets
+        // were erased): the merged account is still to be erased.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.merged_accounts().unwrap(), vec![AccountId(3)]);
+        s.secret_deleted(AccountId(3)).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(s.merged_accounts().unwrap().is_empty());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reply_after_its_parent_joins_its_conversation() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let inbox = folder(&s, a, "INBOX", FolderRole::Inbox);
+        let sent = folder(&s, a, "Sent", FolderRole::Sent);
+        s.insert_messages(inbox, &[msg(1, Some("<p>"), 10)])
+            .unwrap();
+        s.insert_messages(sent, &[reply(1, "<r>", Some("<p>"), &["<p>"], 20)])
+            .unwrap();
+        s.insert_messages(inbox, &[msg(2, Some("<other>"), 15)])
+            .unwrap();
+
+        let inbox_threads = threads_of(&s, FolderRole::Inbox);
+        assert_eq!(inbox_threads.len(), 2);
+        // The conversation counts the reply kept in Sent.
+        let conversation = inbox_threads.iter().find(|i| i.date == 10).unwrap();
+        assert_eq!(conversation.count, 2);
+        assert_eq!(conversation.row_ids.len(), 1);
+        let messages = s
+            .thread_messages(
+                conversation.thread_id.unwrap(),
+                FolderRole::Inbox,
+                AccountFilter::All,
+            )
+            .unwrap();
+        let dates: Vec<i64> = messages.iter().map(|m| m.date).collect();
+        assert_eq!(dates, vec![10, 20]);
+        let lonely = inbox_threads.iter().find(|i| i.date == 15).unwrap();
+        assert_eq!(lonely.count, 1);
+    }
+
+    #[test]
+    fn parent_arriving_after_its_replies_merges_them() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let inbox = folder(&s, a, "INBOX", FolderRole::Inbox);
+        // Two replies that only name their own parent, the parent last.
+        s.insert_messages(inbox, &[reply(3, "<c>", Some("<b>"), &[], 30)])
+            .unwrap();
+        s.insert_messages(inbox, &[reply(1, "<a>", None, &[], 10)])
+            .unwrap();
+        assert_eq!(threads_of(&s, FolderRole::Inbox).len(), 2);
+        s.insert_messages(inbox, &[reply(2, "<b>", Some("<a>"), &[], 20)])
+            .unwrap();
+
+        let items = threads_of(&s, FolderRole::Inbox);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].count, 3);
+        assert_eq!(items[0].row_ids.len(), 3);
+        assert_eq!(items[0].date, 30);
+        let ids = thread_ids(&s);
+        assert!(ids.values().all(|&t| t == ids["subject 1"]), "{ids:?}");
+    }
+
+    #[test]
+    fn references_chain_links_messages_that_never_name_each_other() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let inbox = folder(&s, a, "INBOX", FolderRole::Inbox);
+        // The root is not stored: both replies name it in References.
+        s.insert_messages(
+            inbox,
+            &[
+                reply(1, "<b>", Some("<root>"), &["<root>"], 10),
+                reply(2, "<d>", Some("<c>"), &["<root>", "<b>", "<c>"], 30),
+                reply(3, "<z>", Some("<elsewhere>"), &["<elsewhere>"], 40),
+            ],
+        )
+        .unwrap();
+        let items = threads_of(&s, FolderRole::Inbox);
+        assert_eq!(items.len(), 2);
+        let chain = items.iter().find(|i| i.date == 30).unwrap();
+        assert_eq!(chain.count, 2);
+    }
+
+    #[test]
+    fn conversation_spans_accounts_and_keeps_duplicates_merged() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let b = acct(&s, "b@x");
+        let inbox_a = folder(&s, a, "INBOX", FolderRole::Inbox);
+        let inbox_b = folder(&s, b, "INBOX", FolderRole::Inbox);
+        let sent_b = folder(&s, b, "Sent", FolderRole::Sent);
+        // <m> reached both accounts; b answered it from its own address.
+        let mut first = msg(1, Some("<m>"), 10);
+        first.from_name = Some("Marie".into());
+        s.insert_messages(inbox_a, std::slice::from_ref(&first))
+            .unwrap();
+        s.insert_messages(inbox_b, &[first]).unwrap();
+        let mut answer = reply(1, "<r>", Some("<m>"), &["<m>"], 20);
+        answer.from_addr = "B@x".into();
+        s.insert_messages(sent_b, &[answer]).unwrap();
+
+        let items = threads_of(&s, FolderRole::Inbox);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].accounts, vec![a, b]);
+        assert_eq!(items[0].row_ids.len(), 2);
+        // Two messages, not three rows; the user's own address is "moi".
+        assert_eq!(items[0].count, 2);
+        assert_eq!(items[0].senders, vec!["Marie", "moi"]);
+        let messages = s
+            .thread_messages(
+                items[0].thread_id.unwrap(),
+                FolderRole::Inbox,
+                AccountFilter::All,
+            )
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].accounts, vec![a, b]);
+        assert_eq!(messages[0].row_ids.len(), 2);
+        // Seen from account a alone, b's reply is not there.
+        let only_a = s
+            .thread_messages(
+                items[0].thread_id.unwrap(),
+                FolderRole::Inbox,
+                AccountFilter::Only(a),
+            )
+            .unwrap();
+        assert_eq!(only_a.len(), 1);
+        // The per-message list (conversations off) is unchanged.
+        assert_eq!(all_inbox(&s).len(), 1);
+    }
+
+    #[test]
+    fn thread_messages_prefer_the_copy_with_a_cached_body() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let b = acct(&s, "b@x");
+        let inbox_a = folder(&s, a, "INBOX", FolderRole::Inbox);
+        let inbox_b = folder(&s, b, "INBOX", FolderRole::Inbox);
+        s.insert_messages(inbox_a, &[msg(1, Some("<m>"), 10)])
+            .unwrap();
+        s.insert_messages(inbox_b, &[msg(1, Some("<m>"), 10)])
+            .unwrap();
+        let item = &threads_of(&s, FolderRole::Inbox)[0];
+        let cached = *item.row_ids.iter().max().unwrap();
+        s.put_body(cached, b"raw", "texte", false).unwrap();
+        let messages = s
+            .thread_messages(
+                item.thread_id.unwrap(),
+                FolderRole::Inbox,
+                AccountFilter::All,
+            )
+            .unwrap();
+        assert_eq!(messages[0].row_ids[0], cached);
+        assert_eq!(messages[0].snippet, "texte");
+    }
+
+    #[test]
+    fn thread_list_unread_paging_and_trash() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let inbox = folder(&s, a, "INBOX", FolderRole::Inbox);
+        let trash = folder(&s, a, "Trash", FolderRole::Trash);
+        let mut read = msg(1, Some("<a1>"), 10);
+        read.seen = true;
+        let mut read_too = reply(2, "<a2>", Some("<a1>"), &[], 50);
+        read_too.seen = true;
+        s.insert_messages(
+            inbox,
+            &[
+                read,
+                read_too,
+                reply(3, "<a3>", Some("<a2>"), &[], 20),
+                msg(4, Some("<b1>"), 40),
+                msg(5, Some("<c1>"), 30),
+            ],
+        )
+        .unwrap();
+        // A deleted reply: counted in the trash only.
+        s.insert_messages(trash, &[reply(1, "<a4>", Some("<a3>"), &[], 60)])
+            .unwrap();
+
+        let all = AccountFilter::All;
+        let items = threads_of(&s, FolderRole::Inbox);
+        let dates: Vec<i64> = items.iter().map(|i| i.date).collect();
+        assert_eq!(dates, vec![50, 40, 30]);
+        // One unread message is enough to make the conversation unread.
+        assert!(!items[0].seen);
+        assert_eq!(items[0].count, 3);
+        assert_eq!(items[0].row_ids.len(), 3);
+        assert_eq!(s.unread_threads(FolderRole::Inbox, all).unwrap(), 3);
+        assert_eq!(s.unread_count(FolderRole::Inbox, all).unwrap(), 3);
+        s.set_seen(&items[1].row_ids, true).unwrap();
+        assert_eq!(s.unread_threads(FolderRole::Inbox, all).unwrap(), 2);
+
+        let page = s.threads(FolderRole::Inbox, all, 2, 1).unwrap();
+        let dates: Vec<i64> = page.iter().map(|i| i.date).collect();
+        assert_eq!(dates, vec![40, 30]);
+
+        let in_trash = threads_of(&s, FolderRole::Trash);
+        assert_eq!(in_trash.len(), 1);
+        assert_eq!(in_trash[0].count, 4);
+        assert_eq!(in_trash[0].thread_id, items[0].thread_id);
+
+        // Hidden rows (being archived) leave the conversation.
+        s.set_hidden(&items[0].row_ids, true).unwrap();
+        assert_eq!(threads_of(&s, FolderRole::Inbox).len(), 2);
+    }
+
+    #[test]
+    fn headers_are_stored_and_read_back() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let inbox = folder(&s, a, "INBOX", FolderRole::Inbox);
+        let mut m = reply(1, "<n>", Some("<p>"), &["<r>", "<p>"], 10);
+        m.headers.to = vec!["a@x".into(), "b@y".into()];
+        m.headers.delivered_to = Some("a@x".into());
+        m.headers.list_unsubscribe = Some("<https://l.example/u>".into());
+        m.headers.list_unsubscribe_post = Some("List-Unsubscribe=One-Click".into());
+        m.headers.list_id = Some("<news.l.example>".into());
+        m.headers.precedence = Some("bulk".into());
+        m.headers.auto_submitted = Some("auto-generated".into());
+        let expected = m.headers.clone();
+        s.insert_messages(inbox, &[m]).unwrap();
+        let row = inbox_rows(&s)[0];
+        assert_eq!(s.headers(row).unwrap(), Some(expected));
+        assert_eq!(s.headers(9999).unwrap(), None);
+        assert!(s.missing_headers(inbox, 10).unwrap().is_empty());
+        assert_eq!(s.thread_of(row).unwrap(), Some(row));
+    }
+
+    #[test]
+    fn old_messages_get_their_headers_and_conversation_later() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x");
+        let inbox = folder(&s, a, "INBOX", FolderRole::Inbox);
+        s.insert_messages(
+            inbox,
+            &[
+                msg(1, Some("<p>"), 10),
+                msg(2, Some("<r>"), 20),
+                msg(3, None, 30),
+            ],
+        )
+        .unwrap();
+        // As if stored before version 5: no extra headers yet.
+        s.conn
+            .execute_batch("UPDATE messages SET headers_v2 = 0")
+            .unwrap();
+        assert_eq!(s.missing_headers(inbox, 2).unwrap(), vec![3, 2]);
+        assert_eq!(threads_of(&s, FolderRole::Inbox).len(), 3);
+
+        // The server sends the headers of 2 (a reply to 1); 3 is gone.
+        let mut fetched = reply(2, "<r>", Some("<p>"), &["<p>"], 20);
+        fetched.headers.list_id = Some("<l>".into());
+        s.complete_headers(inbox, &[3, 2], &[fetched, msg(7, None, 0)])
+            .unwrap();
+
+        assert_eq!(s.missing_headers(inbox, 10).unwrap(), vec![1]);
+        let items = threads_of(&s, FolderRole::Inbox);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].count, 2);
+        let row = items[1].row_ids[0];
+        assert_eq!(
+            s.headers(row).unwrap().unwrap().list_id.as_deref(),
+            Some("<l>")
+        );
+        s.complete_headers(inbox, &[1], &[]).unwrap();
+        assert!(s.missing_headers(inbox, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_4_messages_get_conversations_from_their_ids() {
+        let path = std::env::temp_dir().join(format!("avero-v5-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(SCHEMA_V1).unwrap();
+            old.execute_batch(
+                "INSERT INTO accounts VALUES (1, 'A', 'a@x', 1, 2, 3, 'imap.x.com', 993, 'a@x');
+                 INSERT INTO accounts VALUES (2, 'B', 'b@x', 1, 2, 3, 'imap.x.com', 993, 'b@x');
+                 INSERT INTO folders VALUES (1, 1, 'INBOX', 'inbox', 7, 3);
+                 INSERT INTO folders VALUES (2, 2, 'INBOX', 'inbox', 7, 3);
+                 INSERT INTO messages VALUES (1, 1, 1, '<m>', 'Un', 'Marie', 'm@x', 5, 0);
+                 INSERT INTO messages VALUES (2, 2, 1, '<m>', 'Un', 'Marie', 'm@x', 5, 0);
+                 INSERT INTO messages VALUES (3, 1, 2, NULL, 'Deux', NULL, 'p@x', 6, 1);",
+            )
+            .unwrap();
+        }
+
+        let s = Store::open(&path).unwrap();
+
+        let version: i64 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        let ids = thread_ids(&s);
+        assert_eq!(ids["Un"], 1);
+        assert_eq!(ids["Deux"], 3);
+        let items = threads_of(&s, FolderRole::Inbox);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].row_ids.len(), 2);
+        assert_eq!(s.missing_headers(FolderId(1), 10).unwrap(), vec![2, 1]);
+        assert_eq!(s.headers(1).unwrap(), Some(MessageHeaders::default()));
+        // A reply arriving now joins the old message's conversation.
+        s.insert_messages(FolderId(2), &[reply(2, "<r>", Some("<m>"), &[], 9)])
+            .unwrap();
+        assert_eq!(threads_of(&s, FolderRole::Inbox)[0].count, 2);
+        // Deleting a message takes its links with it.
+        s.delete_messages(&[1]).unwrap();
+        assert_eq!(count(&s, "thread_links"), 3);
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Undoes versions 11 (its trigger and indexes), 10, 9 and 8 (to test older
+    /// migrations).
+    const UNDO_V8: &str = "
+        DROP TRIGGER messages_forget_row_keys;
+        DROP INDEX messages_missing_headers;
+        DROP INDEX messages_missing_sizes;
+        DROP TABLE space_accounts;
+        DROP TABLE spaces;
+        DROP TABLE draft_files;
+        DROP TABLE drafts;
+        DROP TABLE snoozes;
+        DROP TABLE spam_learned;
+        DROP TABLE spam_tokens;
+        DROP TABLE rule_conditions;
+        DROP TABLE rules;
+        ALTER TABLE accounts DROP COLUMN spam_bootstrapped;
+        ALTER TABLE senders DROP COLUMN not_spam;
+        ALTER TABLE messages DROP COLUMN size;
+    ";
+
+    /// Takes a database back to version 4 (to test older migrations): undoes
+    /// versions 7, 6 and 5 (after `UNDO_V8`).
+    const UNDO_V5: &str = "
+        DROP TABLE senders;
+        DROP INDEX messages_sender;
+        DROP INDEX messages_flagged;
+        ALTER TABLE messages DROP COLUMN flagged;
+        ALTER TABLE messages DROP COLUMN flag_pending;
+        ALTER TABLE messages DROP COLUMN category;
+        ALTER TABLE accounts DROP COLUMN signature;
+        DROP INDEX messages_thread;
+        DROP TABLE thread_links;
+        ALTER TABLE messages DROP COLUMN in_reply_to;
+        ALTER TABLE messages DROP COLUMN refs;
+        ALTER TABLE messages DROP COLUMN to_addrs;
+        ALTER TABLE messages DROP COLUMN delivered_to;
+        ALTER TABLE messages DROP COLUMN list_unsubscribe;
+        ALTER TABLE messages DROP COLUMN list_unsubscribe_post;
+        ALTER TABLE messages DROP COLUMN list_id;
+        ALTER TABLE messages DROP COLUMN precedence;
+        ALTER TABLE messages DROP COLUMN auto_submitted;
+        ALTER TABLE messages DROP COLUMN headers_v2;
+        ALTER TABLE messages DROP COLUMN thread_id;
+    ";
+
+    /// Server flags with only `\Seen` (`(uid, seen)`).
+    fn seen_flags(list: &[(u32, bool)]) -> Vec<ServerFlags> {
+        list.iter()
+            .map(|&(uid, seen)| ServerFlags {
+                uid,
+                seen,
+                flagged: false,
+            })
+            .collect()
+    }
+
+    /// A message from `from` with some list headers.
+    fn from(uid: u32, from: &str, date: i64) -> NewMessage {
+        let mut m = msg(uid, Some(&format!("<{uid}@x>")), date);
+        m.from_addr = from.to_string();
+        m.subject = format!("{from} {uid}");
+        m
+    }
+
+    fn subjects(items: &[UnifiedItem]) -> Vec<String> {
+        items.iter().map(|i| i.subject.clone()).collect()
+    }
+
+    fn tab(store: &Store, category: Category) -> Vec<String> {
+        subjects(
+            &store
+                .list(&Listing::Tab(category), AccountFilter::All, true, 200, 0)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn new_messages_are_sorted_in_tabs() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        let mut news = from(1, "news@shop.fr", 10);
+        news.headers.list_unsubscribe = Some("<https://shop.fr/u>".into());
+        let mut github = from(2, "notifications@github.com", 20);
+        github.headers.list_id = Some("<repo.github.com>".into());
+        let mut person = from(3, "marie@x.fr", 30);
+        person.seen = true;
+        s.insert_messages(f.id, &[news, github, person]).unwrap();
+
+        assert_eq!(tab(&s, Category::Important), vec!["marie@x.fr 3"]);
+        assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
+        assert_eq!(
+            tab(&s, Category::Notification),
+            vec!["notifications@github.com 2"]
+        );
+        // The whole inbox still lists them all.
+        assert_eq!(threads_of(&s, FolderRole::Inbox).len(), 3);
+        let unread = |c| {
+            s.list_unread(&Listing::Tab(c), AccountFilter::All, true)
+                .unwrap()
+        };
+        assert_eq!(unread(Category::Important), 0);
+        assert_eq!(unread(Category::Newsletter), 1);
+        assert_eq!(unread(Category::Notification), 1);
+        // Tabs follow the account filter.
+        let b = acct(&s, "b@x.fr");
+        let only_b = s
+            .list(
+                &Listing::Tab(Category::Newsletter),
+                AccountFilter::Only(b),
+                true,
+                200,
+                0,
+            )
+            .unwrap();
+        assert!(only_b.is_empty());
+    }
+
+    #[test]
+    fn reclassified_sender_is_remembered() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        let mut first = from(1, "Club@Asso.fr", 10);
+        first.headers.list_id = Some("<club.asso.fr>".into());
+        s.insert_messages(f.id, &[first, from(2, "paul@x.fr", 20)])
+            .unwrap();
+        assert_eq!(tab(&s, Category::Newsletter), vec!["Club@Asso.fr 1"]);
+        let paul_row = threads_of(&s, FolderRole::Inbox)[0].row_ids[0];
+
+        // Moved to Important by hand, with Paul's message of the thread.
+        s.set_sender_category(" club@asso.FR", Category::Important, &[paul_row])
+            .unwrap();
+        assert!(tab(&s, Category::Newsletter).is_empty());
+        assert_eq!(
+            s.sender_category("CLUB@asso.fr").unwrap(),
+            Some(Category::Important)
+        );
+        assert_eq!(s.category(paul_row).unwrap(), Some(Category::Important));
+        // The next message of that sender goes to Important too.
+        let mut next = from(3, "club@asso.fr", 30);
+        next.headers.list_id = Some("<club.asso.fr>".into());
+        s.insert_messages(f.id, &[next]).unwrap();
+        assert_eq!(tab(&s, Category::Important).len(), 3);
+        // And to Notifications once chosen so.
+        s.set_sender_category("club@asso.fr", Category::Notification, &[])
+            .unwrap();
+        assert_eq!(tab(&s, Category::Notification).len(), 2);
+        assert_eq!(s.sender_category("paul@x.fr").unwrap(), None);
+    }
+
+    #[test]
+    fn completed_headers_sort_old_messages_again() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let f = inbox(&s, a);
+        s.insert_messages(f.id, &[from(1, "news@shop.fr", 10)])
+            .unwrap();
+        assert_eq!(tab(&s, Category::Important).len(), 1);
+        s.mark_headers_missing(f.id).unwrap();
+        let mut again = from(1, "news@shop.fr", 10);
+        again.headers.list_unsubscribe = Some("<mailto:u@shop.fr>".into());
+        s.complete_headers(f.id, &[1], &[again]).unwrap();
+        assert_eq!(tab(&s, Category::Newsletter).len(), 1);
+    }
+
+    #[test]
+    fn unsubscribing_is_remembered_per_sender() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.unsubscribed_at("news@shop.fr").unwrap(), None);
+        s.set_sender_category("news@shop.fr", Category::Newsletter, &[])
+            .unwrap();
+        s.mark_unsubscribed(" News@Shop.fr", 1234).unwrap();
+        assert_eq!(s.unsubscribed_at("news@shop.fr").unwrap(), Some(1234));
+        // The tab chosen for the sender stays.
+        assert_eq!(
+            s.sender_category("news@shop.fr").unwrap(),
+            Some(Category::Newsletter)
+        );
+    }
+
+    #[test]
+    fn sender_view_lists_every_folder_and_account() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let b = acct(&s, "b@x.fr");
+        let fa = inbox(&s, a);
+        let archive = folder(&s, a, "Archive", FolderRole::Archive);
+        let fb = inbox(&s, b);
+        s.insert_messages(
+            fa.id,
+            &[from(1, "marie@x.fr", 10), from(2, "paul@x.fr", 20)],
+        )
+        .unwrap();
+        s.insert_messages(archive, &[from(3, "Marie@X.fr", 5)])
+            .unwrap();
+        s.insert_messages(fb.id, &[from(4, "marie@x.fr ", 30)])
+            .unwrap();
+
+        let marie = Listing::Sender("MARIE@x.fr".into());
+        let all = s.list(&marie, AccountFilter::All, false, 200, 0).unwrap();
+        assert_eq!(
+            subjects(&all),
+            vec!["marie@x.fr  4", "marie@x.fr 1", "Marie@X.fr 3"]
+        );
+        let only_a = s
+            .list(&marie, AccountFilter::Only(a), false, 200, 0)
+            .unwrap();
+        assert_eq!(only_a.len(), 2);
+        assert_eq!(s.list_unread(&marie, AccountFilter::All, false).unwrap(), 3);
+    }
+
+    #[test]
+    fn starred_messages_of_every_folder_are_listed() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let fa = inbox(&s, a);
+        let archive = folder(&s, a, "Archive", FolderRole::Archive);
+        let trash = folder(&s, a, "Trash", FolderRole::Trash);
+        let mut starred = from(1, "marie@x.fr", 10);
+        starred.flagged = true;
+        s.insert_messages(fa.id, &[starred, from(2, "paul@x.fr", 20)])
+            .unwrap();
+        let mut archived = from(3, "luc@x.fr", 30);
+        archived.flagged = true;
+        s.insert_messages(archive, &[archived]).unwrap();
+        let mut binned = from(4, "zoe@x.fr", 40);
+        binned.flagged = true;
+        s.insert_messages(trash, &[binned]).unwrap();
+
+        let list = s
+            .list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+            .unwrap();
+        assert_eq!(subjects(&list), vec!["luc@x.fr 3", "marie@x.fr 1"]);
+        assert!(list.iter().all(|i| i.flagged));
+        assert!(!threads_of(&s, FolderRole::Inbox)[0].flagged);
+
+        // Unstarred locally: gone from Favoris, and the server's flag
+        // does not bring it back while the change is pending.
+        let row = list[1].row_ids[0];
+        s.set_flagged(&[row], false).unwrap();
+        let flags = |flagged| {
+            vec![ServerFlags {
+                uid: 1,
+                seen: false,
+                flagged,
+            }]
+        };
+        s.apply_flags(fa.id, 1, 1, &flags(true)).unwrap();
+        let list = s
+            .list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+            .unwrap();
+        assert_eq!(subjects(&list), vec!["luc@x.fr 3"]);
+        // Once confirmed, the server is right again (starred elsewhere).
+        s.confirm_flagged(&[row]).unwrap();
+        s.apply_flags(fa.id, 1, 1, &flags(true)).unwrap();
+        assert_eq!(
+            s.list_unread(&Listing::Starred, AccountFilter::All, true)
+                .unwrap(),
+            2
+        );
+        s.apply_flags(fa.id, 1, 1, &flags(false)).unwrap();
+        assert_eq!(
+            s.list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        // A pending change is forgotten at the next start.
+        s.set_flagged(&[row], true).unwrap();
+        s.clear_pending().unwrap();
+        s.apply_flags(fa.id, 1, 1, &flags(false)).unwrap();
+        assert_eq!(
+            s.list(&Listing::Starred, AccountFilter::All, true, 200, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unstarring_a_conversation_finds_its_other_starred_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let a = acct(&s, "a@x.fr");
+        let fa = inbox(&s, a);
+        let sent = folder(&s, a, "Sent", FolderRole::Sent);
+        let mut first = reply(1, "<p>", None, &[], 10);
+        first.flagged = true;
+        s.insert_messages(fa.id, &[first]).unwrap();
+        let mut answer = reply(2, "<r>", Some("<p>"), &["<p>"], 20);
+        answer.flagged = true;
+        s.insert_messages(sent, &[answer]).unwrap();
+        s.insert_messages(fa.id, &[msg(3, Some("<other>"), 30)])
+            .unwrap();
+
+        let inbox_item = threads_of(&s, FolderRole::Inbox)
+            .into_iter()
+            .find(|i| i.subject == "subject 1")
+            .unwrap();
+        let others = s
+            .starred_in_threads(&inbox_item.row_ids, AccountFilter::All)
+            .unwrap();
+        assert_eq!(others.len(), 1);
+        assert_ne!(others[0], inbox_item.row_ids[0]);
+        assert!(
+            s.starred_in_threads(&inbox_item.row_ids, AccountFilter::Only(AccountId(99)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn version_6_messages_are_sorted_by_the_migration() {
+        let path = std::env::temp_dir().join(format!("avero-v7-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            let a = acct(&s, "a@x.fr");
+            let f = inbox(&s, a);
+            let mut news = from(1, "news@shop.fr", 10);
+            news.headers.precedence = Some("bulk".into());
+            s.insert_messages(f.id, &[news, from(2, "noreply@banque.fr", 20)])
+                .unwrap();
+            s.conn
+                .execute_batch(&format!(
+                    "{UNDO_V8}
+                     DROP TABLE senders;
+                     DROP INDEX messages_sender;
+                     DROP INDEX messages_flagged;
+                     ALTER TABLE messages DROP COLUMN flagged;
+                     ALTER TABLE messages DROP COLUMN flag_pending;
+                     ALTER TABLE messages DROP COLUMN category;
+                     PRAGMA user_version = 6;"
+                ))
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let version: i64 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        assert_eq!(tab(&s, Category::Newsletter), vec!["news@shop.fr 1"]);
+        assert_eq!(tab(&s, Category::Notification), vec!["noreply@banque.fr 2"]);
+        assert!(tab(&s, Category::Important).is_empty());
+        drop(s);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1321,7 +3257,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 11);
         let account = &s.accounts().unwrap()[0];
         assert_eq!(account.imap.host, "imap.x.com");
         assert_eq!(account.imap.security, Security::Tls);

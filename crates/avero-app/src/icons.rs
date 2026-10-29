@@ -12,10 +12,15 @@ use std::sync::{LazyLock, Mutex};
 /// Every icon the app draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
+    /// "Plus tard".
+    AlarmClock,
     Archive,
+    /// "Programmés".
+    CalendarClock,
     Check,
     ChevronDown,
     ChevronLeft,
+    ChevronUp,
     Alert,
     Download,
     EyeOff,
@@ -28,6 +33,7 @@ pub enum Icon {
     LogOut,
     MailOpen,
     Mail,
+    MailX,
     Moon,
     Paperclip,
     Pencil,
@@ -39,7 +45,12 @@ pub enum Icon {
     Send,
     Settings,
     Shield,
+    /// "Grand nettoyage".
+    Sparkles,
     Compose,
+    Star,
+    /// The star, filled: a starred message.
+    StarFilled,
     Sun,
     Trash,
     User,
@@ -53,14 +64,25 @@ pub enum Icon {
     Logo,
     Google,
     Microsoft,
+    // The icons a space can take (see `space_icon`), and "Tous".
+    House,
+    Briefcase,
+    Heart,
+    Bike,
+    BookOpen,
+    /// "Tous": every account, whatever the space.
+    Layers,
 }
 
 /// All icons, in the order of `bytes`; used to build the handle cache.
-const ALL: [Icon; 39] = [
+const ALL: [Icon; 52] = [
+    Icon::AlarmClock,
     Icon::Archive,
+    Icon::CalendarClock,
     Icon::Check,
     Icon::ChevronDown,
     Icon::ChevronLeft,
+    Icon::ChevronUp,
     Icon::Alert,
     Icon::Download,
     Icon::EyeOff,
@@ -73,6 +95,7 @@ const ALL: [Icon; 39] = [
     Icon::LogOut,
     Icon::MailOpen,
     Icon::Mail,
+    Icon::MailX,
     Icon::Moon,
     Icon::Paperclip,
     Icon::Pencil,
@@ -84,7 +107,10 @@ const ALL: [Icon; 39] = [
     Icon::Send,
     Icon::Settings,
     Icon::Shield,
+    Icon::Sparkles,
     Icon::Compose,
+    Icon::Star,
+    Icon::StarFilled,
     Icon::Sun,
     Icon::Trash,
     Icon::User,
@@ -96,15 +122,24 @@ const ALL: [Icon; 39] = [
     Icon::Logo,
     Icon::Google,
     Icon::Microsoft,
+    Icon::House,
+    Icon::Briefcase,
+    Icon::Heart,
+    Icon::Bike,
+    Icon::BookOpen,
+    Icon::Layers,
 ];
 
 /// The SVG source of an icon.
 pub fn bytes(icon: Icon) -> &'static [u8] {
     match icon {
+        Icon::AlarmClock => include_bytes!("../assets/icons/alarm-clock.svg"),
         Icon::Archive => include_bytes!("../assets/icons/archive.svg"),
+        Icon::CalendarClock => include_bytes!("../assets/icons/calendar-clock.svg"),
         Icon::Check => include_bytes!("../assets/icons/check.svg"),
         Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
         Icon::ChevronLeft => include_bytes!("../assets/icons/chevron-left.svg"),
+        Icon::ChevronUp => include_bytes!("../assets/icons/chevron-up.svg"),
         Icon::Alert => include_bytes!("../assets/icons/circle-alert.svg"),
         Icon::Download => include_bytes!("../assets/icons/download.svg"),
         Icon::EyeOff => include_bytes!("../assets/icons/eye-off.svg"),
@@ -117,6 +152,7 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::LogOut => include_bytes!("../assets/icons/log-out.svg"),
         Icon::MailOpen => include_bytes!("../assets/icons/mail-open.svg"),
         Icon::Mail => include_bytes!("../assets/icons/mail.svg"),
+        Icon::MailX => include_bytes!("../assets/icons/mail-x.svg"),
         Icon::Moon => include_bytes!("../assets/icons/moon.svg"),
         Icon::Paperclip => include_bytes!("../assets/icons/paperclip.svg"),
         Icon::Pencil => include_bytes!("../assets/icons/pencil.svg"),
@@ -128,7 +164,10 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Send => include_bytes!("../assets/icons/send.svg"),
         Icon::Settings => include_bytes!("../assets/icons/settings.svg"),
         Icon::Shield => include_bytes!("../assets/icons/shield-alert.svg"),
+        Icon::Sparkles => include_bytes!("../assets/icons/sparkles.svg"),
         Icon::Compose => include_bytes!("../assets/icons/square-pen.svg"),
+        Icon::Star => include_bytes!("../assets/icons/star.svg"),
+        Icon::StarFilled => include_bytes!("../assets/icons/star-filled.svg"),
         Icon::Sun => include_bytes!("../assets/icons/sun.svg"),
         Icon::Trash => include_bytes!("../assets/icons/trash-2.svg"),
         Icon::User => include_bytes!("../assets/icons/user.svg"),
@@ -140,6 +179,27 @@ pub fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Logo => include_bytes!("../assets/logo/avero-icon.svg"),
         Icon::Google => include_bytes!("../assets/logo/google.svg"),
         Icon::Microsoft => include_bytes!("../assets/logo/microsoft.svg"),
+        Icon::House => include_bytes!("../assets/icons/house.svg"),
+        Icon::Briefcase => include_bytes!("../assets/icons/briefcase.svg"),
+        Icon::Heart => include_bytes!("../assets/icons/heart.svg"),
+        Icon::Bike => include_bytes!("../assets/icons/bike.svg"),
+        Icon::BookOpen => include_bytes!("../assets/icons/book-open.svg"),
+        Icon::Layers => include_bytes!("../assets/icons/layers.svg"),
+    }
+}
+
+/// The icon of a space, by the name stored with it (see
+/// `app::SPACE_ICONS`); an unknown name gets the people icon.
+pub fn space_icon(name: &str) -> Icon {
+    match name {
+        "house" => Icon::House,
+        "briefcase" => Icon::Briefcase,
+        "heart" => Icon::Heart,
+        "star" => Icon::Star,
+        "bike" => Icon::Bike,
+        "book-open" => Icon::BookOpen,
+        "globe" => Icon::Globe,
+        _ => Icon::Users,
     }
 }
 
@@ -166,7 +226,6 @@ pub enum Tone {
     Muted,
     Accent,
     OnAccent,
-    Rail,
     Danger,
     Fixed(Color),
     /// Keep the colours of the SVG file (logos).
@@ -180,7 +239,6 @@ impl Tone {
             Tone::Muted => Some(t.muted),
             Tone::Accent => Some(t.accent),
             Tone::OnAccent => Some(t.on_accent),
-            Tone::Rail => Some(t.rail_icon),
             Tone::Danger => Some(t.danger),
             Tone::Fixed(color) => Some(color),
             Tone::Original => None,
@@ -278,6 +336,14 @@ mod tests {
             rotated_handle(Icon::Loader, 0.5),
             rotated_handle(Icon::Loader, 0.52)
         );
+    }
+
+    #[test]
+    fn every_space_icon_is_drawn() {
+        for name in crate::app::SPACE_ICONS {
+            let icon = space_icon(name);
+            assert!(name == "users" || icon != Icon::Users, "{name}");
+        }
     }
 
     #[test]

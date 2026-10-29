@@ -1,7 +1,7 @@
 //! The composer, drawn in place of the reading pane.
 
 use super::{hr, icon_button, icon_label_button};
-use crate::app::{App, ComposeMsg, Composer, Message};
+use crate::app::{App, ComposeMsg, Composer, LaterMsg, Message};
 use crate::compose::{human_size, total_size};
 use crate::icons::{self, Icon, Tone};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
@@ -39,7 +39,9 @@ impl fmt::Display for Sender {
 }
 
 pub fn view<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
-    let title = if composer.in_reply_to.is_some() {
+    let title = if composer.send_at.is_some() {
+        "Envoi programmé"
+    } else if composer.in_reply_to.is_some() {
         "Répondre"
     } else if composer.subject.to_lowercase().starts_with("fwd:") {
         "Transférer"
@@ -50,8 +52,13 @@ pub fn view<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
         text(title).size(16).font(SEMIBOLD),
         space().width(Fill),
         icon_button(
+            Icon::Trash,
+            "Supprimer le brouillon",
+            Some(Message::Compose(ComposeMsg::Discard))
+        ),
+        icon_button(
             Icon::Close,
-            "Fermer sans envoyer (Échap)",
+            "Fermer sans envoyer (Échap) : le brouillon est gardé",
             Some(Message::Compose(ComposeMsg::Cancel))
         ),
     ]
@@ -240,6 +247,21 @@ fn bottom<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
             .spacing(6)
             .align_y(Alignment::Center),
         );
+    } else if let Some(at) = composer.send_at {
+        info = info.push(
+            text(format!(
+                "Programmé {} : fermer garde cette heure",
+                crate::later::describe_local(at, app.clock.now())
+            ))
+            .size(11)
+            .style(theme::muted),
+        );
+    } else if composer.draft_id.is_some() && !composer.dirty {
+        info = info.push(
+            text("Brouillon enregistré sur cet ordinateur")
+                .size(11)
+                .style(theme::muted),
+        );
     }
     let idle = !composer.sending;
     let send_label = if composer.sending {
@@ -255,10 +277,17 @@ fn bottom<'a>(app: &'a App, composer: &'a Composer) -> Element<'a, Message> {
             idle.then_some(Message::Compose(ComposeMsg::Attach)),
             theme::ghost,
         ),
-        button(text("Annuler").size(13).font(MEDIUM))
+        button(text("Fermer").size(13).font(MEDIUM))
             .padding([8, 14])
             .on_press_maybe(idle.then_some(Message::Compose(ComposeMsg::Cancel)))
             .style(theme::secondary),
+        icon_label_button(
+            Icon::CalendarClock,
+            "Envoyer plus tard",
+            Tone::Text,
+            idle.then_some(Message::Later(LaterMsg::SendLater)),
+            theme::secondary,
+        ),
         super::tip(
             icon_label_button(
                 Icon::Send,

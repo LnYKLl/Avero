@@ -6,9 +6,12 @@ use super::{
 use crate::account_form::{self, AccountForm, Stage};
 use crate::auth::{self, OAuthGrant};
 use crate::background::{self, LoginError};
+use crate::notify::{self, Notice};
 use crate::worker::{AccountError, ErrorKind, Event, Job};
+use avero_core::store::{Store, StoreError};
 use avero_core::{AccountFilter, AccountId, Credentials, NewAccount, ServerConfig};
 use avero_oauth::Provider;
+use avero_sync::sync::Arrival;
 use iced::Task;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -40,7 +43,7 @@ impl App {
                     Err(error) => status.error = Some(error),
                 }
                 self.reload_now();
-                Task::none()
+                self.learn_from_folders(account)
             }
             Event::Body { row_id, result } => {
                 let parse = self.body_arrived(row_id, result);
@@ -53,6 +56,11 @@ impl App {
                 Task::batch([toast, self.sync_account(account)])
             }
             Event::Sent(result) => self.sent(result),
+            // Answered through `LaterMsg::DraftSaved`.
+            Event::DraftSaved(_) => Task::none(),
+            // Answered through `Message::ServerFound`.
+            Event::Found(_) => Task::none(),
+            Event::NewMail(arrivals) => self.new_mail(account, arrivals),
             Event::Gone => {
                 let status = self.status.entry(account).or_default();
                 status.syncing = false;
@@ -68,6 +76,56 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    /// What a worker did on its own. Unlike `on_worker_event`, a sync
+    /// ending here does not touch `syncing`: the user's own sync may
+    /// still be running.
+    pub(super) fn on_background_event(
+        &mut self,
+        account: AccountId,
+        event: Event,
+    ) -> Task<Message> {
+        if self.account(account).is_none() {
+            // Removed meanwhile.
+            return Task::none();
+        }
+        match event {
+            Event::Progress => self.reload_soon(),
+            Event::Synced(result) => {
+                let status = self.status.entry(account).or_default();
+                match result {
+                    Ok(archive) => {
+                        status.error = None;
+                        status.archive = Some(archive);
+                    }
+                    Err(error) => status.error = Some(error),
+                }
+                self.reload_now();
+                self.learn_from_folders(account)
+            }
+            Event::NewMail(arrivals) => self.new_mail(account, arrivals),
+            Event::Body { .. }
+            | Event::Done(_)
+            | Event::Sent(_)
+            | Event::DraftSaved(_)
+            | Event::Found(_)
+            | Event::Gone => Task::none(),
+        }
+    }
+
+    /// The system notifications for new mail of `account`, unless the
+    /// user turned them off.
+    pub(super) fn notices(&self, account: AccountId, arrivals: &[Arrival]) -> Vec<Notice> {
+        if !self.settings.notifications {
+            return Vec::new();
+        }
+        let name = self.account(account).map_or("", |a| a.name.as_str());
+        notify::notices(arrivals, name)
+    }
+
+    pub(super) fn notify(&self, account: AccountId, arrivals: &[Arrival]) {
+        notify::show(self.notices(account, arrivals));
     }
 
     // ------------------------------------------------------- add account
@@ -230,10 +288,6 @@ impl App {
                     && form.stage == Stage::Detecting
                 {
                     form.apply_detection(config, configured);
-                    if let Some(provider) = form.needs_setup() {
-                        form.stage = Stage::Setup(provider);
-                        return Task::none();
-                    }
                     return iced::widget::operation::focus(PASSWORD_ID);
                 }
                 Task::none()
@@ -482,7 +536,7 @@ impl App {
             account.imap = new.imap.clone();
             account.smtp = new.smtp.clone();
             account.auth = new.auth;
-            self.send_job(id, Job::UpdateAccount(account.clone()));
+            self.send_job(id, Job::UpdateAccount(Box::new(account.clone())));
             if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
                 *slot = account;
             }
@@ -505,21 +559,25 @@ impl App {
     /// Saves a checked account, hands its secret to the new worker and
     /// starts its first sync.
     fn finish_account(&mut self, new: NewAccount, secret: NewSecret) -> Task<Message> {
-        if self
+        // Quick check for the common case; the database is the guarantee.
+        let known = self
             .accounts
             .iter()
-            .any(|a| a.email.eq_ignore_ascii_case(&new.email))
-        {
-            if let Some(form) = self.form() {
-                form.error = Some("Ce compte est déjà dans Avero.".to_string());
-            }
-            return Task::none();
-        }
-        let account = match self.store.add_account(new) {
+            .any(|a| a.email.trim().eq_ignore_ascii_case(new.email.trim()));
+        let added = if known {
+            Err(StoreError::DuplicateAccount)
+        } else {
+            self.store.add_account(new)
+        };
+        let account = match added {
             Ok(account) => account,
             Err(e) => {
+                let text = match e {
+                    StoreError::DuplicateAccount => "Ce compte est déjà dans Avero.".to_string(),
+                    e => format!("Impossible d'ajouter le compte : {e}"),
+                };
                 if let Some(form) = self.form() {
-                    form.error = Some(format!("Impossible d'ajouter le compte : {e}"));
+                    form.error = Some(text);
                 }
                 return Task::none();
             }
@@ -549,14 +607,19 @@ impl App {
         }
         self.overlay = None;
         self.accounts.push(account.clone());
-        self.start_worker(&account);
+        // Added while a space is shown: it joins that space, so it shows.
+        if let Some(space) = self.space {
+            let _ = self.store.set_space_account(space, account.id, true);
+            self.spaces = self.store.spaces().unwrap_or_default();
+        }
+        let watching = self.start_worker(&account);
         self.screen = super::Screen::Mail;
         self.reload();
         let id = account.id;
         let sync = self.sync_account(id);
         let toast = self.toast(format!("Compte ajouté : {}", account.email), false);
         let Some(access) = access else {
-            return Task::batch([sync, toast]);
+            return Task::batch([sync, toast, watching]);
         };
         // The access token only lives in the worker's memory.
         let hand_token = self.request(id, |reply| Job::SetOAuth {
@@ -564,7 +627,7 @@ impl App {
             access,
             reply,
         });
-        Task::batch([hand_token.chain(sync), toast])
+        Task::batch([hand_token.chain(sync), toast, watching])
     }
 
     // ---------------------------------------------------- manage accounts
@@ -613,6 +676,7 @@ impl App {
                 Task::none()
             }
             AccountMsg::ConfirmDelete => self.delete_account(),
+            AccountMsg::Deleted(id, deleted) => self.account_deleted(id, deleted),
             AccountMsg::Reconnect(id) => self.reconnect(id),
             AccountMsg::Reconnected(id, result) => self.reconnected(id, result),
             AccountMsg::OpenServers(id) => {
@@ -639,6 +703,22 @@ impl App {
             }
             AccountMsg::SaveServers => self.save_servers(),
             AccountMsg::SmtpFound(id, found) => self.smtp_found(id, found),
+            AccountMsg::EditSignature(id) => {
+                if let Some(account) = self.account(id) {
+                    self.overlay = Some(Overlay::Signature {
+                        account: id,
+                        content: iced::widget::text_editor::Content::with_text(&account.signature),
+                    });
+                }
+                Task::none()
+            }
+            AccountMsg::SignatureEdit(action) => {
+                if let Some(Overlay::Signature { content, .. }) = &mut self.overlay {
+                    content.perform(action);
+                }
+                Task::none()
+            }
+            AccountMsg::SaveSignature => self.save_signature(),
             AccountMsg::CloseDialog => {
                 self.oauth_cancel = None;
                 self.overlay = None;
@@ -665,12 +745,30 @@ impl App {
             return self.toast(format!("Erreur de la base locale : {e}"), true);
         }
         account.name = name;
-        self.send_job(id, Job::UpdateAccount(account.clone()));
+        self.send_job(id, Job::UpdateAccount(Box::new(account.clone())));
         if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
             *slot = account;
         }
         self.overlay = None;
         Task::none()
+    }
+
+    /// Saves the signature being edited (trailing blank lines dropped).
+    fn save_signature(&mut self) -> Task<Message> {
+        let Some(Overlay::Signature { account, content }) = &self.overlay else {
+            return Task::none();
+        };
+        let (id, signature) = (*account, content.text().trim_end().to_string());
+        if let Err(e) = self.store.set_signature(id, &signature) {
+            return self.toast(format!("Erreur de la base locale : {e}"), true);
+        }
+        // The worker is not told: the signature is added here, in the
+        // composer, and a new copy of the account would reconnect it.
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            account.signature = signature;
+        }
+        self.overlay = None;
+        self.toast("Signature enregistrée", false)
     }
 
     /// Saves the "Serveurs" dialog and resyncs with the new settings.
@@ -719,7 +817,7 @@ impl App {
             .map_err(|e| format!("Erreur de la base locale : {e}"))?;
         account.imap = imap;
         account.smtp = smtp;
-        self.send_job(id, Job::UpdateAccount(account.clone()));
+        self.send_job(id, Job::UpdateAccount(Box::new(account.clone())));
         if let Some(slot) = self.accounts.iter_mut().find(|a| a.id == id) {
             *slot = account;
         }
@@ -823,33 +921,75 @@ impl App {
         Task::batch([store.chain(sync), toast])
     }
 
+    /// "Supprimer" confirmed. With a database file, its rows (tens of
+    /// thousands of messages) are deleted on a thread of its own, after
+    /// the account's worker stopped: the window goes on meanwhile, and
+    /// the account leaves it once that is done (see `account_deleted`).
+    /// The demo's database in memory is changed at once.
     fn delete_account(&mut self) -> Task<Message> {
         let Some(Overlay::ConfirmDelete(id)) = self.overlay else {
             return Task::none();
         };
         self.overlay = None;
-        if let Err(e) = self.store.delete_account(id) {
-            return self.toast(format!("Erreur de la base locale : {e}"), true);
-        }
-        if let Backend::Live {
-            workers, secrets, ..
+        let Backend::Live {
+            workers,
+            db_path,
+            secrets,
+            ..
         } = &mut self.backend
-        {
-            match workers.remove(&id) {
-                Some(worker) => worker.send(Job::Shutdown {
-                    delete_secret: true,
-                }),
-                None => {
-                    let secrets = secrets.clone();
-                    std::thread::spawn(move || secrets.delete(id));
-                }
+        else {
+            let deleted = self.store.delete_account(id).map_err(|e| e.to_string());
+            return self.account_deleted(id, deleted);
+        };
+        // The worker deletes the secret once its threads are done with it
+        // (a token refresh could store a new one).
+        match workers.remove(&id) {
+            Some(worker) => worker.send(Job::Shutdown {
+                delete_secret: true,
+            }),
+            None => {
+                let secrets = secrets.clone();
+                std::thread::spawn(move || secrets.delete(id));
             }
+        }
+        let path = db_path.clone();
+        let deleting = Task::perform(delete_aside(path, id), move |deleted| {
+            Message::Account(AccountMsg::Deleted(id, deleted))
+        });
+        Task::batch([
+            deleting,
+            self.toast("Suppression du compte en cours…", false),
+        ])
+    }
+
+    /// The rows of account `id` were deleted (or not): it leaves the
+    /// window. On failure it stays, with a worker again (its secret is
+    /// gone: it asks for it).
+    pub(super) fn account_deleted(
+        &mut self,
+        id: AccountId,
+        deleted: Result<(), String>,
+    ) -> Task<Message> {
+        if let Err(e) = deleted {
+            let stopped = matches!(&self.backend,
+                Backend::Live { workers, .. } if !workers.contains_key(&id));
+            let restart = match self.account(id).cloned() {
+                Some(account) if stopped => self.start_worker(&account),
+                _ => Task::none(),
+            };
+            let toast = self.toast(format!("Erreur de la base locale : {e}"), true);
+            return Task::batch([restart, toast]);
         }
         self.accounts.retain(|a| a.id != id);
         self.status.remove(&id);
         if self.filter == AccountFilter::Only(id) {
             self.filter = AccountFilter::All;
         }
+        if self.cleanup.filter == AccountFilter::Only(id) {
+            self.cleanup.filter = AccountFilter::All;
+        }
+        // The database took it out of its spaces.
+        self.spaces = self.store.spaces().unwrap_or_default();
         if self.composer.as_ref().is_some_and(|c| c.from == id) {
             self.composer = None;
         }
@@ -953,4 +1093,19 @@ pub fn login_message(error: &LoginError, app_password: bool) -> String {
         ),
         LoginError::Other(detail) => format!("Connexion impossible : {detail}"),
     }
+}
+
+/// Deletes the rows of an account on a thread of its own, with its own
+/// connection to the database.
+async fn delete_aside(path: std::path::PathBuf, id: AccountId) -> Result<(), String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = Store::open(&path)
+            .and_then(|store| store.delete_account(id))
+            .map_err(|e| e.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
+        .await
+        .unwrap_or_else(|_| Err("la suppression s'est arrêtée".to_string()))
 }

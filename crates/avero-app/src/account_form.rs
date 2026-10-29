@@ -155,14 +155,6 @@ impl AccountForm {
         }
     }
 
-    /// The provider whose assistant should be shown instead of the
-    /// credentials: the address needs OAuth, no client is configured and
-    /// the user did not choose the app password.
-    pub fn needs_setup(&self) -> Option<Provider> {
-        let provider = self.oauth_provider()?;
-        (!self.oauth_configured && !self.use_password).then_some(provider)
-    }
-
     /// Leaves the assistant for the app password: back to the
     /// credentials if the address is known, else to the address.
     pub fn choose_password(&mut self) {
@@ -248,9 +240,17 @@ impl AccountForm {
         }
     }
 
+    /// The OAuth provider of an address that takes no password at all
+    /// (Outlook.com): the only way in. Everywhere else a password (or an
+    /// app password) is used, so that nobody has to register Avero with
+    /// Google or Microsoft.
+    fn oauth_only(&self) -> Option<Provider> {
+        self.oauth_provider().filter(|_| !self.allows_password())
+    }
+
     /// Show the OAuth button as the main action.
     pub fn offers_oauth(&self) -> bool {
-        self.oauth_provider().is_some() && self.oauth_configured && !self.use_password
+        self.oauth_only().is_some() && self.oauth_configured
     }
 
     /// Show the password field.
@@ -320,10 +320,10 @@ impl AccountForm {
         Ok((account, password))
     }
 
-    /// The provider whose assistant can still be opened from the
-    /// credentials step (the user first chose the app password).
+    /// The provider whose assistant the credentials step offers: the
+    /// address takes no password and no connection is configured yet.
     pub fn setup_offer(&self) -> Option<Provider> {
-        self.oauth_provider().filter(|_| !self.oauth_configured)
+        self.oauth_only().filter(|_| !self.oauth_configured)
     }
 }
 
@@ -413,28 +413,16 @@ mod tests {
     }
 
     #[test]
-    fn gmail_with_client_offers_oauth_first() {
-        let form = gmail_form(true);
-        assert_eq!(form.stage, Stage::Credentials);
-        assert_eq!(form.provider_name(), Some("Gmail"));
-        assert_eq!(form.oauth_provider(), Some(Provider::Google));
-        assert!(form.offers_oauth());
-        assert!(!form.shows_password());
-        assert_eq!(form.needs_setup(), None);
-        assert_eq!(form.setup_offer(), None);
-    }
-
-    #[test]
-    fn gmail_without_client_opens_the_assistant_or_the_app_password() {
-        let mut form = gmail_form(false);
-        assert!(!form.offers_oauth());
-        assert_eq!(form.needs_setup(), Some(Provider::Google));
-        form.stage = Stage::Setup(Provider::Google);
-        form.choose_password();
-        assert_eq!(form.stage, Stage::Credentials);
-        assert_eq!(form.needs_setup(), None);
-        assert!(form.shows_password());
-        assert_eq!(form.setup_offer(), Some(Provider::Google));
+    fn gmail_asks_the_app_password_even_with_a_client() {
+        for configured in [true, false] {
+            let form = gmail_form(configured);
+            assert_eq!(form.stage, Stage::Credentials);
+            assert_eq!(form.provider_name(), Some("Gmail"));
+            assert!(!form.offers_oauth());
+            assert!(form.shows_password());
+            assert!(form.app_password());
+            assert_eq!(form.setup_offer(), None);
+        }
     }
 
     #[test]
@@ -447,13 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn outlook_without_client_needs_the_assistant() {
+    fn outlook_takes_no_password_only_its_connection() {
         let mut form = AccountForm::new();
         form.set(Field::Email, "a@hotmail.fr".into());
         form.apply_detection(avero_autoconfig::known("a@hotmail.fr"), false);
         assert!(!form.shows_password());
         assert!(!form.offers_oauth());
-        assert_eq!(form.needs_setup(), Some(Provider::Microsoft));
+        assert_eq!(form.setup_offer(), Some(Provider::Microsoft));
+        // Once the connection is configured: one button.
+        form.apply_detection(avero_autoconfig::known("a@hotmail.fr"), true);
+        assert!(form.offers_oauth());
+        assert_eq!(form.setup_offer(), None);
     }
 
     #[test]

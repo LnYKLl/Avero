@@ -1,2 +1,5 @@
 target/
 .superpowers/
+/target-dev
+/target-ci
+/dist

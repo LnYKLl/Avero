@@ -1,6 +1,7 @@
 //! Building messages: reply and forward drafts, quoting, address lists,
 //! attachment limits and the final `Outgoing` sent by SMTP.
 
+use avero_core::DraftFields;
 use avero_sync::parse::{Address, ParsedBody};
 use avero_sync::smtp::{Outgoing, OutgoingAttachment, Recipient};
 use chrono::{Local, TimeZone};
@@ -264,6 +265,126 @@ pub fn answer(parsed: &ParsedBody, mode: Mode, own: &[String]) -> Fields {
     }
 }
 
+/// The fields of a quick reply ("Répondre à tous…" under a
+/// conversation): a reply to all of `parsed` whose body is only what was
+/// typed, then the signature; no quote (the conversation is there).
+pub fn quick_reply(parsed: &ParsedBody, own: &[String], text: &str, signature: &str) -> Fields {
+    let fields = answer(parsed, Mode::ReplyAll, own);
+    let text = text.trim_end();
+    let block = signature_block(signature);
+    let body = if block.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text}\n\n{block}")
+    };
+    Fields { body, ..fields }
+}
+
+/// The signature as a draft shows it: the `-- ` line, then the text
+/// (empty when the account has none).
+pub fn signature_block(signature: &str) -> String {
+    let text = signature.trim_end();
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("-- \n{text}")
+    }
+}
+
+/// A draft body with the signature: a blank line to write in, the
+/// signature, then what the body already held (the quote of a reply, the
+/// forwarded message).
+pub fn with_signature(body: &str, signature: &str) -> String {
+    let block = signature_block(signature);
+    if block.is_empty() {
+        return body.to_string();
+    }
+    match body.trim_start_matches('\n') {
+        "" => format!("\n\n{block}"),
+        rest => format!("\n\n{block}\n\n{rest}"),
+    }
+}
+
+/// Whether a saved draft is a reply or a forward nobody wrote in: its
+/// body is still what "Répondre" or "Transférer" put there (the blank
+/// lines to write in, the signature `signature`, then the quote or the
+/// forwarded message), a forward has no recipient yet, and a reply has
+/// no Bcc and no file. Older versions of Avero kept such a draft when its
+/// composer was closed untouched (and saved it on the server at the next
+/// start): they are thrown away at start.
+pub fn untouched_answer(fields: &DraftFields, signature: &str, has_files: bool) -> bool {
+    let block = signature_block(signature);
+    let rest = if block.is_empty() {
+        fields.body.strip_prefix(
+            "
+
+",
+        )
+    } else {
+        fields.body.strip_prefix(&format!(
+            "
+
+{block}
+
+"
+        ))
+    };
+    let Some(rest) = rest else {
+        return false;
+    };
+    let subject = fields.subject.trim();
+    if rest.starts_with(
+        "---------- Message transféré ----------
+",
+    ) {
+        return fields.to.trim().is_empty()
+            && fields.cc.trim().is_empty()
+            && fields.bcc.trim().is_empty()
+            && forward_subject(subject) == subject;
+    }
+    let mut lines = rest.lines();
+    let quote_only = lines
+        .next()
+        .is_some_and(|first| first.starts_with("Le ") && first.ends_with(" a écrit :"))
+        && lines.all(|line| line.starts_with('>'));
+    quote_only && !has_files && fields.bcc.trim().is_empty() && reply_subject(subject) == subject
+}
+
+/// The body once the sending account changed from one with signature
+/// `old` to one with `new`; `base` is the body the draft started from,
+/// without signature. `None` when the signature cannot be swapped: the
+/// user changed it (or wrote around a missing one), so the body stays.
+pub fn swap_signature(body: &str, base: &str, old: &str, new: &str) -> Option<String> {
+    // Nothing touched: the draft is built again.
+    if body == with_signature(base, old) {
+        return Some(with_signature(base, new));
+    }
+    let old_block = signature_block(old);
+    if old_block.is_empty() {
+        return None;
+    }
+    // The old signature as it was inserted, followed by nothing or by
+    // the blank line before the quote.
+    let at = body
+        .match_indices(&old_block)
+        .map(|(at, _)| at)
+        .find(|&at| {
+            let after = &body[at + old_block.len()..];
+            after.is_empty() || after.starts_with("\n\n")
+        })?;
+    let before = &body[..at];
+    let after = &body[at + old_block.len()..];
+    let new_block = signature_block(new);
+    if !new_block.is_empty() {
+        return Some(format!("{before}{new_block}{after}"));
+    }
+    // No signature any more: its blank line goes with it.
+    Some(match after.strip_prefix("\n\n") {
+        Some(rest) => format!("{before}{rest}"),
+        None => before.strip_suffix("\n\n").unwrap_or(before).to_string(),
+    })
+}
+
 /// Addresses joined with ", ", without duplicates or those in `skip`.
 fn join_unique(list: &[&Address], skip: &[&Address]) -> String {
     let mut seen: Vec<String> = skip.iter().map(|a| a.addr.to_lowercase()).collect();
@@ -410,6 +531,60 @@ pub fn build(draft: Draft<'_>) -> Result<Outgoing, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn signature_goes_before_the_quote() {
+        assert_eq!(with_signature("", "Marie\n"), "\n\n-- \nMarie");
+        assert_eq!(
+            with_signature("\n\nPaul a écrit :\n> Salut", "Marie"),
+            "\n\n-- \nMarie\n\nPaul a écrit :\n> Salut"
+        );
+        // No signature: the body stays as it is.
+        assert_eq!(with_signature("\n\n> Salut", "  \n"), "\n\n> Salut");
+    }
+
+    #[test]
+    fn untouched_signature_is_swapped() {
+        let base = "\n\n> Salut";
+        let body = with_signature(base, "Marie");
+        assert_eq!(
+            swap_signature(&body, base, "Marie", "M. Durand\nPro").as_deref(),
+            Some("\n\n-- \nM. Durand\nPro\n\n> Salut")
+        );
+        // From an account without signature to one with.
+        assert_eq!(
+            swap_signature(base, base, "", "Marie").as_deref(),
+            Some(body.as_str())
+        );
+    }
+
+    #[test]
+    fn signature_is_swapped_under_text_typed_above() {
+        let typed = "Bonjour,\n\n-- \nMarie\n\n> Salut";
+        assert_eq!(
+            swap_signature(typed, "\n\n> Salut", "Marie", "Paul").as_deref(),
+            Some("Bonjour,\n\n-- \nPaul\n\n> Salut")
+        );
+        // The new account has none: the signature and its blank line go.
+        assert_eq!(
+            swap_signature(typed, "\n\n> Salut", "Marie", "").as_deref(),
+            Some("Bonjour,\n\n> Salut")
+        );
+        assert_eq!(
+            swap_signature("Bonjour,\n\n-- \nMarie", "", "Marie", "").as_deref(),
+            Some("Bonjour,")
+        );
+    }
+
+    #[test]
+    fn edited_signature_is_kept() {
+        let edited = "\n\n-- \nMarie\nà bientôt\n\n> Salut";
+        assert_eq!(swap_signature(edited, "\n\n> Salut", "Marie", "Paul"), None);
+        let gone = "Bonjour\n\n> Salut";
+        assert_eq!(swap_signature(gone, "\n\n> Salut", "Marie", "Paul"), None);
+        // Text written in a draft that had no signature stays as it is.
+        assert_eq!(swap_signature("Bonjour", "", "", "Paul"), None);
+    }
+
     fn addr(name: Option<&str>, addr: &str) -> Address {
         Address {
             name: name.map(str::to_string),
@@ -422,12 +597,15 @@ mod tests {
             from: Some(addr(Some("Marie Durand"), "marie@ex.com")),
             to: vec![addr(None, "moi@ex.com"), addr(Some("Paul"), "paul@ex.com")],
             cc: vec![addr(None, "zoe@ex.com"), addr(None, "MOI@ex.com")],
+            bcc: Vec::new(),
             reply_to: Vec::new(),
             date: 0,
             subject: "Réunion jeudi".to_string(),
             message_id: Some("<b@ex.com>".to_string()),
+            in_reply_to: Some("<a@ex.com>".to_string()),
             references: Some("<a@ex.com>".to_string()),
             text: "Bonjour,\n\nÀ jeudi.".to_string(),
+            lines: Vec::new(),
             attachments: Vec::new(),
         }
     }
@@ -478,6 +656,23 @@ mod tests {
     }
 
     #[test]
+    fn quick_reply_answers_everyone_without_quote() {
+        let own = ["moi@ex.com".to_string()];
+        let fields = quick_reply(&original(), &own, "D'accord, à jeudi !\n\n", "Camille");
+        assert_eq!(fields.to, "Marie Durand <marie@ex.com>, Paul <paul@ex.com>");
+        assert_eq!(fields.cc, "zoe@ex.com");
+        assert_eq!(fields.subject, "Re: Réunion jeudi");
+        assert_eq!(fields.in_reply_to.as_deref(), Some("<b@ex.com>"));
+        assert_eq!(fields.references.as_deref(), Some("<a@ex.com> <b@ex.com>"));
+        assert_eq!(fields.body, "D'accord, à jeudi !\n\n-- \nCamille");
+        assert!(!fields.body.contains("a écrit"));
+        assert!(!fields.body.contains("> "));
+        // No signature: just the text.
+        let plain = quick_reply(&original(), &own, "Merci", "  ");
+        assert_eq!(plain.body, "Merci");
+    }
+
+    #[test]
     fn answering_own_message_targets_original_recipients() {
         let mut parsed = original();
         parsed.from = Some(addr(None, "moi@ex.com"));
@@ -494,6 +689,51 @@ mod tests {
         assert!(fields.body.contains("Message transféré"));
         assert!(fields.body.contains("De : Marie Durand <marie@ex.com>"));
         assert!(fields.body.ends_with("À jeudi."));
+    }
+
+    /// The draft a composer opened with `fields` and signed with
+    /// `signature` keeps, untouched.
+    fn kept(fields: &Fields, signature: &str) -> DraftFields {
+        DraftFields {
+            account: avero_core::AccountId(1),
+            to: fields.to.clone(),
+            cc: fields.cc.clone(),
+            bcc: String::new(),
+            subject: fields.subject.clone(),
+            body: with_signature(&fields.body, signature),
+            in_reply_to: fields.in_reply_to.clone(),
+            references: fields.references.clone(),
+            message_id: "<d@ex.com>".to_string(),
+        }
+    }
+
+    #[test]
+    fn untouched_replies_and_forwards_are_recognised() {
+        let own = ["moi@ex.com".to_string()];
+        for signature in ["", "Camille"] {
+            let reply = kept(&answer(&original(), Mode::ReplyAll, &own), signature);
+            assert!(untouched_answer(&reply, signature, false));
+            let forward = kept(&answer(&original(), Mode::Forward, &own), signature);
+            assert!(untouched_answer(&forward, signature, true));
+
+            // Anything written keeps the draft.
+            let mut typed = reply.clone();
+            typed.body = format!("Bonjour,{}", reply.body);
+            assert!(!untouched_answer(&typed, signature, false));
+            let mut sent_to = forward.clone();
+            sent_to.to = "paul@ex.com".into();
+            assert!(!untouched_answer(&sent_to, signature, true));
+            let mut subject = reply.clone();
+            subject.subject = "Compte rendu".into();
+            assert!(!untouched_answer(&subject, signature, false));
+            assert!(!untouched_answer(&reply, signature, true));
+        }
+        // A new message, even empty, is not an answer.
+        let new = kept(&Fields::default(), "Camille");
+        assert!(!untouched_answer(&new, "Camille", false));
+        // Signed with a signature changed since: kept, to be safe.
+        let reply = kept(&answer(&original(), Mode::Reply, &own), "Camille");
+        assert!(!untouched_answer(&reply, "C. Martin", false));
     }
 
     #[test]

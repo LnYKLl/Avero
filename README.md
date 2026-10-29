@@ -10,9 +10,11 @@ Supported platforms: Windows, macOS and Linux. The interface is in French.
 
 ![Dark mode](docs/screenshots/inbox-dark.png)
 
+!["Océan" colours (Réglages › Apparence: Avero, Orange or Océan)](docs/screenshots/inbox-ocean.png)
+
 ## Features
 
-- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Gmail and Microsoft accounts can sign in with "Continuer avec Google / Microsoft" in the browser (OAuth2, PKCE). Other providers use a password or an app password. The IMAP and SMTP logins are tested before the account is saved.
+- **Easy account setup.** Type your address and Avero finds the servers by itself (built-in table, Thunderbird ISPDB, `autoconfig.<domain>`, then a guess). Accounts use a password or an app password; Outlook.com, which takes no password, signs in with Microsoft in the browser (OAuth2, PKCE) after a one-time assistant. The IMAP and SMTP logins are tested before the account is saved.
 - **Unified inbox** for all accounts, with a filter per account and the usual folders (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille). Messages received by several of your accounts appear once.
 - **Reading**: plain text (HTML is converted to text locally, nothing is downloaded from the web), attachments saved with the system "Save as" dialog, messages marked as read automatically.
 - **Acting**: reply, reply all, forward (with the original attachments), write a new message with attachments (25 MB max), archive, delete (to the trash; from the trash, deleted for good after a confirmation), mark as unread. An archive or delete only leaves the local copy once the server has confirmed it; if it fails, the message comes back with the reason.
@@ -24,6 +26,21 @@ Supported platforms: Windows, macOS and Linux. The interface is in French.
 
 Passwords and OAuth refresh tokens are stored only in the operating system's keyring (Windows Credential Manager, macOS Keychain, Secret Service on Linux), never in the database or in logs. IMAP uses implicit TLS only; SMTP uses implicit TLS or mandatory STARTTLS.
 
+## Installation
+
+### Windows
+
+Download the files from the [Releases](https://github.com/LnYKLl/Avero/releases) page (Windows 10 or 11, 64-bit):
+
+- **Installer** (`Avero-<version>-windows-x64-setup.exe`): installs Avero for your user only, without administrator rights (in `%LOCALAPPDATA%\Programs\Avero`), with a Start menu shortcut, an optional desktop shortcut and an uninstaller ("Apps" in the Windows settings). Uninstalling keeps your mail, settings and passwords.
+- **Portable** (`Avero-<version>-windows-x64-portable.zip`): unzip it anywhere and run `avero.exe`, nothing to install. The data is still kept in your user folder (see "Where files are kept"). New-mail notifications appear under the name "Windows PowerShell" in this version, because Windows only shows an app's own name for apps that have a Start menu shortcut; the installer creates one.
+
+`SHA256SUMS.txt` lists the checksums of both files (`sha256sum -c SHA256SUMS.txt`, or `Get-FileHash` in PowerShell).
+
+The files are not signed yet, so Windows SmartScreen may show "Windows protected your PC" (« Windows a protégé votre ordinateur ») the first time. Click "More info" (« Informations complémentaires »), then "Run anyway" (« Exécuter quand même »).
+
+On macOS and Linux, build Avero from source for now (below).
+
 ## Build and run
 
 You need the stable Rust toolchain (https://rustup.rs). Then, from this folder:
@@ -32,7 +49,7 @@ You need the stable Rust toolchain (https://rustup.rs). Then, from this folder:
 cargo run --release -p avero-app
 ```
 
-The first build takes a few minutes. The app draws its UI in software (tiny-skia), which keeps memory low (about 25 MB private memory in demo mode, see `docs/memory.md`). To use the GPU renderer (wgpu) instead, add `--features gpu`.
+The first build takes a few minutes. The app draws its UI on the GPU (wgpu) for smooth scrolling, and falls back to software rendering (tiny-skia) when no GPU is usable. Software rendering uses far less memory (about 25 MB private memory in demo mode instead of about 175 MB, see `docs/memory.md`): set `ICED_BACKEND=tiny-skia`, or build with `--no-default-features`.
 
 ### Try it without an account (demo mode)
 
@@ -45,14 +62,11 @@ AVERO_DEMO=1 cargo run --release -p avero-app
 
 Demo mode uses an in-memory database with three made-up accounts and about forty French messages. Nothing touches the network or your real data. `AVERO_DEMO=empty` shows the welcome screen; `AVERO_DEMO=google-setup` (or `microsoft-setup`) opens the connection assistant (nothing is saved). `AVERO_THEME=dark` (or `light`) forces a theme without saving it.
 
-### Gmail
+### Gmail, Outlook and the others
 
-- **With the Google button**: Google requires every app to have its own OAuth client, created by its owner in the Google Cloud console, so Avero cannot ship one. The first time, Avero opens a built-in assistant ("Configurer la connexion Google", about 5 minutes, once): each step has a button that opens the right console page, then you paste the client id and secret and Avero signs you in straight away. After that, every Gmail account is one click. The ids can be viewed (masked), changed or removed in Settings → "Connexion Google / Microsoft". Details and the manual way (`oauth.json`, compile-time variables): [docs/oauth-setup.md](docs/oauth-setup.md) (French).
-
-  ![Google connection assistant](docs/screenshots/google-setup.png)
-- **With an app password**: turn on 2-step verification on your Google account, create an app password at https://myaccount.google.com/apppasswords, and paste it in Avero (spaces are removed automatically).
-
-Outlook.com / Hotmail accounts only work with the Microsoft button, which also needs a client id: the same assistant guides you through the Microsoft Entra app registration (only the application id is needed).
+- **Gmail** (and Yahoo, iCloud, AOL): turn on 2-step verification on your account, create an app password (for Google: https://myaccount.google.com/apppasswords), and paste it in Avero (spaces are removed automatically). Avero shows the right link when you type your address.
+- **Outlook.com / Hotmail / Live**: Microsoft no longer accepts passwords in mail apps, only its own sign-in (OAuth), which needs an application id registered by each user. Avero explains this and opens a built-in assistant ("Configurer la connexion Microsoft", once, free): each step has a button to the right Microsoft Entra page, then you paste the application id and Avero signs you in. It can be changed or removed in Settings → "Connexion Outlook". Details: [docs/oauth-setup.md](docs/oauth-setup.md) (French).
+- **Everything else** (Orange, Free, SFR, OVH, your own domain…): your usual password.
 
 ## Where files are kept
 
@@ -63,14 +77,19 @@ Removing an account in the settings deletes its local messages and its keyring e
 
 ## Known limitations
 
-- The V1 interface has mostly been exercised with the demo data and automated tests; testing against real servers is still limited. OAuth (Google, Microsoft) is implemented and its requests are checked against the real Google and Microsoft endpoints (ignored tests in `crates/avero-oauth/tests/live_endpoints.rs`), but a complete sign-in needs your own client id (in-app assistant) and is not covered by automated tests.
+- Testing against real servers is still limited: the interface has mostly been exercised with the demo data and automated tests. OAuth (Google, Microsoft) is implemented and its requests are checked against the real Google and Microsoft endpoints (ignored tests in `crates/avero-oauth/tests/live_endpoints.rs`), but a complete sign-in needs your own client id (in-app assistant) and is not covered by automated tests.
 - Gmail: "Archiver" moves the message to "All Mail", which Avero does not sync (it duplicates every other folder), so archived Gmail messages leave Avero's view. The "Archives" tab is hidden when no account has a real archive folder.
 - Only the special folders are synced (Réception, Envoyés, Brouillons, Archives, Spam, Corbeille); your own folders and Gmail labels are not shown yet.
 - The first sync of a folder fetches its 2000 most recent messages; older ones are not downloaded.
-- Only the inbox has its read flags and deletions resynchronised from the server; other folders only receive new messages.
+- Only the inbox has its read flags, stars and deletions resynchronised from the server; other folders only receive new messages.
 - Messages are shown as plain text; there is no HTML view and inline images are not displayed.
-- No drafts saving, no signatures, no threads (conversation view), no notifications yet.
-- Search covers only bodies already downloaded (the 30 newest inbox messages, plus every message you opened).
+- Rules, "Plus tard" reminders, scheduled sending and the spam filter live on this computer: they only act while Avero runs (a scheduled mail due while Avero was closed leaves at the next start, marked as late). Rules act on new inbox mail, read or not, but not on the first fill of an account (use "Appliquer maintenant").
+- New-mail notifications only show the sender and the subject, never for mail already read elsewhere nor for the first fill of an account. With the portable zip on Windows they appear under the name "Windows PowerShell" (see "Installation").
+- After an update from V1, the messages already stored get their threading and mailing-list headers and their size fetched again a few thousand at a time per sync: on a big mailbox, conversations, tabs and "Grand nettoyage" sizes are complete after a few syncs.
+- On a server without UIDPLUS, the previous copies of a draft are only marked deleted (other clients may show them crossed out until the folder is expunged), so that Avero never expunges what another client marked deleted.
+- Local search covers only the bodies already downloaded (the 30 newest inbox messages, plus every message you opened); "Chercher aussi sur le serveur" asks the servers for the rest.
+- One Avero at a time: starting it again brings the open window to the front.
+- No calendar, contacts or PGP; the Windows files are not signed and there is no macOS or Linux installer yet.
 
 ## Tests
 

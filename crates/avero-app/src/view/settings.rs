@@ -1,13 +1,17 @@
-//! The settings page: accounts, appearance, about.
+//! The settings page: accounts, spaces, notifications, reading, rules,
+//! the spam filter, appearance, about.
 
 use super::{dot, hr, tip, to_color};
-use crate::app::{AccountMsg, AddMsg, App, Message};
+use crate::app::{AccountMsg, AddMsg, App, Message, RuleMsg, SpaceMsg, move_name};
 use crate::icons::{self, Icon, Tone};
-use crate::settings::ThemeChoice;
+use crate::settings::{ColorTheme, ThemeChoice};
 use crate::theme::{self, MEDIUM, SEMIBOLD};
-use avero_core::{Account, AuthKind};
+use avero_core::rules::Rule;
+use avero_core::{Account, AuthKind, Space};
 use avero_oauth::Provider;
-use iced::widget::{Column, button, column, container, row, scrollable, space, text, tooltip};
+use iced::widget::{
+    Column, button, column, container, row, scrollable, space, text, toggler, tooltip,
+};
 use iced::{Alignment, Element, Fill};
 
 /// Width of the settings column.
@@ -20,7 +24,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     let page = column![
         text("Réglages").size(26).font(SEMIBOLD),
         section("Comptes", accounts(app)),
-        section("Connexion Google / Microsoft", oauth_clients(app)),
+        section("Espaces", spaces(app)),
+        section("Connexion Outlook", oauth_clients(app)),
+        section("Notifications", notifications(app)),
+        section("Lecture", reading(app)),
+        section("Règles", rules(app)),
+        section("Anti-spam", spam_filter(app)),
         section("Apparence", appearance(app)),
         section("À propos", about()),
     ]
@@ -33,7 +42,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     )
     .width(Fill)
     .height(Fill)
-    .style(theme::paper)
+    .style(theme::page_on_card)
     .into()
 }
 
@@ -71,6 +80,112 @@ fn accounts(app: &App) -> Element<'_, Message> {
         .padding([8, 12]),
     );
     list.into()
+}
+
+/// The spaces, in order, each with what can be done to it, then "Nouvel
+/// espace".
+fn spaces(app: &App) -> Element<'_, Message> {
+    let mut list = Column::new();
+    let last = app.spaces.len().saturating_sub(1);
+    for (index, space) in app.spaces.iter().enumerate() {
+        list = list.push(space_row(app, space, index == 0, index == last));
+        list = list.push(hr());
+    }
+    list.push(
+        row![
+            button(
+                row![
+                    icons::icon(Icon::Plus, 16.0, Tone::Accent),
+                    text("Nouvel espace").size(13).font(MEDIUM),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 8])
+            .on_press(Message::Space(SpaceMsg::New))
+            .style(theme::link),
+            text(
+                "Un espace regroupe des comptes (Perso, Pro…) : choisi au-dessus de la liste \
+                 (Ctrl+1, Ctrl+2…), il n'en montre que les mails."
+            )
+            .size(12)
+            .style(theme::muted)
+            .width(Fill),
+        ]
+        .spacing(12)
+        .padding([8, 12])
+        .align_y(Alignment::Center),
+    )
+    .into()
+}
+
+fn space_row<'a>(app: &'a App, space: &'a Space, first: bool, last: bool) -> Element<'a, Message> {
+    let id = space.id;
+    let color = super::list::space_color(space);
+    let names: Vec<&str> = app
+        .accounts
+        .iter()
+        .filter(|a| space.contains(a.id))
+        .map(|a| a.name.as_str())
+        .collect();
+    let accounts = if names.is_empty() {
+        "Aucun compte".to_string()
+    } else {
+        names.join(", ")
+    };
+    let action = |icon, label: &'a str, message: Option<SpaceMsg>, tone| {
+        tip(
+            button(icons::icon(icon, 16.0, tone))
+                .padding(7)
+                .on_press_maybe(message.map(Message::Space))
+                .style(theme::ghost),
+            label,
+            tooltip::Position::Bottom,
+        )
+    };
+    row![
+        container(icons::icon(
+            icons::space_icon(&space.icon),
+            16.0,
+            Tone::Fixed(iced::Color::WHITE)
+        ))
+        .center(30)
+        .style(theme::disc(color)),
+        column![
+            text(space.name.clone()).size(14).font(MEDIUM),
+            text(accounts).size(12).style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        action(
+            Icon::ChevronUp,
+            "Monter",
+            (!first).then_some(SpaceMsg::Move(id, -1)),
+            Tone::Text
+        ),
+        action(
+            Icon::ChevronDown,
+            "Descendre",
+            (!last).then_some(SpaceMsg::Move(id, 1)),
+            Tone::Text
+        ),
+        action(
+            Icon::Pencil,
+            "Modifier",
+            Some(SpaceMsg::Edit(id)),
+            Tone::Text
+        ),
+        action(
+            Icon::Trash,
+            "Supprimer",
+            Some(SpaceMsg::AskDelete(id)),
+            Tone::Danger
+        ),
+    ]
+    .spacing(10)
+    .padding([12, 18])
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn auth_label(auth: AuthKind) -> &'static str {
@@ -138,6 +253,12 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
             Tone::Text
         ),
         action(
+            Icon::FileText,
+            "Signature",
+            AccountMsg::EditSignature(id),
+            Tone::Text
+        ),
+        action(
             Icon::Globe,
             "Serveurs (réception et envoi)",
             AccountMsg::OpenServers(id),
@@ -157,13 +278,14 @@ fn account_row<'a>(app: &'a App, account: &'a Account) -> Element<'a, Message> {
     .into()
 }
 
-/// The OAuth clients behind "Continuer avec Google / Microsoft".
+/// The OAuth clients behind "Continuer avec Microsoft" (Outlook takes no
+/// password). Google only for those who set it up before: Gmail takes an
+/// app password.
 fn oauth_clients(app: &App) -> Element<'_, Message> {
     let mut list = Column::new();
-    for (index, provider) in [Provider::Google, Provider::Microsoft]
-        .into_iter()
-        .enumerate()
-    {
+    let google = app.oauth_clients.contains_key(&Provider::Google);
+    let providers = std::iter::once(Provider::Microsoft).chain(google.then_some(Provider::Google));
+    for (index, provider) in providers.enumerate() {
         if index > 0 {
             list = list.push(hr());
         }
@@ -173,9 +295,10 @@ fn oauth_clients(app: &App) -> Element<'_, Message> {
         .push(
             container(
                 text(
-                    "Google et Microsoft demandent que chaque application soit enregistrée par \
-                     son propriétaire. L'assistant vous guide une seule fois ; ensuite chaque \
-                     compte se connecte en un clic.",
+                    "Outlook et Hotmail n'acceptent plus les mots de passe : chacun enregistre \
+                     sa propre connexion Microsoft, une seule fois, avec l'assistant. Les autres \
+                     adresses, Gmail compris, se connectent avec un mot de passe ou un mot de \
+                     passe d'application.",
                 )
                 .size(12)
                 .style(theme::muted),
@@ -252,6 +375,211 @@ fn client_row(app: &App, provider: Provider) -> Element<'_, Message> {
     .into()
 }
 
+fn notifications(app: &App) -> Element<'_, Message> {
+    row![
+        column![
+            text("Notifications de nouveaux messages")
+                .size(14)
+                .font(MEDIUM),
+            text("Expéditeur et objet des nouveaux mails non lus de la Réception.")
+                .size(12)
+                .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.notifications).on_toggle(Message::NotificationsToggled),
+    ]
+    .spacing(12)
+    .padding(18)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn reading(app: &App) -> Element<'_, Message> {
+    let threads = row![
+        column![
+            text("Regrouper les conversations").size(14).font(MEDIUM),
+            text("Une ligne par échange, avec les réponses ; désactivé, une ligne par message.")
+                .size(12)
+                .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.group_threads).on_toggle(Message::ThreadsToggled),
+    ]
+    .spacing(12)
+    .padding(18)
+    .align_y(Alignment::Center);
+    let tabs = row![
+        column![
+            text("Trier la réception en onglets").size(14).font(MEDIUM),
+            text(
+                "Important, Newsletters et Notifications, d'après les en-têtes des messages \
+                 (tri local, rien n'est envoyé)."
+            )
+            .size(12)
+            .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.inbox_tabs).on_toggle(Message::TabsToggled),
+    ]
+    .spacing(12)
+    .padding(18)
+    .align_y(Alignment::Center);
+    column![threads, hr(), tabs].into()
+}
+
+/// The rules, in the order they apply, and "Nouvelle règle".
+fn rules(app: &App) -> Element<'_, Message> {
+    let mut list = Column::new();
+    let last = app.rules.len().saturating_sub(1);
+    for (index, rule) in app.rules.iter().enumerate() {
+        list = list.push(rule_row(app, rule, index == 0, index == last));
+        list = list.push(hr());
+    }
+    list.push(
+        row![
+            button(
+                row![
+                    icons::icon(Icon::Plus, 16.0, Tone::Accent),
+                    text("Nouvelle règle").size(13).font(MEDIUM),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 8])
+            .on_press(Message::Rule(RuleMsg::New))
+            .style(theme::link),
+            text(
+                "Les règles s'appliquent aux nouveaux mails de la Réception, quand Avero est ouvert."
+            )
+            .size(12)
+            .style(theme::muted)
+            .width(Fill),
+        ]
+        .spacing(12)
+        .padding([8, 12])
+        .align_y(Alignment::Center),
+    )
+    .into()
+}
+
+/// What a rule does, in a few words: "Si l'expéditeur contient
+/// « promo » : archiver, marquer comme lu · Perso".
+fn rule_summary(app: &App, rule: &Rule) -> String {
+    use avero_core::rules::RuleField;
+    let conditions: Vec<String> = rule
+        .def
+        .conditions
+        .iter()
+        .map(|c| {
+            let field = match c.field {
+                RuleField::From => "l'expéditeur",
+                RuleField::To => "le destinataire",
+                RuleField::Subject => "l'objet",
+                RuleField::FromAddress => "l'adresse de l'expéditeur",
+            };
+            let verb = crate::app::field_verb(c.field);
+            format!("{field} {verb} « {} »", c.value)
+        })
+        .collect();
+    let joiner = if rule.def.match_all { " et " } else { " ou " };
+    let mut actions = Vec::new();
+    if rule.def.move_to.is_some() {
+        actions.push(move_name(rule.def.move_to).to_lowercase());
+    }
+    if rule.def.mark_read {
+        actions.push("marquer comme lu".to_string());
+    }
+    let scope = match rule.def.account.and_then(|id| app.account(id)) {
+        Some(account) => account.name.clone(),
+        None => "tous les comptes".to_string(),
+    };
+    format!(
+        "Si {} : {} · {scope}",
+        conditions.join(joiner),
+        actions.join(", ")
+    )
+}
+
+fn rule_row<'a>(app: &'a App, rule: &'a Rule, first: bool, last: bool) -> Element<'a, Message> {
+    let id = rule.id;
+    let action = |icon, label: &'a str, message: Option<RuleMsg>, tone| {
+        tip(
+            button(icons::icon(icon, 16.0, tone))
+                .padding(7)
+                .on_press_maybe(message.map(Message::Rule))
+                .style(theme::ghost),
+            label,
+            tooltip::Position::Bottom,
+        )
+    };
+    row![
+        toggler(rule.enabled).on_toggle(move |on| Message::Rule(RuleMsg::Toggle(id, on))),
+        column![
+            text(rule.def.name.clone()).size(14).font(MEDIUM),
+            text(rule_summary(app, rule)).size(12).style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        button(text("Appliquer maintenant").size(12).font(MEDIUM))
+            .padding([5, 10])
+            .on_press(Message::Rule(RuleMsg::Apply(id)))
+            .style(theme::secondary),
+        action(
+            Icon::ChevronUp,
+            "Monter",
+            (!first).then_some(RuleMsg::Shift(id, true)),
+            Tone::Text
+        ),
+        action(
+            Icon::ChevronDown,
+            "Descendre",
+            (!last).then_some(RuleMsg::Shift(id, false)),
+            Tone::Text
+        ),
+        action(
+            Icon::Pencil,
+            "Modifier",
+            Some(RuleMsg::Edit(id)),
+            Tone::Text
+        ),
+        action(
+            Icon::Trash,
+            "Supprimer",
+            Some(RuleMsg::Delete(id)),
+            Tone::Danger
+        ),
+    ]
+    .spacing(8)
+    .padding([12, 18])
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn spam_filter(app: &App) -> Element<'_, Message> {
+    row![
+        column![
+            text("Filtre anti-spam").size(14).font(MEDIUM),
+            text(
+                "Apprend de vos boutons « Spam » et « Pas spam » et place dans le spam les \
+                 nouveaux mails dont il est sûr. Jamais pour quelqu'un à qui vous avez écrit. \
+                 Tout reste sur cet ordinateur."
+            )
+            .size(12)
+            .style(theme::muted),
+        ]
+        .spacing(3)
+        .width(Fill),
+        toggler(app.settings.spam_filter).on_toggle(Message::SpamFilterToggled),
+    ]
+    .spacing(12)
+    .padding(18)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn appearance(app: &App) -> Element<'_, Message> {
     let choice = |icon, label: &'static str, value: ThemeChoice| {
         let selected = app.settings.theme == value;
@@ -275,6 +603,36 @@ fn appearance(app: &App) -> Element<'_, Message> {
         .on_press(Message::ThemeChosen(value))
         .style(theme::choice(selected))
     };
+    let dark = app.tokens().surface == theme::DARK.surface;
+    let colour = |color: ColorTheme| {
+        let selected = app.settings.color == color;
+        let tokens = theme::tokens_for(color, dark);
+        let swatch = container(
+            text("Aa")
+                .size(15)
+                .font(theme::BOLD)
+                .color(iced::Color::WHITE),
+        )
+        .center_x(Fill)
+        .height(44)
+        .center_y(44)
+        .style(move |_theme: &iced::Theme| container::Style {
+            background: Some(theme::frame_background(tokens)),
+            border: iced::border::rounded(theme::CONTROL_RADIUS),
+            ..container::Style::default()
+        });
+        button(
+            column![
+                swatch,
+                container(text(color.label()).size(13).font(MEDIUM)).center_x(Fill),
+            ]
+            .spacing(8),
+        )
+        .width(Fill)
+        .padding(8)
+        .on_press(Message::ColorChosen(color))
+        .style(theme::choice(selected))
+    };
     column![
         text("Thème de l'interface").size(14).font(MEDIUM),
         row![
@@ -283,6 +641,11 @@ fn appearance(app: &App) -> Element<'_, Message> {
             choice(Icon::Moon, "Sombre", ThemeChoice::Dark),
         ]
         .spacing(10),
+        text("Couleurs").size(14).font(MEDIUM),
+        row(ColorTheme::ALL.map(|color| colour(color).into())).spacing(10),
+        text("Le dégradé de la fenêtre et la couleur des boutons, en clair comme en sombre.")
+            .size(12)
+            .style(theme::muted),
     ]
     .spacing(12)
     .padding(18)

@@ -7,11 +7,17 @@ mod auth;
 mod background;
 mod compose;
 mod demo;
+mod diag;
 mod icons;
+mod instance;
+mod later;
+mod marks;
+mod notify;
 mod oauth_setup;
 mod paths;
 mod settings;
 mod theme;
+mod unsubscribe;
 mod view;
 mod worker;
 
@@ -24,21 +30,50 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn main() -> iced::Result {
+    // Windows: before any window, so the taskbar and the notifications
+    // know the process as Avero.
+    notify::set_process_app_id();
     // Without a console (release builds), a database that cannot be
-    // opened must be explained in a window, not by a silent crash.
+    // opened must be explained in a window, not by a silent crash. It is
+    // opened here once, and that connection goes to the window's state:
+    // opening migrates the database, and what the migration leaves for
+    // the app (see `Store::merged_accounts`) is read from it.
+    let mut opened = None;
+    // Held until Avero quits (see `instance`).
+    let mut _instance = None;
     if demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref()).is_none() {
         let db_path = paths::database_path();
-        if let Err(e) = Store::open(&db_path) {
-            rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Error)
-                .set_title("Avero")
-                .set_description(database_error_text(&db_path, &e))
-                .set_buttons(rfd::MessageButtons::Ok)
-                .show();
-            std::process::exit(1);
+        match instance::claim(&db_path) {
+            instance::Claim::First(guard) => _instance = Some(guard),
+            instance::Claim::Running => {
+                if !instance::show_running() {
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Info)
+                        .set_title("Avero")
+                        .set_description(instance::ALREADY_RUNNING)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+                std::process::exit(0);
+            }
+        }
+        match Store::open(&db_path) {
+            Ok(store) => opened = Some(store),
+            Err(e) => {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Avero")
+                    .set_description(database_error_text(&db_path, &e))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                std::process::exit(1);
+            }
         }
     }
-    let mut application = iced::application(boot, App::update, App::view)
+    // `boot` may in theory be called more than once: the next calls open
+    // the database again.
+    let opened = std::cell::Cell::new(opened);
+    let mut application = iced::application(move || boot(opened.take()), App::update, App::view)
         .title("Avero")
         .theme(App::theme)
         .subscription(App::subscription)
@@ -55,8 +90,9 @@ fn main() -> iced::Result {
     application.run()
 }
 
-/// Opens the database (or the demo one) and builds the window's state.
-fn boot() -> (App, Task<Message>) {
+/// Builds the window's state on the database `main` opened (or the demo
+/// one).
+fn boot(opened: Option<Store>) -> (App, Task<Message>) {
     let demo = demo::from_env_value(std::env::var("AVERO_DEMO").ok().as_deref());
     let config_dir = paths::config_dir();
     let settings_path = settings::path_in(&config_dir);
@@ -66,6 +102,13 @@ fn boot() -> (App, Task<Message>) {
         .and_then(|v| ThemeChoice::from_env_value(&v));
     if let Some(choice) = forced {
         settings.theme = choice;
+    }
+    // AVERO_COLOR (avero, orange, ocean) picks the colours, for screenshots.
+    let forced_color = std::env::var("AVERO_COLOR")
+        .ok()
+        .and_then(|v| settings::ColorTheme::from_env_value(&v));
+    if let Some(color) = forced_color {
+        settings.color = color;
     }
 
     match demo {
@@ -82,20 +125,41 @@ fn boot() -> (App, Task<Message>) {
                 let open = app.update(Message::Add(AddMsg::Open(Some(provider))));
                 return (app, Task::batch([task, open]));
             }
+            // AVERO_DEMO_SCREEN opens another screen, for screenshots.
+            let screen = match std::env::var("AVERO_DEMO_SCREEN").as_deref() {
+                Ok("settings") => Some(Message::ShowSettings),
+                Ok("cleanup") => Some(Message::ShowCleanup),
+                Ok("newsletter") => {
+                    let _ = app.update(Message::TabSelected(
+                        avero_core::category::Category::Newsletter,
+                    ));
+                    // The first letter of Le Monde: an HTML mail.
+                    Some(Message::MessageSelected(2))
+                }
+                _ => None,
+            };
+            if let Some(screen) = screen {
+                let shown = app.update(screen);
+                return (app, Task::batch([task, shown]));
+            }
             (app, task)
         }
         None => {
             let db_path = paths::database_path();
+            if let Some(dir) = db_path.parent() {
+                diag::open(dir);
+            }
+            diag::diag!("Avero {} démarre", env!("CARGO_PKG_VERSION"));
             // Checked in `main` before the window opened.
-            let store = Store::open(&db_path).expect("open database");
+            let store = opened.unwrap_or_else(|| Store::open(&db_path).expect("open database"));
             let backend = Backend::Live {
                 db_path,
                 secrets: Arc::new(KeyringSecrets),
                 config_dir,
                 workers: HashMap::new(),
             };
-            // An AVERO_THEME override is not saved either.
-            let path = forced.is_none().then_some(settings_path);
+            // An AVERO_THEME or AVERO_COLOR override is not saved either.
+            let path = (forced.is_none() && forced_color.is_none()).then_some(settings_path);
             App::new(store, backend, settings, path)
         }
     }
@@ -156,6 +220,19 @@ mod tests {
     #[test]
     fn window_icon_is_rendered() {
         assert!(window_icon().is_some());
+    }
+
+    #[test]
+    fn windows_icon_has_every_size() {
+        // Made by `cargo run -p avero-app --example make_icon`.
+        let ico = include_bytes!("../assets/logo/avero.ico");
+        assert_eq!(&ico[..4], &[0, 0, 1, 0], "an .ico header");
+        let count = usize::from(u16::from_le_bytes([ico[4], ico[5]]));
+        // Each entry starts with the width; 0 means 256.
+        let widths: Vec<u8> = (0..count).map(|i| ico[6 + 16 * i]).collect();
+        for width in [16, 24, 32, 48, 0] {
+            assert!(widths.contains(&width), "size {width} missing: {widths:?}");
+        }
     }
 
     #[test]

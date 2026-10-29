@@ -2,12 +2,17 @@
 //! says), logged in with a password (LOGIN) or an OAuth2 token
 //! (AUTHENTICATE XOAUTH2).
 
+use crate::parse::HEADER_FIELDS;
 use crate::source::{FetchedHeader, FolderStatus, MailSource, RemoteFolder, SyncError};
+use crate::watch::{Change, IDLE_RENEW, InboxCount, InboxNews, InboxWatch, POLL_EVERY};
 use async_imap::error::Error as ImapError;
-use async_imap::imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
-use async_imap::types::NameAttribute;
+use async_imap::extensions::idle::IdleResponse;
+use async_imap::imap_proto::{
+    AttributeValue, MailboxDatum, MessageSection, Response, SectionPath, Status,
+};
+use async_imap::types::{NameAttribute, UnsolicitedResponse};
 use async_imap::{Authenticator, Client, Session};
-use avero_core::model::{Credentials, Security, ServerConfig};
+use avero_core::model::{Credentials, Security, ServerConfig, ServerFlags};
 use futures::TryStreamExt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -38,6 +43,8 @@ struct ServerCaps {
     move_command: bool,
     /// `UID EXPUNGE` (RFC 4315).
     uidplus: bool,
+    /// `IDLE` (RFC 2177).
+    idle: bool,
 }
 
 /// A logged-in connection to an IMAP server.
@@ -221,6 +228,7 @@ where
     Ok(ServerCaps {
         move_command: caps.has_str("MOVE"),
         uidplus: caps.has_str("UIDPLUS"),
+        idle: caps.has_str("IDLE"),
     })
 }
 
@@ -314,6 +322,11 @@ where
     }
 }
 
+/// The header fields `parse_headers` reads, without setting `\Seen`.
+fn header_section() -> String {
+    format!("BODY.PEEK[HEADER.FIELDS ({HEADER_FIELDS})]")
+}
+
 /// Headers (with UID and flags) of the messages in `from_uid..=to_uid`.
 async fn fetch_headers_from<T>(
     session: &mut Session<T>,
@@ -327,7 +340,10 @@ where
         Some(to) => format!("{from_uid}:{to}"),
         None => format!("{from_uid}:*"),
     };
-    let command = format!("UID FETCH {range} (UID FLAGS BODY.PEEK[HEADER])");
+    let command = format!(
+        "UID FETCH {range} (UID FLAGS RFC822.SIZE {})",
+        header_section()
+    );
     let mut headers = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         headers.extend(header_from_fetch(attributes, from_uid));
@@ -347,13 +363,149 @@ async fn fetch_headers_seq<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
-    let command = format!("FETCH {from_seq}:{to_seq} (UID FLAGS BODY.PEEK[HEADER])");
+    let command = format!(
+        "FETCH {from_seq}:{to_seq} (UID FLAGS RFC822.SIZE {})",
+        header_section()
+    );
     let mut headers = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
         headers.extend(header_from_fetch(attributes, 0));
     })
     .await?;
     Ok(headers)
+}
+
+/// Headers (with UID and flags) of the messages with these UIDs, asked
+/// in one `UID FETCH` with a UID set (they can be far apart).
+async fn fetch_headers_of<T>(
+    session: &mut Session<T>,
+    uids: &[u32],
+) -> Result<Vec<FetchedHeader>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let Some(&lowest) = uids.iter().min() else {
+        return Ok(Vec::new());
+    };
+    let command = format!(
+        "UID FETCH {} (UID FLAGS RFC822.SIZE {})",
+        uid_set(uids),
+        header_section()
+    );
+    let mut headers = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        headers.extend(header_from_fetch(attributes, lowest));
+    })
+    .await?;
+    headers.retain(|header| uids.contains(&header.uid));
+    Ok(headers)
+}
+
+/// Most words of a search sent to the server.
+const SEARCH_WORDS: usize = 8;
+
+/// The criteria of a search on the server for what the user typed, like
+/// the local search: every word must be in the sender, the subject or the
+/// text (`OR OR FROM "w" SUBJECT "w" BODY "w"` per word, the words
+/// joined, which means "and"). Words without any letter or digit are
+/// dropped; `None` when nothing is left.
+///
+/// Each word is an IMAP quoted string: `\` and `"` escaped with `\`, control
+/// characters (line breaks above all, which would end the command)
+/// removed. Accented words are sent as UTF-8 inside the quotes, which the
+/// big servers accept with `CHARSET UTF-8` (async-imap cannot send
+/// literals, which wait for the server's go-ahead).
+pub fn search_criteria(input: &str) -> Option<String> {
+    let words: Vec<String> = input
+        .split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .take(SEARCH_WORDS)
+        .map(|word| {
+            let clean: String = word.chars().filter(|c| !c.is_control()).collect();
+            format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
+        })
+        .map(|quoted| format!("OR OR FROM {quoted} SUBJECT {quoted} BODY {quoted}"))
+        .collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
+}
+
+/// The `UID SEARCH` command for `criteria`, announcing UTF-8 or not.
+fn search_command(criteria: &str, charset: bool) -> String {
+    if charset {
+        format!("UID SEARCH CHARSET UTF-8 {criteria}")
+    } else {
+        format!("UID SEARCH {criteria}")
+    }
+}
+
+/// Searches the selected folder for what the user typed (see
+/// [`search_criteria`]); the UIDs found, in increasing order. A server
+/// that refuses `CHARSET UTF-8` is asked again without it.
+async fn search_text<T>(session: &mut Session<T>, input: &str) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let Some(criteria) = search_criteria(input) else {
+        return Ok(Vec::new());
+    };
+    let first = with_timeout(
+        FETCH_TIMEOUT,
+        "UID SEARCH",
+        run_uid_search(session, &search_command(&criteria, true)),
+    )
+    .await;
+    match first {
+        Err(SyncError::Protocol(_)) => {
+            with_timeout(
+                FETCH_TIMEOUT,
+                "UID SEARCH",
+                run_uid_search(session, &search_command(&criteria, false)),
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+/// Sends a `UID SEARCH` command and reads the UIDs it finds, up to the
+/// answer tagged for it. Unlike async-imap's `uid_search`, a refusal (NO
+/// or BAD) is an error (`SyncError::Protocol`), not "nothing found".
+async fn run_uid_search<T>(session: &mut Session<T>, command: &str) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let tag = session.run_command(command).await.map_err(command_error)?;
+    let mut uids = Vec::new();
+    loop {
+        let response = match session.read_response().await {
+            Ok(Some(response)) => response,
+            Ok(None) => return Err(SyncError::Connect("connection lost".to_string())),
+            Err(e) => return Err(SyncError::Connect(e.to_string())),
+        };
+        match response.parsed() {
+            Response::Done {
+                tag: done_tag,
+                status,
+                outcome,
+            } if *done_tag == tag => {
+                if *status == Status::Ok {
+                    uids.sort_unstable();
+                    uids.dedup();
+                    return Ok(uids);
+                }
+                let reason = outcome.information.as_deref().unwrap_or("");
+                return Err(SyncError::Protocol(format!(
+                    "UID SEARCH refused: {status:?} {reason}"
+                )));
+            }
+            Response::MailboxData(MailboxDatum::Search(found)) => uids.extend(found),
+            _ => {}
+        }
+    }
 }
 
 /// UIDs of the messages from `from_uid` up, in increasing order.
@@ -376,25 +528,61 @@ where
     Ok(uids)
 }
 
-/// `(uid, seen)` of every message with a UID in `from_uid..=to_uid`.
+/// The flags of every message with a UID in `from_uid..=to_uid`.
 async fn fetch_flags_range<T>(
     session: &mut Session<T>,
     from_uid: u32,
     to_uid: u32,
-) -> Result<Vec<(u32, bool)>, SyncError>
+) -> Result<Vec<ServerFlags>, SyncError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
     let command = format!("UID FETCH {from_uid}:{to_uid} (UID FLAGS)");
     let mut flags = Vec::new();
     run_uid_fetch(session, &command, |attributes| {
-        let (uid, seen, _) = read_fetch(attributes);
+        let (uid, read, _) = read_fetch(attributes);
         if let Some(uid) = uid.filter(|uid| (from_uid..=to_uid).contains(uid)) {
-            flags.push((uid, seen));
+            flags.push(ServerFlags {
+                uid,
+                seen: read.seen,
+                flagged: read.flagged,
+            });
         }
     })
     .await?;
     Ok(flags)
+}
+
+/// The size (RFC822.SIZE) of every message with a UID in
+/// `from_uid..=to_uid`.
+async fn fetch_sizes_range<T>(
+    session: &mut Session<T>,
+    from_uid: u32,
+    to_uid: u32,
+) -> Result<Vec<(u32, u32)>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let command = format!("UID FETCH {from_uid}:{to_uid} (UID RFC822.SIZE)");
+    let mut sizes = Vec::new();
+    run_uid_fetch(session, &command, |attributes| {
+        let (uid, _, _) = read_fetch(attributes);
+        if let Some(uid) = uid.filter(|uid| (from_uid..=to_uid).contains(uid))
+            && let Some(size) = size_of(attributes)
+        {
+            sizes.push((uid, size));
+        }
+    })
+    .await?;
+    Ok(sizes)
+}
+
+/// The RFC822.SIZE of a FETCH answer, if it holds one.
+fn size_of(attributes: &[AttributeValue<'_>]) -> Option<u32> {
+    attributes.iter().find_map(|attribute| match attribute {
+        AttributeValue::Rfc822Size(size) => Some(*size),
+        _ => None,
+    })
 }
 
 /// The full raw message, without setting `\Seen` (BODY.PEEK).
@@ -415,17 +603,26 @@ where
     Ok(body)
 }
 
-/// UID, seen flag and body section (whole message or header) of one
-/// FETCH answer.
-fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, bool, Option<Vec<u8>>) {
+/// The flags of a FETCH answer that Avero keeps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReadFlags {
+    seen: bool,
+    flagged: bool,
+}
+
+/// UID, flags and body section (whole message or header) of one FETCH
+/// answer.
+fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, ReadFlags, Option<Vec<u8>>) {
     let mut uid = None;
-    let mut seen = false;
+    let mut read = ReadFlags::default();
     let mut data = None;
     for attribute in attributes {
         match attribute {
             AttributeValue::Uid(value) => uid = Some(*value),
             AttributeValue::Flags(flags) => {
-                seen = flags.iter().any(|flag| flag.eq_ignore_ascii_case(r"\Seen"));
+                let has = |name: &str| flags.iter().any(|flag| flag.eq_ignore_ascii_case(name));
+                read.seen = has(r"\Seen");
+                read.flagged = has(r"\Flagged");
             }
             AttributeValue::BodySection {
                 section: None | Some(SectionPath::Full(MessageSection::Header)),
@@ -437,20 +634,26 @@ fn read_fetch(attributes: &[AttributeValue<'_>]) -> (Option<u32>, bool, Option<V
             _ => {}
         }
     }
-    (uid, seen, data)
+    (uid, read, data)
 }
 
 /// Builds a `FetchedHeader` from the attributes of one FETCH answer.
 /// Returns `None` if the UID or the header block is missing.
 fn header_from_fetch(attributes: &[AttributeValue<'_>], from_uid: u32) -> Option<FetchedHeader> {
-    let (Some(uid), seen, Some(raw)) = read_fetch(attributes) else {
+    let (Some(uid), read, Some(raw)) = read_fetch(attributes) else {
         return None;
     };
     // `N:*` always returns the last message, even below N.
     if uid < from_uid {
         return None;
     }
-    Some(FetchedHeader { uid, seen, raw })
+    Some(FetchedHeader {
+        uid,
+        seen: read.seen,
+        flagged: read.flagged,
+        size: size_of(attributes),
+        raw,
+    })
 }
 
 /// Runs a command that only needs a tagged OK (STORE, COPY, EXPUNGE...).
@@ -478,6 +681,24 @@ where
     }
     let sign = if seen { '+' } else { '-' };
     let command = format!("UID STORE {} {sign}FLAGS.SILENT (\\Seen)", uid_set(uids));
+    run_checked(session, &command).await
+}
+
+/// Adds or removes `\Flagged` (the star) on the given messages of the
+/// selected folder.
+async fn store_flagged<T>(
+    session: &mut Session<T>,
+    uids: &[u32],
+    flagged: bool,
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let sign = if flagged { '+' } else { '-' };
+    let command = format!("UID STORE {} {sign}FLAGS.SILENT (\\Flagged)", uid_set(uids));
     run_checked(session, &command).await
 }
 
@@ -533,6 +754,30 @@ where
     }
 }
 
+/// Marks messages `\Deleted` and, with UIDPLUS only, expunges them (see
+/// `MailSource::discard`): never a plain EXPUNGE.
+async fn discard_uids<T>(
+    session: &mut Session<T>,
+    caps: ServerCaps,
+    uids: &[u32],
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if caps.uidplus {
+        return expunge_uids(session, caps, uids).await;
+    }
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let set = uid_set(uids);
+    run_checked(
+        session,
+        &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)"),
+    )
+    .await
+}
+
 /// Adds a raw message to `folder`, flagged `\Seen` if asked.
 async fn append_to<T>(
     session: &mut Session<T>,
@@ -544,6 +789,19 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
 {
     let flags = if seen { Some(r"(\Seen)") } else { None };
+    append_flagged(session, folder, raw, flags).await
+}
+
+/// Adds a raw message to `folder` with these flags (`(\Seen \Draft)`).
+async fn append_flagged<T>(
+    session: &mut Session<T>,
+    folder: &str,
+    raw: &[u8],
+    flags: Option<&str>,
+) -> Result<(), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
     let appending = async {
         session
             .append(folder, flags, None, raw)
@@ -551,6 +809,19 @@ where
             .map_err(command_error)
     };
     with_timeout(TRANSFER_TIMEOUT, "APPEND", appending).await
+}
+
+/// UID SEARCH for a Message-ID in the selected folder, sorted.
+async fn search_id<T>(session: &mut Session<T>, message_id: &str) -> Result<Vec<u32>, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let query = format!("HEADER Message-ID {}", quote_mailbox(message_id)?);
+    let searching = async { session.uid_search(query).await.map_err(command_error) };
+    let found = with_timeout(COMMAND_TIMEOUT, "UID SEARCH", searching).await?;
+    let mut uids: Vec<u32> = found.into_iter().collect();
+    uids.sort_unstable();
+    Ok(uids)
 }
 
 /// Sends CREATE for `path`, quoted.
@@ -571,6 +842,213 @@ fn quote_mailbox(name: &str) -> Result<String, SyncError> {
         "\"{}\"",
         name.replace('\\', "\\\\").replace('"', "\\\"")
     ))
+}
+
+/// A connection of its own that watches the inbox: IDLE when the server
+/// has it (renewed every [`IDLE_RENEW`]), else a STATUS of the inbox
+/// every [`POLL_EVERY`].
+pub struct ImapWatch {
+    /// `None` once the connection is given up (a wait was cancelled or
+    /// failed half-way).
+    session: Option<Session<TlsStream<TcpStream>>>,
+    idle: bool,
+    /// The size of the inbox as last seen (with IDLE).
+    count: InboxCount,
+    /// What the last poll saw (without IDLE).
+    last: Option<InboxState>,
+}
+
+impl ImapWatch {
+    /// Connects and logs in like [`ImapSource::connect`]; with IDLE, the
+    /// inbox is opened read-only (EXAMINE) to be watched.
+    pub async fn connect(cfg: &ServerConfig, creds: &Credentials) -> Result<ImapWatch, SyncError> {
+        let ImapSource { mut session, caps } = ImapSource::connect(cfg, creds).await?;
+        let mut count = InboxCount::default();
+        if caps.idle {
+            count = examine_inbox(&mut session).await?;
+        }
+        Ok(ImapWatch {
+            session: Some(session),
+            idle: caps.idle,
+            count,
+            last: None,
+        })
+    }
+
+    /// Whether the server announced IDLE (else the inbox is polled).
+    pub fn uses_idle(&self) -> bool {
+        self.idle
+    }
+}
+
+impl InboxWatch for ImapWatch {
+    async fn wait(&mut self) -> Result<Change, SyncError> {
+        let Some(mut session) = self.session.take() else {
+            return Err(SyncError::Connect("connection given up".to_string()));
+        };
+        let change = if self.idle {
+            let (back, change) = idle_once(session, IDLE_RENEW, &mut self.count).await?;
+            session = back;
+            change
+        } else {
+            poll_once(&mut session, &mut self.last, POLL_EVERY).await?
+        };
+        self.session = Some(session);
+        Ok(change)
+    }
+}
+
+/// Opens the inbox read-only, so that IDLE reports its changes. Returns
+/// its size.
+async fn examine_inbox<T>(session: &mut Session<T>) -> Result<InboxCount, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let examining = async { session.examine("INBOX").await.map_err(command_error) };
+    let mailbox = with_timeout(COMMAND_TIMEOUT, "EXAMINE", examining).await?;
+    Ok(InboxCount {
+        exists: mailbox.exists,
+        recent: mailbox.recent,
+    })
+}
+
+/// What a response of the server says about the watched inbox.
+fn news_of(response: &Response) -> InboxNews {
+    match response {
+        Response::MailboxData(MailboxDatum::Exists(n)) => InboxNews::Exists(*n),
+        Response::MailboxData(MailboxDatum::Recent(n)) => InboxNews::Recent(*n),
+        Response::Expunge(_) | Response::Vanished { .. } => InboxNews::Expunge,
+        Response::Fetch(..) => InboxNews::Fetch,
+        _ => InboxNews::Other,
+    }
+}
+
+/// The responses the library set aside (those that came with a command,
+/// or after the first piece of news of an IDLE), in order.
+fn set_aside<T>(session: &mut Session<T>) -> Vec<InboxNews>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let mut news = Vec::new();
+    while let Ok(response) = session.unsolicited_responses.try_recv() {
+        news.push(match response {
+            UnsolicitedResponse::Exists(n) => InboxNews::Exists(n),
+            UnsolicitedResponse::Recent(n) => InboxNews::Recent(n),
+            UnsolicitedResponse::Expunge(_) => InboxNews::Expunge,
+            UnsolicitedResponse::Other(data) => news_of(data.parsed()),
+            _ => InboxNews::Other,
+        });
+    }
+    news
+}
+
+/// Sends IDLE and waits for any news from the server, at most `limit`
+/// (the server's keep-alive lines are not news), then sends DONE. Gives
+/// the session back for the next round. What the news mean is judged
+/// against `count`, the size of the inbox seen so far (see
+/// `InboxCount::change`), which is kept up to date.
+async fn idle_once<T>(
+    mut session: Session<T>,
+    limit: Duration,
+    count: &mut InboxCount,
+) -> Result<(Session<T>, Change), SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    // News that came between two rounds.
+    let before = count.change(&set_aside(&mut session));
+    if before != Change::Quiet {
+        return Ok((session, before));
+    }
+    let mut handle = session.idle();
+    let starting = async { handle.init().await.map_err(command_error) };
+    with_timeout(COMMAND_TIMEOUT, "IDLE", starting).await?;
+    let mut news = {
+        // Dropping `_stop` would end the wait at once: keep it alive.
+        let (waiting, _stop) = handle.wait_with_timeout(limit);
+        // The library's own limit starts again after every keep-alive
+        // line; this one makes sure IDLE is renewed in time.
+        match timeout(limit, waiting).await {
+            Err(_) | Ok(Ok(IdleResponse::Timeout)) => Vec::new(),
+            Ok(Ok(IdleResponse::NewData(data))) => vec![news_of(data.parsed())],
+            // Since `_stop` is kept, only the end of the connection
+            // stops the wait this way.
+            Ok(Ok(IdleResponse::ManualInterrupt)) => {
+                return Err(SyncError::Connect(
+                    "connection lost during IDLE".to_string(),
+                ));
+            }
+            Ok(Err(error)) => return Err(command_error(error)),
+        }
+    };
+    let ending = async { handle.done().await.map_err(command_error) };
+    let mut session = with_timeout(COMMAND_TIMEOUT, "DONE", ending).await?;
+    // What came after the first piece of news, until DONE was answered.
+    news.extend(set_aside(&mut session));
+    Ok((session, count.change(&news)))
+}
+
+/// What a STATUS of the inbox says, compared from one poll to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InboxState {
+    exists: u32,
+    uid_next: Option<u32>,
+    uid_validity: Option<u32>,
+}
+
+async fn inbox_state<T>(session: &mut Session<T>) -> Result<InboxState, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    let asking = async {
+        session
+            .status("INBOX", "(MESSAGES UIDNEXT UIDVALIDITY)")
+            .await
+            .map_err(command_error)
+    };
+    let mailbox = with_timeout(COMMAND_TIMEOUT, "STATUS", asking).await?;
+    Ok(InboxState {
+        exists: mailbox.exists,
+        uid_next: mailbox.uid_next,
+        uid_validity: mailbox.uid_validity,
+    })
+}
+
+/// Without IDLE: waits `every`, then asks the inbox's STATUS and
+/// compares it with the one before (the first call takes note first).
+async fn poll_once<T>(
+    session: &mut Session<T>,
+    last: &mut Option<InboxState>,
+    every: Duration,
+) -> Result<Change, SyncError>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Debug + Send,
+{
+    if last.is_none() {
+        *last = Some(inbox_state(session).await?);
+    }
+    tokio::time::sleep(every).await;
+    let now = inbox_state(session).await?;
+    let Some(before) = last.replace(now) else {
+        return Ok(Change::Quiet);
+    };
+    Ok(compare_states(before, now))
+}
+
+/// What changed in the inbox between two polls: new mail if it holds
+/// more messages, got a new UID or new UIDs altogether; otherwise a
+/// deletion if its size changed.
+fn compare_states(before: InboxState, now: InboxState) -> Change {
+    if now.uid_validity != before.uid_validity
+        || now.exists > before.exists
+        || now.uid_next > before.uid_next
+    {
+        Change::Arrived
+    } else if now != before {
+        Change::Updated
+    } else {
+        Change::Quiet
+    }
 }
 
 impl MailSource for ImapSource {
@@ -635,8 +1113,17 @@ impl MailSource for ImapSource {
         &mut self,
         from_uid: u32,
         to_uid: u32,
-    ) -> Result<Vec<(u32, bool)>, SyncError> {
+    ) -> Result<Vec<ServerFlags>, SyncError> {
         let fetching = fetch_flags_range(&mut self.session, from_uid, to_uid);
+        with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
+    }
+
+    async fn fetch_sizes(
+        &mut self,
+        from_uid: u32,
+        to_uid: u32,
+    ) -> Result<Vec<(u32, u32)>, SyncError> {
+        let fetching = fetch_sizes_range(&mut self.session, from_uid, to_uid);
         with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
 
@@ -649,6 +1136,10 @@ impl MailSource for ImapSource {
         store_seen(&mut self.session, uids, seen).await
     }
 
+    async fn set_flagged(&mut self, uids: &[u32], flagged: bool) -> Result<(), SyncError> {
+        store_flagged(&mut self.session, uids, flagged).await
+    }
+
     async fn move_to(&mut self, uids: &[u32], dest: &str) -> Result<(), SyncError> {
         move_uids(&mut self.session, self.caps, uids, dest).await
     }
@@ -657,8 +1148,29 @@ impl MailSource for ImapSource {
         expunge_uids(&mut self.session, self.caps, uids).await
     }
 
+    async fn discard(&mut self, uids: &[u32]) -> Result<(), SyncError> {
+        discard_uids(&mut self.session, self.caps, uids).await
+    }
+
     async fn append(&mut self, folder: &str, raw: &[u8], seen: bool) -> Result<(), SyncError> {
         append_to(&mut self.session, folder, raw, seen).await
+    }
+
+    async fn append_draft(&mut self, folder: &str, raw: &[u8]) -> Result<(), SyncError> {
+        append_flagged(&mut self.session, folder, raw, Some(r"(\Seen \Draft)")).await
+    }
+
+    async fn search_message_id(&mut self, message_id: &str) -> Result<Vec<u32>, SyncError> {
+        search_id(&mut self.session, message_id).await
+    }
+
+    async fn search_text(&mut self, query: &str) -> Result<Vec<u32>, SyncError> {
+        search_text(&mut self.session, query).await
+    }
+
+    async fn fetch_headers_of(&mut self, uids: &[u32]) -> Result<Vec<FetchedHeader>, SyncError> {
+        let fetching = fetch_headers_of(&mut self.session, uids);
+        with_timeout(FETCH_TIMEOUT, "UID FETCH", fetching).await
     }
 }
 
@@ -752,7 +1264,8 @@ mod tests {
     /// One FETCH answer carrying `header` as a literal.
     fn fetch_line(seq: u32, uid: u32, flags: &str, header: &str) -> String {
         format!(
-            "* {seq} FETCH (UID {uid} FLAGS ({flags}) BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            "* {seq} FETCH (UID {uid} FLAGS ({flags}) RFC822.SIZE {} BODY[HEADER] {{{}}}\r\n{header})\r\n",
+            uid * 100,
             header.len()
         )
     }
@@ -806,6 +1319,8 @@ mod tests {
         assert!(headers[0].seen);
         assert!(!headers[1].seen);
         assert_eq!(headers[0].raw, header.as_bytes());
+        assert_eq!(headers[0].size, Some(500));
+        assert_eq!(headers[0].parse().size, Some(500));
     }
 
     #[tokio::test]
@@ -929,23 +1444,25 @@ mod tests {
             caps,
             ServerCaps {
                 move_command: true,
-                uidplus: true
+                uidplus: true,
+                idle: true,
             }
         );
     }
 
     #[tokio::test]
-    async fn fetch_flags_reads_seen_in_the_range_only() {
+    async fn fetch_flags_reads_seen_and_star_in_the_range_only() {
         let reply = "* 1 FETCH (UID 3 FLAGS (\\Seen))\r\n\
                      * 2 FETCH (UID 7 FLAGS (\\Answered \\Seen))\r\n\
-                     * 3 FETCH (UID 9 FLAGS ())\r\n\
+                     * 3 FETCH (UID 9 FLAGS (\\flagged))\r\n\
                      * 4 FETCH (UID 12 FLAGS ())\r\n\
                      {tag} OK done\r\n";
         let (mut session, server) = session_recording(vec![reply]).await;
 
         let flags = fetch_flags_range(&mut session, 5, 10).await.unwrap();
 
-        assert_eq!(flags, vec![(7, true), (9, false)]);
+        let flag = |uid, seen, flagged| ServerFlags { uid, seen, flagged };
+        assert_eq!(flags, vec![flag(7, true, false), flag(9, false, true)]);
         let sent = commands(session, server).await;
         assert_eq!(sent, vec!["UID FETCH 5:10 (UID FLAGS)"]);
     }
@@ -955,7 +1472,7 @@ mod tests {
         let header = "Subject: hello\r\n\r\n";
         let reply = format!(
             "{}{}{{tag}} OK done\r\n",
-            fetch_line(1999, 40_017, "", header),
+            fetch_line(1999, 40_017, r"\Flagged", header),
             fetch_line(2000, 90_123, r"\Seen", header),
         );
         let (mut session, server) = session_recording(vec![&reply]).await;
@@ -964,9 +1481,46 @@ mod tests {
 
         let uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
         assert_eq!(uids, vec![40_017, 90_123]);
-        assert!(headers[1].seen);
+        assert!(headers[1].seen && !headers[1].flagged);
+        assert!(!headers[0].seen && headers[0].flagged);
         let sent = commands(session, server).await;
-        assert_eq!(sent, vec!["FETCH 1999:2000 (UID FLAGS BODY.PEEK[HEADER])"]);
+        assert_eq!(
+            sent,
+            vec![format!(
+                "FETCH 1999:2000 (UID FLAGS RFC822.SIZE {})",
+                header_section()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_asks_only_the_needed_header_fields() {
+        let header = "Message-ID: <a@b>\r\nIn-Reply-To: <p@b>\r\n\r\n";
+        let reply = format!(
+            "* 1 FETCH (UID 4 FLAGS () BODY[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO)] {{{}}}\r\n{header})\r\n{{tag}} OK done\r\n",
+            header.len()
+        );
+        let (mut session, server) = session_recording(vec![&reply]).await;
+
+        let headers = fetch_headers_from(&mut session, 4, Some(9)).await.unwrap();
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].raw, header.as_bytes());
+        let sent = commands(session, server).await;
+        assert!(
+            sent[0].starts_with(
+                "UID FETCH 4:9 (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID "
+            ),
+            "{sent:?}"
+        );
+        for field in [
+            "REFERENCES",
+            "LIST-UNSUBSCRIBE-POST",
+            "CONTENT-TYPE",
+            "DELIVERED-TO",
+        ] {
+            assert!(sent[0].contains(field), "{field}: {sent:?}");
+        }
     }
 
     #[tokio::test]
@@ -988,6 +1542,7 @@ mod tests {
         let caps = ServerCaps {
             move_command: true,
             uidplus: true,
+            idle: false,
         };
         expunge_uids(&mut session, caps, &[4, 8]).await.unwrap();
         let sent = commands(session, server).await;
@@ -1040,6 +1595,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_flagged_stores_the_star_silently() {
+        let (mut session, server) = session_recording(vec![OK, OK]).await;
+        store_flagged(&mut session, &[3, 7], true).await.unwrap();
+        store_flagged(&mut session, &[3], false).await.unwrap();
+        store_flagged(&mut session, &[], true).await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec![
+                "UID STORE 3,7 +FLAGS.SILENT (\\Flagged)",
+                "UID STORE 3 -FLAGS.SILENT (\\Flagged)"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn refused_store_is_protocol_error() {
         let (mut session, _server) = session_recording(vec!["{tag} NO read-only\r\n"]).await;
         let result = store_seen(&mut session, &[1], true).await;
@@ -1052,6 +1623,7 @@ mod tests {
         let caps = ServerCaps {
             move_command: true,
             uidplus: true,
+            idle: false,
         };
         move_uids(&mut session, caps, &[3, 5], "[Gmail]/Corbeille")
             .await
@@ -1066,6 +1638,7 @@ mod tests {
         let caps = ServerCaps {
             move_command: false,
             uidplus: true,
+            idle: false,
         };
         move_uids(&mut session, caps, &[3], "Trash").await.unwrap();
         let sent = commands(session, server).await;
@@ -1090,6 +1663,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discarding_never_expunges_other_messages() {
+        let (mut session, server) = session_recording(vec![OK]).await;
+        discard_uids(&mut session, ServerCaps::default(), &[3, 4])
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID STORE 3,4 +FLAGS.SILENT (\\Deleted)"]);
+
+        let (mut session, server) = session_recording(vec![OK, OK]).await;
+        let caps = ServerCaps {
+            uidplus: true,
+            ..ServerCaps::default()
+        };
+        discard_uids(&mut session, caps, &[3]).await.unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec!["UID STORE 3 +FLAGS.SILENT (\\Deleted)", "UID EXPUNGE 3"]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_copy_stops_the_move() {
         let (mut session, server) =
             session_recording(vec!["{tag} NO [TRYCREATE] no such folder\r\n"]).await;
@@ -1111,6 +1706,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn draft_is_appended_seen_and_draft() {
+        let (mut session, server) = session_recording(vec!["+ go ahead\r\n", OK]).await;
+        append_flagged(&mut session, "Drafts", b"hello", Some(r"(\Seen \Draft)"))
+            .await
+            .unwrap();
+        let sent = commands(session, server).await;
+        assert_eq!(sent[0], r#"APPEND "Drafts" (\Seen \Draft) {5}"#);
+    }
+
+    #[tokio::test]
+    async fn message_id_search_lists_the_uids() {
+        let (mut session, server) =
+            session_recording(vec!["* SEARCH 12 4\r\n{tag} OK done\r\n"]).await;
+        let uids = search_id(&mut session, "<d1@ex.fr>").await.unwrap();
+        assert_eq!(uids, vec![4, 12]);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["UID SEARCH HEADER Message-ID \"<d1@ex.fr>\""]);
+    }
+
+    #[test]
+    fn search_criteria_ask_every_word_in_sender_subject_or_text() {
+        assert_eq!(
+            search_criteria("facture").as_deref(),
+            Some(r#"OR OR FROM "facture" SUBJECT "facture" BODY "facture""#)
+        );
+        assert_eq!(
+            search_criteria("  Marie   été ").as_deref(),
+            Some(concat!(
+                r#"OR OR FROM "Marie" SUBJECT "Marie" BODY "Marie" "#,
+                r#"OR OR FROM "été" SUBJECT "été" BODY "été""#
+            ))
+        );
+        // Nothing to look for.
+        assert_eq!(search_criteria("  - ** "), None);
+        assert_eq!(search_criteria(""), None);
+    }
+
+    #[test]
+    fn search_criteria_escape_quotes_and_drop_line_breaks() {
+        let criteria = search_criteria(r#"a"b\c"#).unwrap();
+        assert!(
+            criteria.starts_with(r#"OR OR FROM "a\"b\\c" "#),
+            "{criteria}"
+        );
+        // A line break would end the command: it never goes out.
+        let criteria = search_criteria("x\u{7}y").unwrap();
+        assert!(criteria.contains(r#""xy""#), "{criteria}");
+        assert!(!criteria.contains(['\r', '\n']));
+        // A long query is cut to its first words.
+        let long = "mot ".repeat(20);
+        assert_eq!(
+            search_criteria(&long).unwrap().matches("FROM").count(),
+            SEARCH_WORDS
+        );
+    }
+
+    #[tokio::test]
+    async fn text_search_announces_utf8_and_reads_the_uids() {
+        let (mut session, server) =
+            session_recording(vec!["* SEARCH 40 3 17\r\n{tag} OK done\r\n"]).await;
+        let uids = search_text(&mut session, "réunion").await.unwrap();
+        assert_eq!(uids, vec![3, 17, 40]);
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent[0],
+            r#"UID SEARCH CHARSET UTF-8 OR OR FROM "réunion" SUBJECT "réunion" BODY "réunion""#
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_charset_is_asked_again_without_it() {
+        let (mut session, server) = session_recording(vec![
+            "{tag} NO [BADCHARSET (US-ASCII)] unknown charset\r\n",
+            "* SEARCH 8\r\n{tag} OK done\r\n",
+        ])
+        .await;
+        let uids = search_text(&mut session, "budget").await.unwrap();
+        assert_eq!(uids, vec![8]);
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent[..2],
+            [
+                r#"UID SEARCH CHARSET UTF-8 OR OR FROM "budget" SUBJECT "budget" BODY "budget""#,
+                r#"UID SEARCH OR OR FROM "budget" SUBJECT "budget" BODY "budget""#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_refused_twice_is_a_protocol_error() {
+        let (mut session, _server) =
+            session_recording(vec!["{tag} BAD nope\r\n", "{tag} NO still not\r\n"]).await;
+        let result = search_text(&mut session, "budget").await;
+        assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_search_sends_nothing() {
+        let (mut session, server) = session_recording(vec![]).await;
+        assert!(search_text(&mut session, " ? ").await.unwrap().is_empty());
+        assert!(commands(session, server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn headers_of_scattered_uids_are_asked_in_one_fetch() {
+        let header = "Subject: hi\r\n\r\n";
+        let reply = format!(
+            "{}{}{{tag}} OK done\r\n",
+            fetch_line(1, 5, "", header),
+            fetch_line(2, 900, "\\Seen", header)
+        );
+        let (mut session, server) = session_recording(vec![&reply]).await;
+        let headers = fetch_headers_of(&mut session, &[900, 5]).await.unwrap();
+        let uids: Vec<u32> = headers.iter().map(|h| h.uid).collect();
+        assert_eq!(uids, vec![5, 900]);
+        assert!(headers[1].seen);
+        let sent = commands(session, server).await;
+        assert!(
+            sent[0].starts_with("UID FETCH 900,5 (UID FLAGS"),
+            "{}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
     async fn create_sends_a_quoted_name() {
         let (mut session, server) = session_recording(vec![OK]).await;
         create_mailbox(&mut session, "Mes \"dossiers\"")
@@ -1126,6 +1846,121 @@ mod tests {
             session_recording(vec!["{tag} NO [ALREADYEXISTS] exists\r\n"]).await;
         let result = create_mailbox(&mut session, "Trash").await;
         assert!(matches!(result, Err(SyncError::Protocol(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn idle_wakes_up_on_new_data_and_ends_with_done() {
+        let (session, server) = session_recording(vec![
+            "+ idling\r\n* 5 EXISTS\r\n",
+            "{tag} OK IDLE terminated\r\n",
+        ])
+        .await;
+        let mut count = InboxCount {
+            exists: 4,
+            recent: 0,
+        };
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Arrived);
+        assert_eq!(count.exists, 5);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["IDLE", "DONE"]);
+    }
+
+    #[tokio::test]
+    async fn idle_tells_flag_changes_from_new_mail() {
+        // Marked read elsewhere (or by Avero's own session), then a
+        // message expunged and one arrived while DONE was on its way.
+        let (session, server) = session_recording(vec![
+            "+ idling\r\n* 2 FETCH (FLAGS (\\Seen))\r\n",
+            "{tag} OK IDLE terminated\r\n",
+            "+ idling\r\n* 3 EXPUNGE\r\n",
+            "* 5 EXISTS\r\n{tag} OK IDLE terminated\r\n",
+        ])
+        .await;
+        let mut count = InboxCount {
+            exists: 5,
+            recent: 0,
+        };
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Updated);
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Arrived);
+        assert_eq!(count.exists, 5);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["IDLE", "DONE", "IDLE", "DONE"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_is_renewed_after_its_limit() {
+        // A keep-alive line is not news (time is simulated).
+        let (session, server) = session_recording(vec![
+            "+ idling\r\n* OK still here\r\n",
+            "{tag} OK IDLE terminated\r\n",
+        ])
+        .await;
+        let mut count = InboxCount::default();
+        let (session, change) = idle_once(session, IDLE_RENEW, &mut count).await.unwrap();
+        assert_eq!(change, Change::Quiet);
+        let sent = commands(session, server).await;
+        assert_eq!(sent, vec!["IDLE", "DONE"]);
+    }
+
+    #[tokio::test]
+    async fn idle_on_a_closed_connection_is_a_connect_error() {
+        // A server that accepts IDLE, then hangs up.
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_side);
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"* OK ready\r\n").await.unwrap();
+            let login = lines.next_line().await.unwrap().unwrap();
+            let tag = login.split(' ').next().unwrap().to_string();
+            write
+                .write_all(format!("{tag} OK logged in\r\n").as_bytes())
+                .await
+                .unwrap();
+            lines.next_line().await.unwrap().unwrap();
+            write.write_all(b"+ idling\r\n").await.unwrap();
+        });
+        let mut client = Client::new(client_side);
+        client.read_response().await.unwrap().unwrap();
+        let session = login(client, "user", "pw").await.unwrap();
+        let result = idle_once(session, IDLE_RENEW, &mut InboxCount::default()).await;
+        assert!(
+            matches!(result, Err(SyncError::Connect(_))),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_compares_the_inbox_status() {
+        let status = |messages: u32, next: u32| {
+            format!(
+                "* STATUS INBOX (MESSAGES {messages} UIDNEXT {next} UIDVALIDITY 1)\r\n{{tag}} OK\r\n"
+            )
+        };
+        let (first, same, more, fewer) =
+            (status(2, 10), status(2, 10), status(3, 11), status(2, 11));
+        let (mut session, server) = session_recording(vec![&first, &same, &more, &fewer]).await;
+        let mut last = None;
+        let quiet = poll_once(&mut session, &mut last, POLL_EVERY)
+            .await
+            .unwrap();
+        assert_eq!(quiet, Change::Quiet);
+        let changed = poll_once(&mut session, &mut last, POLL_EVERY)
+            .await
+            .unwrap();
+        assert_eq!(changed, Change::Arrived);
+        let deleted = poll_once(&mut session, &mut last, POLL_EVERY)
+            .await
+            .unwrap();
+        assert_eq!(deleted, Change::Updated);
+        let sent = commands(session, server).await;
+        assert_eq!(
+            sent,
+            vec!["STATUS \"INBOX\" (MESSAGES UIDNEXT UIDVALIDITY)"; 4]
+        );
     }
 
     #[test]

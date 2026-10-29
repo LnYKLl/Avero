@@ -1,15 +1,103 @@
 //! The message list, the reading pane and the actions on a message.
 
-use super::{App, Body, Message, Overlay, PAGE, RELOAD_EVERY, Reading};
+use super::{App, Body, Entry, Message, Overlay, PAGE, RELOAD_EVERY, Reading};
 use crate::background::{self, OpenedBody};
 use crate::compose::Mode;
 use crate::worker::{Destination, Event, Job};
-use avero_core::{AccountFilter, AccountId, FolderRole, MessageRef, UnifiedItem};
+use avero_core::category::sender_key;
+use avero_core::{
+    AccountFilter, AccountId, Category, FolderRole, Listing, MessageRef, UnifiedItem,
+};
+
+use avero_core::store::Store;
 use iced::Task;
 use iced::widget::text_editor;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+
+/// The numbers of the side bar and of the inbox's tabs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// Unread items of each account's inbox.
+    unread: HashMap<AccountId, usize>,
+    snoozed: usize,
+    drafts: usize,
+    /// Unread items of each tab (none when the tabs are off).
+    tabs: HashMap<Category, usize>,
+}
+
+/// What `Counters` depend on, taken from the window's state.
+#[derive(Debug, Clone)]
+pub(super) struct CounterQuery {
+    accounts: Vec<AccountId>,
+    /// "Regrouper les conversations".
+    threads: bool,
+    /// The space shown (every account when none).
+    space: AccountFilter,
+    /// The accounts the list shows (the space, or one account).
+    scope: AccountFilter,
+    tabs: bool,
+}
+
+impl CounterQuery {
+    /// Counts on `store`; a count that fails gives 0.
+    fn count(&self, store: &Store) -> Counters {
+        let unread = self
+            .accounts
+            .iter()
+            .map(|&id| {
+                let only = AccountFilter::Only(id);
+                let count = if self.threads {
+                    store.unread_threads(FolderRole::Inbox, only)
+                } else {
+                    store.unread_count(FolderRole::Inbox, only)
+                };
+                (id, count.unwrap_or(0))
+            })
+            .collect();
+        let tabs = if self.tabs {
+            Category::ALL
+                .into_iter()
+                .map(|category| {
+                    let count =
+                        store.list_unread(&Listing::Tab(category), self.scope, self.threads);
+                    (category, count.unwrap_or(0))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        Counters {
+            unread,
+            snoozed: store
+                .list_count(&Listing::Snoozed, self.space, self.threads)
+                .unwrap_or(0),
+            drafts: store
+                .list_count(
+                    &Listing::Folder(FolderRole::Drafts),
+                    self.space,
+                    self.threads,
+                )
+                .unwrap_or(0),
+            tabs,
+        }
+    }
+}
+
+/// Counts on a thread of its own, with its own connection to the
+/// database, so that the window never waits for it. `None` if the
+/// database could not be opened (the numbers shown stay).
+async fn count_aside(path: PathBuf, query: CounterQuery) -> Option<Counters> {
+    let (sender, receiver) = oneshot::channel();
+    std::thread::spawn(move || {
+        let counted = Store::open(&path).ok().map(|store| query.count(&store));
+        let _ = sender.send(counted);
+    });
+    receiver.await.ok().flatten()
+}
 
 /// Delay between the last key typed in the search field and the search.
 const SEARCH_DELAY: Duration = Duration::from_millis(250);
@@ -19,6 +107,11 @@ impl App {
         match message {
             Message::FolderSelected(folder) => {
                 self.folder = folder;
+                self.starred = false;
+                self.snoozed = false;
+                self.scheduled = false;
+                self.sender = None;
+                self.tab = avero_core::Category::Important;
                 self.search_text.clear();
                 self.search_query = None;
                 self.screen = super::Screen::Mail;
@@ -27,6 +120,7 @@ impl App {
             }
             Message::FilterSelected(filter) => {
                 self.filter = filter;
+                self.screen = super::Screen::Mail;
                 self.load_first_page();
                 Task::none()
             }
@@ -55,28 +149,41 @@ impl App {
                 self.apply_search();
                 Task::none()
             }
-            Message::MessageSelected(index) => self.open(index),
+            Message::MessageSelected(index) => self.click_line(index),
+            Message::SelectAll(on) => {
+                self.select_all(on);
+                Task::none()
+            }
             Message::LoadMore => {
                 self.items = self.fetch(self.items.len() + PAGE);
                 Task::none()
             }
-            Message::ReaderAction(action) => {
+            Message::ReaderAction(entry, action) => {
                 // Read-only: selection and scrolling, never edits.
                 if !action.is_edit()
-                    && let Some(Reading {
-                        body: Body::Ready { content, .. },
+                    && let Some(reading) = &mut self.reading
+                    && let Some(Entry {
+                        body: Body::Ready { content, marks, .. },
                         ..
-                    }) = &mut self.reading
+                    }) = reading.entries.get_mut(entry)
                 {
+                    let click = matches!(action, text_editor::Action::Click(_));
                     content.perform(action);
+                    // A click (not a drag) on a link opens it.
+                    let at = content.cursor().position;
+                    if click && let Some(url) = marks.link_at(at.line, at.column) {
+                        return Task::done(Message::OpenUrl(url.to_string()));
+                    }
                 }
                 Task::none()
             }
+            Message::EntryToggled(entry) => self.toggle_entry(entry),
             Message::Answer(mode) => self.answer(mode),
             Message::Archive => self.move_selected(Destination::Archive),
             Message::Delete => self.move_selected(Destination::Trash),
-            Message::MarkUnread => self.mark_unread(),
-            Message::SaveAttachment(index) => self.save_attachment(index),
+            Message::MarkRead => self.mark_seen(true),
+            Message::MarkUnread => self.mark_seen(false),
+            Message::SaveAttachment(entry, index) => self.save_attachment(entry, index),
             Message::AttachmentSaved(result) => match result {
                 Ok(Some(name)) => self.toast(format!("Enregistré : {name}"), false),
                 Ok(None) => Task::none(),
@@ -86,16 +193,22 @@ impl App {
         }
     }
 
+    /// A search replaces "Mails de X" (it looks everywhere anyway).
     fn apply_search(&mut self) {
         let query = self.search_text.trim();
         self.search_query = (!query.is_empty()).then(|| query.to_string());
+        if self.search_query.is_some() {
+            self.sender = None;
+        }
         self.load_first_page();
     }
 
     /// Shows the first page for the current folder, filter and search,
     /// with nothing selected.
     pub(super) fn load_first_page(&mut self) {
+        self.forget_stale_server_search();
         self.selected = None;
+        self.clear_checked();
         self.reading = None;
         self.items = self.fetch(PAGE);
         self.refresh_unread();
@@ -106,13 +219,37 @@ impl App {
     pub(super) fn reload(&mut self) {
         let pages = self.items.len().div_ceil(PAGE).max(1);
         self.items = self.fetch(pages * PAGE);
+        self.follow_thread();
+        self.prune_checked();
         self.refresh_unread();
+    }
+
+    /// When a message joins or leaves the conversation being read, its
+    /// line in the list has other rows: the selection follows it.
+    fn follow_thread(&mut self) {
+        if self.selected_index().is_some() {
+            return;
+        }
+        let Some(reading) = &mut self.reading else {
+            return;
+        };
+        let Some(thread) = reading.thread else {
+            return;
+        };
+        if let Some(item) = self.items.iter().find(|i| i.thread_id == Some(thread)) {
+            reading.rows = item.row_ids.clone();
+            reading.accounts = item.accounts.clone();
+            self.selected = Some(item.row_ids.clone());
+        }
     }
 
     /// `reload`, and remember when (for `reload_soon`).
     pub(super) fn reload_now(&mut self) {
         self.last_reload = Some(Instant::now());
         self.reload();
+        if self.screen == super::Screen::Cleanup {
+            self.refresh_cleanup();
+        }
     }
 
     /// Reload for sync progress: at most once per [`RELOAD_EVERY`]; a
@@ -138,10 +275,25 @@ impl App {
 
     /// The first `limit` items for the current view; on a database error
     /// logs it and returns nothing so the window keeps working.
+    ///
+    /// With "Regrouper les conversations" on, one item per conversation;
+    /// search results and a sender's mail stay one item per message.
     fn fetch(&self, limit: usize) -> Vec<UnifiedItem> {
+        if self.scheduled_shown() {
+            return Vec::new();
+        }
         let result = match &self.search_query {
-            Some(query) => self.store.search(query, None, self.filter, limit),
-            None => self.store.unified(self.folder, self.filter, limit, 0),
+            Some(query) => {
+                self.store
+                    .search_with(query, None, self.scope(), &self.server_rows, limit)
+            }
+            None => self.store.list(
+                &self.listing(),
+                self.scope(),
+                self.lines_are_threads(),
+                limit,
+                0,
+            ),
         };
         result.unwrap_or_else(|e| {
             eprintln!("Impossible de lire la liste : {e}");
@@ -149,6 +301,9 @@ impl App {
         })
     }
 
+    /// Reads the side bar's numbers again. With a database file, they are
+    /// counted aside (see `count_aside`) once the current message is
+    /// handled; with the demo's database in memory, at once.
     fn refresh_unread(&mut self) {
         self.trash_accounts = self
             .accounts
@@ -167,17 +322,54 @@ impl App {
                 Ok(Some(_))
             )
         });
-        self.unread = self
-            .accounts
-            .iter()
-            .map(|a| {
-                let count = self
-                    .store
-                    .unread_count(FolderRole::Inbox, AccountFilter::Only(a.id))
-                    .unwrap_or(0);
-                (a.id, count)
-            })
-            .collect();
+        let query = CounterQuery {
+            accounts: self.accounts.iter().map(|a| a.id).collect(),
+            threads: self.settings.group_threads,
+            space: match self.space {
+                Some(id) => AccountFilter::Space(id),
+                None => AccountFilter::All,
+            },
+            scope: self.scope(),
+            tabs: self.settings.inbox_tabs,
+        };
+        match &self.backend {
+            super::Backend::Live { .. } => self.counters_wanted = Some(query),
+            super::Backend::Demo => {
+                let counted = query.count(&self.store);
+                self.show_counters(counted);
+            }
+        }
+    }
+
+    /// Starts counting aside what `refresh_unread` asked for, if anything.
+    pub(super) fn count_wanted(&mut self) -> Task<Message> {
+        let Some(query) = self.counters_wanted.take() else {
+            return Task::none();
+        };
+        let super::Backend::Live { db_path, .. } = &self.backend else {
+            return Task::none();
+        };
+        self.counters_generation += 1;
+        let generation = self.counters_generation;
+        Task::perform(count_aside(db_path.clone(), query), move |counted| {
+            Message::Counted(generation, counted)
+        })
+    }
+
+    /// Numbers counted aside: shown unless newer ones are on their way.
+    pub(super) fn counted(&mut self, generation: u64, counted: Option<Counters>) {
+        if generation == self.counters_generation
+            && let Some(counted) = counted
+        {
+            self.show_counters(counted);
+        }
+    }
+
+    fn show_counters(&mut self, counted: Counters) {
+        self.unread = counted.unread;
+        self.snoozed_count = counted.snoozed;
+        self.drafts_count = counted.drafts;
+        self.tab_unread = counted.tabs;
     }
 
     /// Index of the selected item in the list.
@@ -191,7 +383,8 @@ impl App {
         self.selected_index().map(|i| &self.items[i])
     }
 
-    /// J/K: moves the selection down (`1`) or up (`-1`).
+    /// J/K: moves the selection down (`1`) or up (`-1`). While lines are
+    /// checked, only the keyboard's line moves (for `x`).
     pub(super) fn step_selection(&mut self, step: isize) -> Task<Message> {
         if self.items.is_empty() {
             return Task::none();
@@ -200,29 +393,83 @@ impl App {
             Some(i) => i.saturating_add_signed(step).min(self.items.len() - 1),
             None => 0,
         };
+        if !self.checked.is_empty() {
+            self.move_cursor(self.items[next].row_ids.clone());
+            return Task::none();
+        }
         self.open(next)
     }
 
+    /// Entrée: opens the keyboard's line (the first one if none), and
+    /// forgets the checked lines.
+    pub(super) fn open_current(&mut self) -> Task<Message> {
+        self.clear_checked();
+        self.open(self.selected_index().unwrap_or(0))
+    }
+
     /// Selects an item: shows its body (cached, or downloaded in the
-    /// background) and marks it read, locally first.
-    fn open(&mut self, index: usize) -> Task<Message> {
+    /// background) and marks it read, locally first. A conversation shows
+    /// all its messages, the newest unfolded; the others are loaded when
+    /// unfolded.
+    pub(super) fn open(&mut self, index: usize) -> Task<Message> {
+        if self.folder == FolderRole::Drafts && self.in_folder() {
+            return self.open_draft_line(index);
+        }
         let Some(item) = self.items.get(index).cloned() else {
             return Task::none();
         };
-        self.selected = Some(item.row_ids.clone());
-        let Some(&row) = item.row_ids.first() else {
-            return Task::none();
-        };
-        let mut tasks = Vec::new();
-        match self.store.body(row) {
-            Ok(Some((raw, _))) => tasks.push(parse_task(row, raw)),
-            _ => tasks.push(self.fetch_body(row)),
+        // A quick reply belongs to the conversation it was typed under.
+        if self.reading.as_ref().is_none_or(|r| r.rows != item.row_ids) {
+            self.quick_reply = super::QuickReply::default();
+            self.quick_generation += 1;
         }
+        self.selected = Some(item.row_ids.clone());
+        if item.row_ids.is_empty() {
+            return Task::none();
+        }
+        let mut messages = match item.thread_id {
+            Some(thread) if item.count > 1 => self
+                .store
+                .thread_messages(thread, self.reading_role(), self.scope())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if messages.is_empty() {
+            messages.push(item.clone());
+        }
+        let newest = messages.len() - 1;
+        // Who the conversation is from: its newest message by someone
+        // else (the user's own answers say nothing about the list).
+        let own: Vec<String> = self.accounts.iter().map(|a| sender_key(&a.email)).collect();
+        let from = messages
+            .iter()
+            .rev()
+            .find(|m| !own.contains(&sender_key(&m.from_addr)))
+            .unwrap_or(&messages[newest]);
+        let from_row = from.row_ids.first().copied();
+        let sender = from.from_addr.clone();
+        let account = from.accounts.first().or(item.accounts.first()).copied();
+        let category = from_row.and_then(|row| self.store.category(row).ok().flatten());
+        let unsubscribe = from_row
+            .and_then(|row| self.unsubscribe_offer(row, &sender, &from.from_display, account));
         self.reading = Some(Reading {
             rows: item.row_ids.clone(),
             accounts: item.accounts.clone(),
-            body: Body::Loading,
+            thread: item.thread_id,
+            entries: messages
+                .into_iter()
+                .map(|message| Entry {
+                    item: message,
+                    expanded: false,
+                    body: Body::NotLoaded,
+                })
+                .collect(),
+            focus: newest,
+            sender,
+            category,
+            unsubscribe,
         });
+        let mut tasks = vec![self.unfold(newest)];
         if !item.seen {
             let _ = self.store.set_seen(&item.row_ids, true);
             self.reload();
@@ -231,7 +478,51 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn fetch_body(&self, row: i64) -> Task<Message> {
+    /// Unfolds a message of the reader and makes it the one Reply and
+    /// Forward answer; its body is loaded the first time.
+    fn unfold(&mut self, index: usize) -> Task<Message> {
+        let Some(reading) = &mut self.reading else {
+            return Task::none();
+        };
+        let Some(entry) = reading.entries.get_mut(index) else {
+            return Task::none();
+        };
+        entry.expanded = true;
+        reading.focus = index;
+        if !matches!(entry.body, Body::NotLoaded) {
+            return Task::none();
+        }
+        let Some(&row) = entry.item.row_ids.first() else {
+            return Task::none();
+        };
+        entry.body = Body::Loading;
+        match self.store.body(row) {
+            Ok(Some((raw, _))) => parse_task(row, raw),
+            _ => self.fetch_body(row),
+        }
+    }
+
+    /// A click on a message of the conversation: unfolds it, or folds it
+    /// back (one message always stays unfolded).
+    fn toggle_entry(&mut self, index: usize) -> Task<Message> {
+        let Some(reading) = &mut self.reading else {
+            return Task::none();
+        };
+        let unfolded = reading.entries.iter().filter(|e| e.expanded).count();
+        match reading.entries.get_mut(index) {
+            Some(entry) if entry.expanded && unfolded > 1 => {
+                entry.expanded = false;
+                if let Some(last) = reading.entries.iter().rposition(|e| e.expanded) {
+                    reading.focus = last;
+                }
+                Task::none()
+            }
+            Some(entry) if !entry.expanded => self.unfold(index),
+            _ => Task::none(),
+        }
+    }
+
+    pub(super) fn fetch_body(&self, row: i64) -> Task<Message> {
         let Some(target) = self.refs(&[row]).into_iter().next() else {
             return Task::none();
         };
@@ -239,53 +530,90 @@ impl App {
         self.request(account, |reply| Job::FetchBody { target, reply })
     }
 
+    /// The reader entry waiting for the body of `row`, if any.
+    fn entry_for(&mut self, row: i64) -> Option<&mut Entry> {
+        self.reading
+            .as_mut()?
+            .entries
+            .iter_mut()
+            .find(|entry| entry.item.row_ids.first() == Some(&row))
+    }
+
     /// Called when a worker cached a body: it is parsed off the UI thread.
     pub(super) fn body_arrived(&mut self, row: i64, result: Result<(), String>) -> Task<Message> {
-        let Some(reading) = &mut self.reading else {
+        let cached = match &result {
+            Ok(()) => self.store.body(row),
+            Err(_) => Ok(None),
+        };
+        // A draft waiting to open in the composer.
+        if self.pending_draft == Some(row) {
+            return match (result, cached) {
+                (Ok(()), Ok(Some((raw, _)))) => parse_task(row, raw),
+                (Err(e), _) => {
+                    self.pending_draft = None;
+                    self.toast(format!("Brouillon introuvable : {e}"), true)
+                }
+                _ => {
+                    self.pending_draft = None;
+                    Task::none()
+                }
+            };
+        }
+        let Some(entry) = self.entry_for(row) else {
             return Task::none();
         };
-        if reading.rows.first() != Some(&row) {
-            return Task::none();
-        }
-        match result {
-            Ok(()) => match self.store.body(row) {
-                Ok(Some((raw, _))) => return parse_task(row, raw),
-                _ => reading.body = Body::Failed("Le message n'a pas pu être lu".to_string()),
-            },
-            Err(e) => reading.body = Body::Failed(e),
+        match (result, cached) {
+            (Ok(()), Ok(Some((raw, _)))) => return parse_task(row, raw),
+            (Ok(()), _) => entry.body = Body::Failed("Le message n'a pas pu être lu".to_string()),
+            (Err(e), _) => entry.body = Body::Failed(e),
         }
         Task::none()
     }
 
-    /// A parsed body is ready: show it if it is still the one being read.
-    pub(super) fn body_parsed(&mut self, row: i64, result: Result<Arc<OpenedBody>, String>) {
-        let Some(reading) = &mut self.reading else {
-            return;
-        };
-        if reading.rows.first() != Some(&row) {
-            return;
+    /// A parsed body is ready: show it if its message is still in the
+    /// reader.
+    pub(super) fn body_parsed(
+        &mut self,
+        row: i64,
+        result: Result<Arc<OpenedBody>, String>,
+    ) -> Task<Message> {
+        if self.pending_draft == Some(row) {
+            return match result {
+                Ok(opened) => self.open_parsed_draft(row, &opened),
+                Err(e) => {
+                    self.pending_draft = None;
+                    self.toast(format!("Brouillon illisible : {e}"), true)
+                }
+            };
         }
-        reading.body = match result {
+        let Some(entry) = self.entry_for(row) else {
+            return Task::none();
+        };
+        entry.body = match result {
             Ok(opened) => ready_body(opened),
             Err(e) => Body::Failed(e),
         };
+        Task::none()
     }
 
-    /// A worker lost the job of the message being loaded.
+    /// A worker lost the jobs of the messages being loaded.
     pub(super) fn body_lost(&mut self) {
-        if let Some(reading) = &mut self.reading
-            && matches!(reading.body, Body::Loading)
-        {
-            reading.body = Body::Failed("Le message n'a pas pu être chargé".to_string());
+        let Some(reading) = &mut self.reading else {
+            return;
+        };
+        for entry in &mut reading.entries {
+            if matches!(entry.body, Body::Loading) {
+                entry.body = Body::Failed("Le message n'a pas pu être chargé".to_string());
+            }
         }
     }
 
-    fn refs(&self, rows: &[i64]) -> Vec<MessageRef> {
+    pub(super) fn refs(&self, rows: &[i64]) -> Vec<MessageRef> {
         self.store.message_refs(rows).unwrap_or_default()
     }
 
     /// Sends the seen flag to the servers, one job per account.
-    fn remote_seen(&self, rows: &[i64], seen: bool) -> Task<Message> {
+    pub(super) fn remote_seen(&self, rows: &[i64], seen: bool) -> Task<Message> {
         let groups = by_account(self.refs(rows));
         Task::batch(groups.into_iter().map(|(account, targets)| {
             self.request(account, |reply| Job::SetSeen {
@@ -296,29 +624,34 @@ impl App {
         }))
     }
 
-    fn mark_unread(&mut self) -> Task<Message> {
-        let Some(rows) = self.selected.clone() else {
+    /// Marks the selection read or unread, locally first, then on each
+    /// account's server (one job per account).
+    fn mark_seen(&mut self, seen: bool) -> Task<Message> {
+        let rows = self.action_rows();
+        if rows.is_empty() {
             return Task::none();
-        };
-        let _ = self.store.set_seen(&rows, false);
+        }
+        let _ = self.store.set_seen(&rows, seen);
         self.reload();
-        self.remote_seen(&rows, false)
+        self.remote_seen(&rows, seen)
     }
 
     /// Whether "Archiver" can be used on the selection: some account of
-    /// the message has a known archive folder.
+    /// its messages has a known archive folder.
     pub fn can_archive(&self) -> bool {
-        self.selected_item().is_some() && self.archive_problem().is_none()
+        !self.action_rows().is_empty() && self.archive_problem().is_none()
     }
 
     /// Why "Archiver" cannot be used, for its tooltip.
     pub fn archive_problem(&self) -> Option<&'static str> {
-        let item = self.selected_item()?;
-        if self.folder == FolderRole::Archive && self.search_query.is_none() {
+        let accounts = self.action_accounts();
+        if accounts.is_empty() {
+            return None;
+        }
+        if self.folder == FolderRole::Archive && self.in_folder() {
             return Some("Déjà dans les archives");
         }
-        let known: Vec<Option<bool>> = item
-            .accounts
+        let known: Vec<Option<bool>> = accounts
             .iter()
             .map(|id| self.status.get(id).and_then(|s| s.archive))
             .collect();
@@ -333,20 +666,18 @@ impl App {
 
     /// Whether "Supprimer" can be used on the selection.
     pub fn can_delete(&self) -> bool {
-        self.selected_item().is_some() && self.delete_problem().is_none()
+        !self.action_rows().is_empty() && self.delete_problem().is_none()
     }
 
     /// Why "Supprimer" cannot be used, for its tooltip.
     pub fn delete_problem(&self) -> Option<&'static str> {
-        let item = self.selected_item()?;
-        if item
-            .accounts
-            .iter()
-            .any(|id| self.trash_accounts.contains(id))
-        {
+        let accounts = self.action_accounts();
+        if accounts.is_empty() {
+            return None;
+        }
+        if accounts.iter().any(|id| self.trash_accounts.contains(id)) {
             None
-        } else if item
-            .accounts
+        } else if accounts
             .iter()
             .any(|id| self.status.get(id).and_then(|s| s.archive).is_none())
         {
@@ -359,10 +690,7 @@ impl App {
     /// Whether every copy of the selection is already in a trash folder
     /// (deleting it then means deleting it for good).
     pub fn selection_in_trash(&self) -> bool {
-        let Some(rows) = &self.selected else {
-            return false;
-        };
-        let refs = self.refs(rows);
+        let refs = self.refs(&self.action_rows());
         !refs.is_empty() && refs.iter().all(|r| self.is_trash_folder(r))
     }
 
@@ -373,55 +701,70 @@ impl App {
         )
     }
 
-    /// Archive or delete: hides the rows at once and selects the next
-    /// message; the rows are only removed when the server confirms (shown
+    /// Archive or delete (the checked lines, else the one read): hides
+    /// the rows at once and selects the next message; the rows are only removed when the server confirms (shown
     /// again otherwise). Messages already in the trash are deleted for
     /// good, after a confirmation.
     fn move_selected(&mut self, to: Destination) -> Task<Message> {
         let allowed = match to {
             Destination::Archive => self.can_archive(),
             Destination::Trash => self.can_delete(),
+            Destination::Junk | Destination::Inbox => true,
         };
-        let Some(rows) = self.selected.clone() else {
-            return Task::none();
-        };
-        if !allowed {
+        let rows = self.action_rows();
+        if rows.is_empty() || !allowed {
             return Task::none();
         }
         if to == Destination::Trash && self.selection_in_trash() {
             self.overlay = Some(Overlay::ConfirmDeleteForever(rows));
             return Task::none();
         }
-        let has_destination = |app: &App, account: AccountId| match to {
-            Destination::Archive => app.status.get(&account).and_then(|s| s.archive) == Some(true),
-            Destination::Trash => app.trash_accounts.contains(&account),
+        let Some(moving) = self.move_rows(&rows, to) else {
+            return Task::none();
         };
-        // Copies already in the destination, or on an account without
-        // one, stay where they are.
+        let toast = self.toast(super::destination_label(to), false);
+        Task::batch([moving, toast])
+    }
+
+    /// Whether `account` has a folder for `to`.
+    pub(super) fn has_destination(&self, account: AccountId, to: Destination) -> bool {
+        match to {
+            Destination::Archive => self.status.get(&account).and_then(|s| s.archive) == Some(true),
+            Destination::Trash => self.trash_accounts.contains(&account),
+            Destination::Junk | Destination::Inbox => {
+                matches!(self.store.folder_by_role(account, to.role()), Ok(Some(_)))
+            }
+        }
+    }
+
+    /// Whether this copy is already in the folder of `to`.
+    pub(super) fn is_in(&self, target: &MessageRef, to: Destination) -> bool {
+        matches!(
+            self.store.folder_by_role(target.account_id, to.role()),
+            Ok(Some(folder)) if folder.id == target.folder_id
+        )
+    }
+
+    /// Moves `rows` to `to` on their servers (one job per account): hides
+    /// them at once, removes them when the server confirms. Copies
+    /// already there, or on an account without such a folder, stay where
+    /// they are. `None` when nothing can move.
+    pub(super) fn move_rows(&mut self, rows: &[i64], to: Destination) -> Option<Task<Message>> {
         let targets: Vec<MessageRef> = self
-            .refs(&rows)
+            .refs(rows)
             .into_iter()
-            .filter(|r| has_destination(self, r.account_id))
-            .filter(|r| match to {
-                Destination::Trash => !self.is_trash_folder(r),
-                Destination::Archive => !matches!(
-                    self.store.folder_by_role(r.account_id, FolderRole::Archive),
-                    Ok(Some(folder)) if folder.id == r.folder_id
-                ),
-            })
+            .filter(|r| self.has_destination(r.account_id, to) && !self.is_in(r, to))
             .collect();
         if targets.is_empty() {
-            return Task::none();
+            return None;
         }
-        let toast = self.toast(super::destination_label(to), false);
-        Task::batch([
+        Some(
             self.hide_and_send(targets, move |targets, reply| Job::Move {
                 targets,
                 to,
                 reply,
             }),
-            toast,
-        ])
+        )
     }
 
     /// "Supprimer définitivement" was confirmed.
@@ -509,19 +852,38 @@ impl App {
         }
     }
 
+    /// Reply, reply all or forward: answers the focused message of the
+    /// reader (the newest of a conversation, or the last one unfolded),
+    /// from the account that received it.
     fn answer(&mut self, mode: Mode) -> Task<Message> {
-        let Some(Reading {
-            body: Body::Ready { opened, .. },
-            accounts,
-            ..
-        }) = &self.reading
-        else {
+        let Some(reading) = &self.reading else {
+            return Task::none();
+        };
+        self.open_answer(reading.focus, mode, "")
+    }
+
+    /// Opens the composer to answer reader entry `index`; `typed` (from
+    /// the quick reply) goes first, above the signature and the quote.
+    pub(super) fn open_answer(&mut self, index: usize, mode: Mode, typed: &str) -> Task<Message> {
+        let Some(reading) = &self.reading else {
+            return Task::none();
+        };
+        let Some(entry) = reading.entries.get(index) else {
+            return Task::none();
+        };
+        let Body::Ready { opened, .. } = &entry.body else {
             return Task::none();
         };
         let parsed = &opened.parsed;
         let own: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
         let fields = crate::compose::answer(parsed, mode, &own);
-        let from = accounts.first().copied().or_else(|| self.default_sender());
+        let from = entry
+            .item
+            .accounts
+            .first()
+            .or(reading.accounts.first())
+            .copied()
+            .or_else(|| self.default_sender());
         let Some(from) = from else {
             return Task::none();
         };
@@ -540,29 +902,46 @@ impl App {
         } else {
             Vec::new()
         };
-        self.composer = Some(super::Composer::from_fields(from, fields, attachments));
+        let signature = self.signature_of(from);
+        // A message being written is kept as a draft first.
+        let close = self.close_composer();
+        if self.composer.is_some() {
+            return close;
+        }
+        let mut composer = super::Composer::from_fields(from, fields, attachments, &signature);
+        if !typed.is_empty() {
+            let body = format!("{typed}{}", composer.body.text());
+            composer.body = text_editor::Content::with_text(&body);
+            composer.dirty = true;
+            composer.edited = true;
+        }
+        self.composer = Some(composer);
         self.screen = super::Screen::Mail;
         let target = if mode == Mode::Forward {
             super::composer::TO_ID
         } else {
             super::composer::BODY_ID
         };
-        iced::widget::operation::focus(target)
+        Task::batch([close, iced::widget::operation::focus(target)])
     }
 
     /// The account a new message is sent from by default.
     pub(super) fn default_sender(&self) -> Option<AccountId> {
         match self.filter {
             AccountFilter::Only(id) if self.account(id).is_some() => Some(id),
-            _ => self.accounts.first().map(|a| a.id),
+            _ => self
+                .space_accounts()
+                .first()
+                .map(|a| a.id)
+                .or(self.accounts.first().map(|a| a.id)),
         }
     }
 
-    fn save_attachment(&mut self, index: usize) -> Task<Message> {
-        let Some(Reading {
+    fn save_attachment(&mut self, entry: usize, index: usize) -> Task<Message> {
+        let Some(Entry {
             body: Body::Ready { opened, .. },
             ..
-        }) = &self.reading
+        }) = self.reading.as_ref().and_then(|r| r.entries.get(entry))
         else {
             return Task::none();
         };
@@ -579,7 +958,7 @@ impl App {
 
 /// Parses a raw body off the UI thread; the result comes back as
 /// `Message::BodyParsed`.
-fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
+pub(super) fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
     Task::perform(background::parse_message(raw), move |result| {
         Message::BodyParsed(row, result.map(Arc::new))
     })
@@ -587,13 +966,15 @@ fn parse_task(row: i64, raw: Vec<u8>) -> Task<Message> {
 
 /// The reader's state for a parsed body.
 fn ready_body(opened: Arc<OpenedBody>) -> Body {
-    let text = if opened.parsed.text.trim().is_empty() {
+    let (text, marks) = crate::marks::layout(&opened.parsed.lines);
+    let text = if text.trim().is_empty() {
         "(Ce message ne contient pas de texte.)".to_string()
     } else {
-        opened.parsed.text.trim_end().to_string()
+        text
     };
     Body::Ready {
         content: text_editor::Content::with_text(&text),
+        marks,
         opened,
     }
 }
@@ -622,4 +1003,50 @@ pub fn by_account(refs: Vec<MessageRef>) -> BTreeMap<AccountId, Vec<MessageRef>>
         groups.entry(r.account_id).or_default().push(r);
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{add_account_with_mail, app_with};
+
+    #[tokio::test]
+    async fn counters_counted_aside_are_those_of_the_window() {
+        let path = std::env::temp_dir().join(format!("avero-count-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let a = add_account_with_mail(&store, "a@x.fr", 3);
+        let query = CounterQuery {
+            accounts: vec![a],
+            threads: true,
+            space: AccountFilter::All,
+            scope: AccountFilter::All,
+            tabs: true,
+        };
+        let here = query.count(&store);
+        assert_eq!(here.unread[&a], 3);
+        assert_eq!(count_aside(path.clone(), query).await, Some(here));
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_the_newest_count_is_shown() {
+        let mut app = app_with(|s| {
+            add_account_with_mail(s, "a@x.fr", 2);
+        });
+        let a = app.accounts[0].id;
+        assert_eq!(app.unread[&a], 2);
+        let counted = |n| Counters {
+            unread: HashMap::from([(a, n)]),
+            ..Counters::default()
+        };
+        app.counters_generation = 2;
+        app.counted(1, Some(counted(7)));
+        assert_eq!(app.unread[&a], 2);
+        app.counted(2, None);
+        assert_eq!(app.unread[&a], 2);
+        app.counted(2, Some(counted(5)));
+        assert_eq!(app.unread[&a], 5);
+    }
 }

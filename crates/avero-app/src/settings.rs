@@ -34,12 +34,77 @@ impl ThemeChoice {
     }
 }
 
+/// The colours of the window: the gradient behind the side bar and the
+/// accent of buttons and links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorTheme {
+    /// Avero's violet.
+    #[default]
+    Avero,
+    Orange,
+    /// "Océan": blue-green.
+    Ocean,
+}
+
+impl ColorTheme {
+    /// Every colour theme, in the order of the settings.
+    pub const ALL: [ColorTheme; 3] = [ColorTheme::Avero, ColorTheme::Orange, ColorTheme::Ocean];
+
+    /// The name shown in the settings.
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorTheme::Avero => "Avero",
+            ColorTheme::Orange => "Orange",
+            ColorTheme::Ocean => "Océan",
+        }
+    }
+
+    /// Reads `AVERO_COLOR` (`avero`, `orange` or `ocean`), if set.
+    pub fn from_env_value(value: &str) -> Option<ColorTheme> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "avero" | "violet" => Some(ColorTheme::Avero),
+            "orange" => Some(ColorTheme::Orange),
+            "ocean" | "océan" => Some(ColorTheme::Ocean),
+            _ => None,
+        }
+    }
+}
+
 /// Everything stored in `settings.json`. Unknown or missing fields fall
 /// back to their defaults, so old files keep working.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    /// The colours of the window (light and dark alike).
+    pub color: ColorTheme,
+    /// A system notification for each new unread message of an inbox.
+    pub notifications: bool,
+    /// One line per conversation in the list (off: one per message).
+    pub group_threads: bool,
+    /// The inbox is sorted in tabs: Important, Newsletters,
+    /// Notifications (off: one list).
+    pub inbox_tabs: bool,
+    /// The local spam filter moves new mail it is sure about to the
+    /// spam folder.
+    pub spam_filter: bool,
+    /// The space shown (its database id); `None` for every account.
+    pub active_space: Option<i64>,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            theme: ThemeChoice::default(),
+            color: ColorTheme::default(),
+            notifications: true,
+            group_threads: true,
+            inbox_tabs: true,
+            spam_filter: true,
+            active_space: None,
+        }
+    }
 }
 
 /// Name of the file inside the config folder.
@@ -82,6 +147,7 @@ mod tests {
         let path = temp_dir("missing").join(FILE);
         assert_eq!(Settings::load(&path), Settings::default());
         assert_eq!(Settings::default().theme, ThemeChoice::System);
+        assert!(Settings::default().notifications);
     }
 
     #[test]
@@ -90,11 +156,39 @@ mod tests {
         let path = path_in(&dir);
         let settings = Settings {
             theme: ThemeChoice::Dark,
+            color: ColorTheme::Ocean,
+            notifications: false,
+            group_threads: false,
+            inbox_tabs: false,
+            spam_filter: false,
+            active_space: Some(3),
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"dark\""), "{text}");
+        assert!(text.contains("\"color\": \"ocean\""), "{text}");
+        assert!(text.contains("\"notifications\": false"), "{text}");
+        assert!(text.contains("\"group_threads\": false"), "{text}");
+        assert!(text.contains("\"inbox_tabs\": false"), "{text}");
+        assert!(text.contains("\"spam_filter\": false"), "{text}");
+        assert!(text.contains("\"active_space\": 3"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn older_files_get_notifications_and_conversations_on() {
+        let dir = temp_dir("older");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = path_in(&dir);
+        std::fs::write(&path, "{\"theme\": \"light\"}").unwrap();
+        let settings = Settings::load(&path);
+        assert_eq!(settings.theme, ThemeChoice::Light);
+        assert_eq!(settings.color, ColorTheme::Avero);
+        assert!(settings.notifications);
+        assert!(settings.group_threads);
+        assert!(settings.inbox_tabs);
+        assert!(settings.spam_filter);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -118,5 +212,18 @@ mod tests {
         assert!(!ThemeChoice::Light.is_dark(true));
         assert_eq!(ThemeChoice::from_env_value("Dark"), Some(ThemeChoice::Dark));
         assert_eq!(ThemeChoice::from_env_value("nope"), None);
+    }
+
+    #[test]
+    fn colour_themes_read_from_env_and_files() {
+        assert_eq!(ColorTheme::from_env_value("Océan"), Some(ColorTheme::Ocean));
+        assert_eq!(
+            ColorTheme::from_env_value("orange"),
+            Some(ColorTheme::Orange)
+        );
+        assert_eq!(ColorTheme::from_env_value("rose"), None);
+        let settings: Settings = serde_json::from_str("{\"color\": \"orange\"}").unwrap();
+        assert_eq!(settings.color, ColorTheme::Orange);
+        assert_eq!(ColorTheme::Ocean.label(), "Océan");
     }
 }

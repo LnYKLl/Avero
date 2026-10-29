@@ -4,18 +4,20 @@ Cible : moins de 50 Mo au repos avec 4 comptes (objectif mesuré, pas une barri�
 
 ## Rendu
 
-Depuis le 2026-10-28, Avero utilise par défaut le **rendu logiciel tiny-skia** (dessin par le
-processeur) : dans `crates/avero-app/Cargo.toml`, iced est déclaré sans ses fonctionnalités par
-défaut, avec toutes sauf `wgpu`.
+Depuis le 2026-10-29, Avero utilise par défaut le **rendu GPU (wgpu)** : la fonctionnalité `gpu`
+fait partie des fonctionnalités par défaut de `crates/avero-app/Cargo.toml`. Raison : avec le
+rendu logiciel, une image coûtait 6 à 20 ms (davantage à 150 %), ce qui faisait saccader le
+défilement ; avec wgpu, moins d'1 ms. Coût accepté par Lenny : environ 150 Mo de mémoire en plus,
+donc la cible de 50 Mo n'est plus tenue avec le rendu par défaut.
 
-Le rendu GPU (wgpu) reste disponible avec la fonctionnalité `gpu` :
+Si aucun GPU n'est utilisable (machine virtuelle, pilote cassé), iced se replie tout seul sur le
+rendu logiciel tiny-skia. Pour forcer le rendu logiciel :
 
-```
-cargo build --release -p avero-app --features gpu
-```
+- au lancement : variable d'environnement `ICED_BACKEND=tiny-skia` ;
+- à la compilation : `cargo build --release -p avero-app --no-default-features` (wgpu absent du
+  binaire).
 
-Avec `--features gpu`, iced essaie d'abord wgpu et se replie sur tiny-skia si aucun GPU n'est
-utilisable.
+Les mesures ci-dessous datent de la période tiny-skia par défaut (2026-10-28).
 
 ## Mesure du 2026-10-28 (0 compte, tiny-skia par défaut)
 

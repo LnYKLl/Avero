@@ -1,29 +1,58 @@
 //! State of the window and how it reacts to messages.
 //!
 //! `mod.rs` holds the state, the message list and the dispatch; the
-//! details live in `mail` (list, reader, actions), `accounts` (adding,
-//! fixing and removing accounts, worker events) and `composer`.
+//! details live in `mail` (list, reader, actions), `selection` (lines
+//! picked with Ctrl, Maj or `x`), `places` (tabs, favourites, one
+//! sender's mail, the star), `unsubscribe` ("Se désinscrire"), `keys`
+//! (keyboard shortcuts), `accounts` (adding, fixing and removing
+//! accounts, worker events), `filters` (spam, the spam filter and the
+//! rules), `cleanup` ("Grand nettoyage"), `composer`, `drafts` (saving
+//! what is written), `later` ("Plus tard" and "Programmés"), `spaces`
+//! (groups of accounts), `server_search` ("Chercher aussi sur le
+//! serveur") and `quick_reply` ("Répondre à tous…" under a conversation).
 
 mod accounts;
+mod cleanup;
 mod composer;
+mod drafts;
+mod filters;
+mod keys;
+mod later;
 mod mail;
+mod places;
+mod quick_reply;
+mod selection;
+mod server_search;
+mod spaces;
+mod unsubscribe;
 
 pub use accounts::{EMAIL_ID, PASSWORD_ID};
+pub use cleanup::{Cleanup, CleanupMsg};
 pub use composer::{BODY_ID, ComposeMsg, Composer, TO_ID};
+pub use filters::{RuleForm, RuleMsg, field_name, field_verb, move_name};
+pub use keys::SHORTCUTS;
+pub use later::{LaterMsg, LaterPicker, LaterPurpose, scheduled_status};
+pub use places::{SenderView, tab_name};
+pub use quick_reply::{QUICK_REPLY_ID, QuickMsg, QuickReply};
+pub use server_search::{ServerSearch, server_search_result};
+pub use spaces::{SPACE_ICONS, SpaceForm, SpaceMsg};
+pub use unsubscribe::UnsubscribeOffer;
 
 use crate::account_form::{AccountForm, Field};
 use crate::auth::OAuthGrant;
 use crate::background::{LoginError, OpenedBody};
 use crate::compose::Mode;
-use crate::settings::{Settings, ThemeChoice};
+use crate::settings::{ColorTheme, Settings, ThemeChoice};
 use crate::theme;
 use crate::view;
 use crate::worker::{self, AccountError, Destination, Event, Job, Reply, WorkerHandle};
 use avero_autoconfig::ProviderConfig;
+use avero_core::rules::Rule;
 use avero_core::secrets::SecretStore;
 use avero_core::store::Store;
 use avero_core::{
-    Account, AccountFilter, AccountId, FolderRole, Security, ServerConfig, UnifiedItem,
+    Account, AccountFilter, AccountId, Category, DraftRecord, FolderRole, Security, ServerConfig,
+    Space, SpaceId, UnifiedItem,
 };
 use avero_oauth::Provider;
 use iced::widget::text_editor;
@@ -63,6 +92,8 @@ pub enum Backend {
 pub enum Screen {
     Mail,
     Settings,
+    /// "Grand nettoyage".
+    Cleanup,
 }
 
 /// A dialog drawn over the window.
@@ -81,6 +112,38 @@ pub enum Overlay {
     Servers(ServersForm),
     /// Deleting messages that are already in the trash, for good.
     ConfirmDeleteForever(Vec<i64>),
+    /// The signature of an account, being edited.
+    Signature {
+        account: AccountId,
+        content: text_editor::Content,
+    },
+    /// The list of keyboard shortcuts (`?`).
+    Shortcuts,
+    /// "Se désinscrire", waiting for a confirmation.
+    ConfirmUnsubscribe(UnsubscribeOffer),
+    /// A rule being written or changed.
+    RuleEditor(RuleForm),
+    /// "Appliquer maintenant": the rule changes `count` mails of the
+    /// inbox.
+    ConfirmApplyRule {
+        rule: i64,
+        name: String,
+        count: usize,
+    },
+    /// "Tout mettre à la corbeille" for a sender of "Grand nettoyage".
+    ConfirmTrashSender {
+        name: String,
+        rows: Vec<i64>,
+    },
+    /// "Plus tard" or "Envoyer plus tard": when.
+    Later(LaterPicker),
+    /// A space being created or changed.
+    SpaceEditor(SpaceForm),
+    /// "Supprimer l'espace", waiting for a confirmation.
+    ConfirmDeleteSpace {
+        space: SpaceId,
+        name: String,
+    },
 }
 
 /// "Changer le mot de passe".
@@ -192,22 +255,67 @@ pub struct AccountStatus {
     pub archive: Option<bool>,
 }
 
-/// The message shown in the reading pane.
+/// The conversation (or the single message) shown in the reading pane.
 pub struct Reading {
-    /// Every copy of the message (merged across accounts), newest first.
+    /// The rows of the list item read: every copy of the message, or of
+    /// every message of the conversation in the folder.
     pub rows: Vec<i64>,
     pub accounts: Vec<AccountId>,
+    /// The conversation read, when the list groups them.
+    pub thread: Option<i64>,
+    /// The messages, oldest first: just one outside conversations.
+    pub entries: Vec<Entry>,
+    /// The entry Reply and Forward answer: the last one unfolded (the
+    /// newest at first).
+    pub focus: usize,
+    /// Who the conversation is from: the address of its newest message
+    /// written by someone else than the user (for "Classer dans").
+    pub sender: String,
+    /// The tab of that message.
+    pub category: Option<Category>,
+    /// How to unsubscribe from that message's list, if it offers it.
+    pub unsubscribe: Option<UnsubscribeOffer>,
+}
+
+impl Reading {
+    /// The entry Reply and Forward answer.
+    pub fn focused(&self) -> &Entry {
+        &self.entries[self.focus]
+    }
+
+    /// The body of the focused entry.
+    pub fn body(&self) -> &Body {
+        &self.focused().body
+    }
+
+    /// Whether the pane shows a conversation of several messages.
+    pub fn is_thread(&self) -> bool {
+        self.entries.len() > 1
+    }
+}
+
+/// One message of the reading pane.
+pub struct Entry {
+    /// Its copies (the one with a cached body first), sender, date,
+    /// snippet.
+    pub item: UnifiedItem,
+    /// Unfolded (its text shown) or folded to one line.
+    pub expanded: bool,
     pub body: Body,
 }
 
-/// The body of the message being read.
+/// The body of a message of the reading pane.
 pub enum Body {
+    /// Not asked for yet: a folded message of a conversation.
+    NotLoaded,
     Loading,
     Ready {
         /// Parsed once, attachments decoded (forward and save reuse them).
         opened: Arc<OpenedBody>,
         /// Read-only editor: lets the user select and copy the text.
         content: text_editor::Content,
+        /// Its links and bold text.
+        marks: crate::marks::Marks,
     },
     Failed(String),
 }
@@ -229,25 +337,63 @@ pub enum Message {
     Tick,
     AutoSync,
     Key(keyboard::Key, keyboard::Modifiers),
+    /// Ctrl, Maj… pressed or released (a click on a line reads them).
+    ModifiersChanged(keyboard::Modifiers),
     ToastExpired(u64),
     OpenUrl(String),
     /// Puts a value on the clipboard (a scope or redirect URI to paste in
     /// a provider's console).
     CopyText(String),
     ThemeChosen(ThemeChoice),
+    /// "Avero", "Orange" or "Océan" in the settings.
+    ColorChosen(ColorTheme),
+    /// The window's new width (the side bar folds when it is narrow).
+    WindowResized(f32),
+    /// The mouse entered (`true`) or left line `.0` of the list (its
+    /// checkbox shows).
+    LineHovered(usize, bool),
+    /// The checkbox of line `.0` of the list.
+    LineChecked(usize),
+    /// Opens (`true`) or closes the menu of spaces of the side bar.
+    SpaceMenu(bool),
+    NotificationsToggled(bool),
+    /// "Regrouper les conversations" in the settings.
+    ThreadsToggled(bool),
+    /// "Trier la réception en onglets" in the settings.
+    TabsToggled(bool),
+    /// "Filtre anti-spam" in the settings.
+    SpamFilterToggled(bool),
+    /// The spam filter learned from an account's folders (how many
+    /// messages), or could not.
+    SpamLearned(AccountId, Result<usize, String>),
 
     ShowMail,
     ShowSettings,
+    ShowCleanup,
     FolderSelected(FolderRole),
+    /// "Favoris": the starred mail of every folder.
+    StarredSelected,
+    /// A tab above the inbox.
+    TabSelected(Category),
+    /// "Mails de X" (address, name).
+    ShowSender(String, String),
+    /// Leaves "Mails de X".
+    SenderBack,
     FilterSelected(AccountFilter),
     SearchChanged(String),
     SearchDebounced(u64),
     SearchSubmitted,
     SearchCleared,
+    /// A click on a line of the list (Ctrl and Maj change what it does).
     MessageSelected(usize),
+    /// "Tout sélectionner": every loaded line, or none.
+    SelectAll(bool),
     LoadMore,
     Refresh,
     Worker(AccountId, Event),
+    /// What a worker did on its own: a sync because the inbox changed,
+    /// new mail to notify (see `Job::Watch`).
+    Background(AccountId, Event),
     /// A throttled list reload is due.
     ReloadDue,
     /// A body was parsed off the UI thread.
@@ -256,17 +402,48 @@ pub enum Message {
     Moved(Vec<i64>, Event),
     ConfirmDeleteForever,
 
-    ReaderAction(text_editor::Action),
+    /// Selection or scrolling in the text of a reader entry.
+    ReaderAction(usize, text_editor::Action),
+    /// Unfolds (or folds) a message of the conversation being read.
+    EntryToggled(usize),
     Answer(Mode),
     Archive,
     Delete,
+    MarkRead,
     MarkUnread,
-    SaveAttachment(usize),
+    /// Stars the lines acted on (or unstars them, all starred).
+    ToggleStar,
+    /// The star of line `.0` of the list.
+    StarLine(usize),
+    /// "Classer dans" for the conversation being read.
+    Reclassify(Category),
+    /// "Spam" (`true`) or "Pas spam" for the lines acted on.
+    MarkSpam(bool),
+    /// "Se désinscrire" (asks for a confirmation).
+    Unsubscribe,
+    ConfirmUnsubscribe,
+    /// Unsubscribing from a sender was done (or failed).
+    Unsubscribed(String, Result<(), String>),
+    /// Attachment `.1` of reader entry `.0`.
+    SaveAttachment(usize, usize),
     AttachmentSaved(Result<Option<String>, String>),
 
     Compose(ComposeMsg),
     Add(AddMsg),
     Account(AccountMsg),
+    Rule(RuleMsg),
+    Cleanup(CleanupMsg),
+    Later(LaterMsg),
+    Space(SpaceMsg),
+    QuickReply(QuickMsg),
+    /// "Chercher aussi sur le serveur".
+    SearchServer,
+    /// What an account's server found for search number `.0` (see
+    /// `App::server_generation`).
+    ServerFound(u64, AccountId, Event),
+    /// The side bar's numbers, counted aside (number `.0`; see
+    /// `App::counters_generation`).
+    Counted(u64, Option<mail::Counters>),
 }
 
 /// Messages of the add-account card. `Debug` hides a typed password.
@@ -341,6 +518,8 @@ pub enum AccountMsg {
     PasswordChecked(u64, Result<(), LoginError>),
     AskDelete(AccountId),
     ConfirmDelete,
+    /// The account's rows were deleted (or not), off the UI thread.
+    Deleted(AccountId, Result<(), String>),
     Reconnect(AccountId),
     Reconnected(AccountId, Result<OAuthGrant, String>),
     OpenServers(AccountId),
@@ -349,6 +528,10 @@ pub enum AccountMsg {
     SaveServers,
     /// The SMTP server found for an account that had none.
     SmtpFound(AccountId, Option<ServerConfig>),
+    /// Opens the signature of an account.
+    EditSignature(AccountId),
+    SignatureEdit(text_editor::Action),
+    SaveSignature,
     CloseDialog,
 }
 
@@ -366,6 +549,7 @@ impl fmt::Debug for AccountMsg {
             }
             AccountMsg::AskDelete(id) => write!(f, "AskDelete({id:?})"),
             AccountMsg::ConfirmDelete => f.write_str("ConfirmDelete"),
+            AccountMsg::Deleted(id, result) => write!(f, "Deleted({id:?}, {result:?})"),
             AccountMsg::Reconnect(id) => write!(f, "Reconnect({id:?})"),
             AccountMsg::Reconnected(id, result) => write!(f, "Reconnected({id:?}, {result:?})"),
             AccountMsg::OpenServers(id) => write!(f, "OpenServers({id:?})"),
@@ -373,6 +557,9 @@ impl fmt::Debug for AccountMsg {
             AccountMsg::ServerSecurity(security) => write!(f, "ServerSecurity({security:?})"),
             AccountMsg::SaveServers => f.write_str("SaveServers"),
             AccountMsg::SmtpFound(id, found) => write!(f, "SmtpFound({id:?}, {found:?})"),
+            AccountMsg::EditSignature(id) => write!(f, "EditSignature({id:?})"),
+            AccountMsg::SignatureEdit(action) => write!(f, "SignatureEdit({action:?})"),
+            AccountMsg::SaveSignature => f.write_str("SaveSignature"),
             AccountMsg::CloseDialog => f.write_str("CloseDialog"),
         }
     }
@@ -395,17 +582,63 @@ pub struct App {
     settings_path: Option<PathBuf>,
     system_dark: bool,
     current_theme: Theme,
+    /// Width of the window, in logical pixels.
+    pub(crate) window_width: f32,
+    /// The line of the list under the mouse.
+    pub(crate) hovered_line: Option<usize>,
+    /// The menu of spaces of the side bar is open.
+    pub(crate) space_menu: bool,
 
     pub(crate) accounts: Vec<Account>,
     pub(crate) status: HashMap<AccountId, AccountStatus>,
     pub(crate) unread: HashMap<AccountId, usize>,
+    /// The counters of the side bar: conversations in "Plus tard" and
+    /// in the drafts folder (of the space shown).
+    pub(crate) snoozed_count: usize,
+    pub(crate) drafts_count: usize,
 
     pub(crate) screen: Screen,
     pub(crate) folder: FolderRole,
+    /// "Favoris" is shown instead of `folder`.
+    pub(crate) starred: bool,
+    /// "Plus tard" (the snoozed conversations) is shown instead.
+    pub(crate) snoozed: bool,
+    /// "Programmés" (the mail to send later) is shown instead.
+    pub(crate) scheduled: bool,
+    /// The scheduled mail, for "Programmés".
+    pub(crate) outbox: Vec<DraftRecord>,
+    /// Scheduled mail being sent right now.
+    pub(crate) sending: HashSet<i64>,
+    /// The row of the drafts folder whose body is awaited to open it in
+    /// the composer.
+    pub(crate) pending_draft: Option<i64>,
+    /// Where the time comes from (tests set it by hand).
+    pub(crate) clock: crate::later::Clock,
+    /// The tab of the inbox shown (see `App::tabs_shown`).
+    pub(crate) tab: Category,
+    /// "Mails de X", shown over the rest.
+    pub(crate) sender: Option<SenderView>,
+    /// Unread lines of each tab of the inbox.
+    pub(crate) tab_unread: HashMap<Category, usize>,
+    /// Numbers to count aside once the current message is handled (see
+    /// `refresh_unread`).
+    counters_wanted: Option<mail::CounterQuery>,
+    /// Bumped at each count aside: only the newest one is shown.
+    counters_generation: u64,
     pub(crate) filter: AccountFilter,
+    /// The spaces, in order, and the one shown (`None`: every account).
+    pub(crate) spaces: Vec<Space>,
+    pub(crate) space: Option<SpaceId>,
     pub(crate) search_text: String,
     pub(crate) search_query: Option<String>,
     search_generation: u64,
+    /// "Chercher aussi sur le serveur" for the search shown.
+    pub(crate) server_search: ServerSearch,
+    /// The rows the servers found, added to the local results.
+    pub(crate) server_rows: Vec<i64>,
+    /// Bumped by each search on the server, so late answers to an older
+    /// one are ignored.
+    server_generation: u64,
     pub(crate) items: Vec<UnifiedItem>,
     /// Accounts that have a trash folder (Supprimer needs one).
     pub(crate) trash_accounts: HashSet<AccountId>,
@@ -416,9 +649,24 @@ pub struct App {
     /// waiting for its turn.
     last_reload: Option<Instant>,
     reload_scheduled: bool,
-    /// Row ids of the selected item (stable across reloads).
+    /// Row ids of the selected item (stable across reloads): the line
+    /// read, or the keyboard's line while lines are checked.
     pub(crate) selected: Option<Vec<i64>>,
+    /// Lines picked with Ctrl+click, Maj+click, `x` or "Tout
+    /// sélectionner" (row ids of each); the actions apply to them.
+    pub(crate) checked: Vec<Vec<i64>>,
+    /// Where a Maj+click range starts.
+    pub(crate) anchor: Option<Vec<i64>>,
+    /// The modifier keys held (read by a click on a line).
+    pub(crate) modifiers: keyboard::Modifiers,
+    /// When `g` was pressed, waiting for the folder letter.
+    pub(crate) pending_g: Option<Instant>,
     pub(crate) reading: Option<Reading>,
+    /// "Répondre à tous…" under the conversation read.
+    pub(crate) quick_reply: QuickReply,
+    /// Bumped when another conversation is opened (its quick reply
+    /// starts empty).
+    quick_generation: u64,
 
     pub(crate) composer: Option<Composer>,
     pub(crate) overlay: Option<Overlay>,
@@ -431,6 +679,34 @@ pub struct App {
     toast_seq: u64,
     /// Angle of the refresh icon while syncing.
     pub(crate) spinner: f32,
+
+    /// The user's rules, in order (read again after each change).
+    pub(crate) rules: Vec<Rule>,
+    /// Accounts whose folders the spam filter is learning from.
+    learning: HashSet<AccountId>,
+    /// "Grand nettoyage".
+    pub(crate) cleanup: Cleanup,
+}
+
+/// Erases the secrets of the accounts the store merged when it was
+/// migrated (the store cannot reach the keyring itself). Each one is
+/// crossed off once erased; one that could not be is tried again at the
+/// next start.
+fn forget_merged_secrets(store: &Store, secrets: &dyn SecretStore) {
+    let merged = store.merged_accounts().unwrap_or_else(|e| {
+        eprintln!("Impossible de lire les comptes fusionnés : {e}");
+        Vec::new()
+    });
+    for id in merged {
+        match secrets.delete(id) {
+            Ok(()) => {
+                if let Err(e) = store.secret_deleted(id) {
+                    eprintln!("Impossible de noter l'effacement d'un secret : {e}");
+                }
+            }
+            Err(e) => eprintln!("Impossible d'effacer le secret d'un compte fusionné : {e}"),
+        }
+    }
 }
 
 impl App {
@@ -451,29 +727,61 @@ impl App {
         if let Err(e) = store.clear_pending() {
             eprintln!("Impossible de remettre la base en ordre : {e}");
         }
+        // Accounts merged by the database migration lose their secrets too.
+        if let Backend::Live { secrets, .. } = &backend {
+            forget_merged_secrets(&store, secrets.as_ref());
+        }
         let mut app = App {
             store,
             backend,
-            current_theme: theme::build(settings.theme.is_dark(false)),
+            current_theme: theme::build(settings.color, settings.theme.is_dark(false)),
+            window_width: 1280.0,
+            hovered_line: None,
+            space_menu: false,
             settings,
             settings_path,
             system_dark: false,
             accounts,
             status: HashMap::new(),
             unread: HashMap::new(),
+            snoozed_count: 0,
+            drafts_count: 0,
             screen: Screen::Mail,
             folder: FolderRole::Inbox,
+            starred: false,
+            snoozed: false,
+            scheduled: false,
+            outbox: Vec::new(),
+            sending: HashSet::new(),
+            pending_draft: None,
+            clock: crate::later::Clock::default(),
+            tab: Category::Important,
+            sender: None,
+            tab_unread: HashMap::new(),
+            counters_wanted: None,
+            counters_generation: 0,
             filter: AccountFilter::All,
+            spaces: Vec::new(),
+            space: None,
             search_text: String::new(),
             search_query: None,
             search_generation: 0,
+            server_search: ServerSearch::Idle,
+            server_rows: Vec::new(),
+            server_generation: 0,
             items: Vec::new(),
             trash_accounts: HashSet::new(),
             archive_view: false,
             last_reload: None,
             reload_scheduled: false,
             selected: None,
+            checked: Vec::new(),
+            anchor: None,
+            modifiers: keyboard::Modifiers::default(),
+            pending_g: None,
             reading: None,
+            quick_reply: QuickReply::default(),
+            quick_generation: 0,
             composer: None,
             overlay: None,
             oauth_cancel: None,
@@ -481,17 +789,55 @@ impl App {
             toast: None,
             toast_seq: 0,
             spinner: 0.0,
+            rules: Vec::new(),
+            learning: HashSet::new(),
+            cleanup: Cleanup::default(),
         };
         app.read_oauth_clients();
-        for account in app.accounts.clone() {
-            app.start_worker(&account);
+        app.refresh_rules();
+        app.spaces = app.store.spaces().unwrap_or_else(|e| {
+            eprintln!("Impossible de lire les espaces : {e}");
+            Vec::new()
+        });
+        // The space shown last time, if it still exists.
+        app.space = app
+            .settings
+            .active_space
+            .map(SpaceId)
+            .filter(|id| app.spaces.iter().any(|s| s.id == *id));
+        // Scheduled mail whose sending a stop cut short is not sent twice.
+        if let Err(e) = app.store.interrupted_sends(later::INTERRUPTED) {
+            eprintln!("Impossible de relire les envois programmés : {e}");
         }
+        app.refresh_outbox();
+        let watching: Vec<Task<Message>> = app
+            .accounts
+            .clone()
+            .iter()
+            .map(|account| app.start_worker(account))
+            .collect();
+        // After the workers start: it asks them to save or drop drafts on
+        // their servers.
+        let drafts = app.restore_drafts();
         app.load_first_page();
         let system = iced::system::theme().map(Message::SystemTheme);
         let complete = app.complete_smtp_settings();
+        let ids: Vec<AccountId> = app.accounts.iter().map(|a| a.id).collect();
+        let learning: Vec<Task<Message>> = ids
+            .into_iter()
+            .map(|id| app.learn_from_folders(id))
+            .collect();
         (
             app,
-            Task::batch([system, Task::done(Message::AutoSync), complete]),
+            Task::batch([
+                system,
+                Task::done(Message::AutoSync),
+                complete,
+                Task::batch(watching),
+                Task::batch(learning),
+                drafts,
+                Task::done(Message::Later(LaterMsg::Tick)),
+            ]),
         )
     }
 
@@ -507,10 +853,28 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = vec![
             iced::system::theme_changes().map(Message::SystemTheme),
+            iced::window::resize_events().map(|(_, size)| Message::WindowResized(size.width)),
             iced::time::every(AUTO_SYNC).map(|_| Message::AutoSync),
+            iced::time::every(later::TICK).map(|_| Message::Later(LaterMsg::Tick)),
             keyboard::listen().filter_map(|event| match event {
+                // Ctrl+0 to Ctrl+9 change the space, read from the key's
+                // place: on a French keyboard the digits need Maj.
+                keyboard::Event::KeyPressed {
+                    physical_key,
+                    modifiers,
+                    ..
+                } if modifiers.command() && !modifiers.alt() && digit(physical_key).is_some() => {
+                    digit(physical_key).map(|n| Message::Space(SpaceMsg::Number(n)))
+                }
                 keyboard::Event::KeyPressed { key, modifiers, .. } => {
                     Some(Message::Key(key, modifiers))
+                }
+                _ => None,
+            }),
+            // Every modifier change, even while a field has the focus.
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                    Some(Message::ModifiersChanged(modifiers))
                 }
                 _ => None,
             }),
@@ -522,7 +886,18 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.handle(message);
+        // The side bar's numbers, if the message changed them.
+        let counting = self.count_wanted();
+        Task::batch([task, counting])
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Counted(generation, counted) => {
+                self.counted(generation, counted);
+                Task::none()
+            }
             Message::SystemTheme(mode) => {
                 self.system_dark = mode == iced::theme::Mode::Dark;
                 self.refresh_theme();
@@ -534,6 +909,10 @@ impl App {
             }
             Message::AutoSync | Message::Refresh => self.sync_all(),
             Message::Key(key, modifiers) => self.on_key(key, modifiers),
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                Task::none()
+            }
             Message::ToastExpired(id) => {
                 if self.toast.as_ref().is_some_and(|t| t.id == id) {
                     self.toast = None;
@@ -561,6 +940,43 @@ impl App {
                 self.save_settings();
                 Task::none()
             }
+            Message::ColorChosen(color) => {
+                self.settings.color = color;
+                self.refresh_theme();
+                self.save_settings();
+                Task::none()
+            }
+            Message::WindowResized(width) => {
+                self.window_width = width;
+                Task::none()
+            }
+            Message::LineHovered(index, inside) => {
+                if inside {
+                    self.hovered_line = Some(index);
+                } else if self.hovered_line == Some(index) {
+                    self.hovered_line = None;
+                }
+                Task::none()
+            }
+            Message::LineChecked(index) => {
+                self.check_line(index);
+                Task::none()
+            }
+            Message::SpaceMenu(open) => {
+                self.space_menu = open;
+                Task::none()
+            }
+            Message::NotificationsToggled(on) => {
+                self.settings.notifications = on;
+                self.save_settings();
+                Task::none()
+            }
+            Message::ThreadsToggled(on) => {
+                self.settings.group_threads = on;
+                self.save_settings();
+                self.load_first_page();
+                Task::none()
+            }
             Message::ShowMail => {
                 self.screen = Screen::Mail;
                 Task::none()
@@ -569,6 +985,33 @@ impl App {
                 self.screen = Screen::Settings;
                 Task::none()
             }
+            Message::ShowCleanup => {
+                self.show_cleanup();
+                Task::none()
+            }
+            Message::SpamFilterToggled(on) => self.spam_filter_toggled(on),
+            Message::SpamLearned(account, result) => {
+                self.spam_learned(account, result);
+                Task::none()
+            }
+            Message::MarkSpam(spam) => self.mark_spam(spam),
+            Message::Rule(message) => self.update_rules(message),
+            Message::Cleanup(message) => self.update_cleanup(message),
+            Message::Later(message) => self.update_later(message),
+            Message::Space(message) => {
+                if self.overlay.is_some() && matches!(message, SpaceMsg::Number(_)) {
+                    return Task::none();
+                }
+                if matches!(message, SpaceMsg::Select(_) | SpaceMsg::Number(_)) {
+                    self.space_menu = false;
+                }
+                self.update_spaces(message)
+            }
+            Message::QuickReply(message) => self.update_quick_reply(message),
+            Message::SearchServer => self.search_on_server(),
+            Message::ServerFound(generation, _account, event) => {
+                self.server_found(generation, event)
+            }
             Message::FolderSelected(_)
             | Message::FilterSelected(_)
             | Message::SearchChanged(_)
@@ -576,24 +1019,37 @@ impl App {
             | Message::SearchSubmitted
             | Message::SearchCleared
             | Message::MessageSelected(_)
+            | Message::SelectAll(_)
             | Message::LoadMore
-            | Message::ReaderAction(_)
+            | Message::ReaderAction(..)
+            | Message::EntryToggled(_)
             | Message::Answer(_)
             | Message::Archive
             | Message::Delete
+            | Message::MarkRead
             | Message::MarkUnread
-            | Message::SaveAttachment(_)
+            | Message::SaveAttachment(..)
             | Message::AttachmentSaved(_) => self.update_mail(message),
+            Message::StarredSelected
+            | Message::TabSelected(_)
+            | Message::TabsToggled(_)
+            | Message::ShowSender(..)
+            | Message::SenderBack
+            | Message::ToggleStar
+            | Message::StarLine(_)
+            | Message::Reclassify(_) => self.update_places(message),
+            Message::Unsubscribe | Message::ConfirmUnsubscribe | Message::Unsubscribed(..) => {
+                self.update_unsubscribe(message)
+            }
+
             Message::Worker(account, event) => self.on_worker_event(account, event),
+            Message::Background(account, event) => self.on_background_event(account, event),
             Message::ReloadDue => {
                 self.reload_scheduled = false;
                 self.reload_now();
                 Task::none()
             }
-            Message::BodyParsed(row, result) => {
-                self.body_parsed(row, result);
-                Task::none()
-            }
+            Message::BodyParsed(row, result) => self.body_parsed(row, result),
             Message::Moved(rows, event) => self.moved(rows, event),
             Message::ConfirmDeleteForever => self.delete_forever(),
             Message::Compose(message) => self.update_composer(message),
@@ -609,7 +1065,10 @@ impl App {
     // ------------------------------------------------------------ helpers
 
     fn refresh_theme(&mut self) {
-        self.current_theme = theme::build(self.settings.theme.is_dark(self.system_dark));
+        self.current_theme = theme::build(
+            self.settings.color,
+            self.settings.theme.is_dark(self.system_dark),
+        );
     }
 
     fn save_settings(&self) {
@@ -637,14 +1096,13 @@ impl App {
             Some(Overlay::Reconnect(_)) => true,
             _ => false,
         };
-        let loading = matches!(
-            self.reading,
-            Some(Reading {
-                body: Body::Loading,
-                ..
-            })
-        );
-        overlay || loading
+        let loading = self.reading.as_ref().is_some_and(|reading| {
+            reading
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.body, Body::Loading))
+        });
+        overlay || loading || self.server_search.is_running() || self.quick_reply.sending
     }
 
     pub fn is_demo(&self) -> bool {
@@ -671,23 +1129,30 @@ impl App {
         })
     }
 
-    /// Starts the worker of an account (live mode only).
-    fn start_worker(&mut self, account: &Account) {
-        if let Backend::Live {
+    /// Starts the worker of an account (live mode only) and has it watch
+    /// the inbox; what it does on its own comes back as
+    /// `Message::Background`. Demo mode watches nothing.
+    fn start_worker(&mut self, account: &Account) -> Task<Message> {
+        let Backend::Live {
             db_path,
             secrets,
             config_dir,
             workers,
         } = &mut self.backend
-        {
-            let handle = WorkerHandle::spawn(worker::WorkerSetup {
-                account: account.clone(),
-                db_path: db_path.clone(),
-                secrets: secrets.clone(),
-                config_dir: config_dir.clone(),
-            });
-            workers.insert(account.id, handle);
-        }
+        else {
+            return Task::none();
+        };
+        let handle = WorkerHandle::spawn(worker::WorkerSetup {
+            account: account.clone(),
+            db_path: db_path.clone(),
+            secrets: secrets.clone(),
+            config_dir: config_dir.clone(),
+        });
+        let id = account.id;
+        let watching =
+            Task::stream(handle.watch()).map(move |event| Message::Background(id, event));
+        workers.insert(id, handle);
+        watching
     }
 
     /// Sends a job to an account's worker; its events come back as
@@ -731,45 +1196,31 @@ impl App {
         status.syncing = true;
         self.request(id, |reply| Job::Sync { reply })
     }
+}
 
-    fn on_key(&mut self, key: keyboard::Key, modifiers: keyboard::Modifiers) -> Task<Message> {
-        use keyboard::key::Named;
-        let ctrl = modifiers.command();
-        match key.as_ref() {
-            keyboard::Key::Named(Named::Escape) => self.escape(),
-            _ if self.overlay.is_some() => Task::none(),
-            keyboard::Key::Character("n") if ctrl => self.update_composer(ComposeMsg::New),
-            keyboard::Key::Character("r") if ctrl && self.composer.is_none() => {
-                self.update_mail(Message::Answer(Mode::Reply))
-            }
-            keyboard::Key::Character("f") if ctrl => {
-                self.screen = Screen::Mail;
-                iced::widget::operation::focus(SEARCH_ID)
-            }
-            _ if self.composer.is_some() || ctrl => Task::none(),
-            keyboard::Key::Named(Named::Delete) => self.update_mail(Message::Delete),
-            keyboard::Key::Character("j") => self.step_selection(1),
-            keyboard::Key::Character("k") => self.step_selection(-1),
-            _ => Task::none(),
-        }
-    }
-
-    /// Échap closes the top-most thing: dialog, composer, search.
-    fn escape(&mut self) -> Task<Message> {
-        if self.overlay.is_some() {
-            return match self.overlay {
-                Some(Overlay::AddAccount(_)) => self.update_add(AddMsg::Close),
-                _ => self.update_account(AccountMsg::CloseDialog),
-            };
-        }
-        if self.composer.is_some() {
-            return self.update_composer(ComposeMsg::Cancel);
-        }
-        if self.search_query.is_some() || !self.search_text.is_empty() {
-            return self.update_mail(Message::SearchCleared);
-        }
-        Task::none()
-    }
+/// The digit of a key of the top row or of the keypad (Ctrl+1 changes
+/// the space, whatever the keyboard layout).
+fn digit(key: keyboard::key::Physical) -> Option<u8> {
+    use keyboard::key::{Code, Physical};
+    let Physical::Code(code) = key else {
+        return None;
+    };
+    let digits = [
+        (Code::Digit0, Code::Numpad0),
+        (Code::Digit1, Code::Numpad1),
+        (Code::Digit2, Code::Numpad2),
+        (Code::Digit3, Code::Numpad3),
+        (Code::Digit4, Code::Numpad4),
+        (Code::Digit5, Code::Numpad5),
+        (Code::Digit6, Code::Numpad6),
+        (Code::Digit7, Code::Numpad7),
+        (Code::Digit8, Code::Numpad8),
+        (Code::Digit9, Code::Numpad9),
+    ];
+    digits
+        .iter()
+        .position(|(row, pad)| code == *row || code == *pad)
+        .map(|n| n as u8)
 }
 
 /// Waits; the timer is only created when the task first runs.
@@ -795,14 +1246,25 @@ fn demo_answer(job: Job) {
                 "Mode démo : le message n'a pas vraiment été envoyé".to_string(),
             ))));
         }
+        // Kept on this computer only.
+        Job::SaveDraft { reply, .. } => {
+            let _ = reply.send(Event::DraftSaved(Ok(None)));
+        }
+        // The demo searches its own data (see `demo::server_hits`).
+        Job::SearchServer { reply, .. } => {
+            let _ = reply.send(Event::Found(Ok(Default::default())));
+        }
         Job::SetPassword { reply, .. }
         | Job::SetOAuth { reply, .. }
         | Job::SetSeen { reply, .. }
+        | Job::SetFlagged { reply, .. }
         | Job::Move { reply, .. }
-        | Job::DeleteForever { reply, .. } => {
+        | Job::DeleteForever { reply, .. }
+        | Job::DropDraft { reply, .. } => {
             let _ = reply.send(Event::Done(Ok(())));
         }
-        Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
+        // Never sent in demo mode: no inbox to watch.
+        Job::Watch { .. } | Job::UpdateAccount(_) | Job::Shutdown { .. } => {}
     }
 }
 
@@ -811,8 +1273,20 @@ pub fn destination_label(destination: Destination) -> &'static str {
     match destination {
         Destination::Archive => "Archivé",
         Destination::Trash => "Placé dans la corbeille",
+        Destination::Junk => "Placé dans le spam",
+        Destination::Inbox => "Remis dans la réception",
     }
 }
 
+#[cfg(test)]
+mod design_tests;
+#[cfg(test)]
+mod filter_tests;
+#[cfg(test)]
+mod later_tests;
+#[cfg(test)]
+mod reply_tests;
+#[cfg(test)]
+mod space_tests;
 #[cfg(test)]
 mod tests;

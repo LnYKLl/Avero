@@ -3,7 +3,8 @@
 
 use avero_core::model::{Credentials, Security, ServerConfig};
 use lettre::message::header::ContentType;
-use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
+use lettre::message::header::{HeaderName, HeaderValue};
+use lettre::message::{Attachment, Mailbox, MessageBuilder, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials as SmtpCredentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use std::hash::{BuildHasher, Hasher};
@@ -160,17 +161,7 @@ fn is_rejected_token(error: &lettre::transport::smtp::Error) -> bool {
 /// Builds the MIME message: plain text alone, or text followed by the
 /// attachments in a multipart/mixed.
 pub fn build_message(msg: &Outgoing) -> Result<Message, SendError> {
-    let from_addr = msg
-        .from_addr
-        .trim()
-        .parse()
-        .map_err(|_| SendError::InvalidAddress(msg.from_addr.clone()))?;
-    let from = Mailbox::new(msg.from_name.clone(), from_addr);
-
-    let mut builder = Message::builder()
-        .message_id(Some(new_message_id(&msg.from_addr)))
-        .from(from)
-        .subject(msg.subject.clone());
+    let mut builder = headers(msg, Some(new_message_id(&msg.from_addr)))?;
     for to in &msg.to {
         builder = builder.to(mailbox(to)?);
     }
@@ -180,13 +171,76 @@ pub fn build_message(msg: &Outgoing) -> Result<Message, SendError> {
     for bcc in &msg.bcc {
         builder = builder.bcc(mailbox(bcc)?);
     }
+    with_body(builder, msg)
+}
+
+/// A draft as it is kept in the server's drafts folder: the message as
+/// it would be sent, with `message_id` (the same from one save to the
+/// next) and its Bcc header. Addresses are as typed: an unfinished one
+/// keeps its field as plain text, and no recipient at all is fine.
+pub fn draft_message(msg: &Outgoing, message_id: &str) -> Result<Vec<u8>, SendError> {
+    let mut builder = headers(msg, Some(message_id.to_string()))?.keep_bcc();
+    let fields: [(&[Recipient], &str); 3] = [(&msg.to, "To"), (&msg.cc, "Cc"), (&msg.bcc, "Bcc")];
+    for (list, name) in fields {
+        if list.is_empty() {
+            continue;
+        }
+        let mailboxes: Result<Vec<Mailbox>, SendError> = list.iter().map(mailbox).collect();
+        builder = match (mailboxes, name) {
+            (Ok(all), "To") => all.into_iter().fold(builder, |b, m| b.to(m)),
+            (Ok(all), "Cc") => all.into_iter().fold(builder, |b, m| b.cc(m)),
+            (Ok(all), _) => all.into_iter().fold(builder, |b, m| b.bcc(m)),
+            (Err(_), _) => {
+                let text: Vec<String> = list.iter().map(typed_address).collect();
+                let header = HeaderName::new_from_ascii(name.to_string())
+                    .map_err(|e| SendError::InvalidAddress(e.to_string()))?;
+                builder.raw_header(HeaderValue::new(header, text.join(", ")))
+            }
+        };
+    }
+    // Nobody to deliver to: lettre still wants an envelope.
+    let from: lettre::Address = msg
+        .from_addr
+        .trim()
+        .parse()
+        .map_err(|_| SendError::InvalidAddress(msg.from_addr.clone()))?;
+    let envelope = lettre::address::Envelope::new(Some(from.clone()), vec![from])
+        .map_err(|e| SendError::InvalidAddress(e.to_string()))?;
+    Ok(with_body(builder.envelope(envelope), msg)?.formatted())
+}
+
+/// `Name <addr>` or `addr`, as the user typed it.
+fn typed_address(recipient: &Recipient) -> String {
+    match recipient.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => format!("{name} <{}>", recipient.addr.trim()),
+        _ => recipient.addr.trim().to_string(),
+    }
+}
+
+/// The headers every message gets: Message-ID, From, Subject and the
+/// thread's ids.
+fn headers(msg: &Outgoing, message_id: Option<String>) -> Result<MessageBuilder, SendError> {
+    let from_addr = msg
+        .from_addr
+        .trim()
+        .parse()
+        .map_err(|_| SendError::InvalidAddress(msg.from_addr.clone()))?;
+    let from = Mailbox::new(msg.from_name.clone(), from_addr);
+    let mut builder = Message::builder()
+        .message_id(message_id)
+        .from(from)
+        .subject(msg.subject.clone());
     if let Some(id) = &msg.in_reply_to {
         builder = builder.in_reply_to(id.clone());
     }
     if let Some(ids) = &msg.references {
         builder = builder.references(ids.clone());
     }
+    Ok(builder)
+}
 
+/// The text, then the attachments in a multipart/mixed if there are any.
+fn with_body(builder: MessageBuilder, msg: &Outgoing) -> Result<Message, SendError> {
     let text = SinglePart::plain(msg.body.clone());
     let built = if msg.attachments.is_empty() {
         builder.singlepart(text)
@@ -223,7 +277,7 @@ fn mailbox(recipient: &Recipient) -> Result<Mailbox, SendError> {
 
 /// A unique `<random@domain>` Message-ID, on the sender's domain (the
 /// computer's name is never revealed).
-fn new_message_id(from_addr: &str) -> String {
+pub fn new_message_id(from_addr: &str) -> String {
     let domain = from_addr
         .rsplit_once('@')
         .map_or("avero.invalid", |(_, domain)| domain.trim());
@@ -287,6 +341,35 @@ mod tests {
         let text = String::from_utf8_lossy(&raw);
         assert!(!text.contains("secret@ex.com"), "{text}");
         assert_eq!(parsed.references, None);
+    }
+
+    #[test]
+    fn draft_keeps_its_id_its_bcc_and_unfinished_addresses() {
+        let mut draft = outgoing();
+        draft.in_reply_to = Some("<p@ex.com>".into());
+        draft.references = Some("<o@ex.com> <p@ex.com>".into());
+        let raw = draft_message(&draft, "<d1@ex.com>").unwrap();
+        let parsed = parse_body(&raw);
+        assert_eq!(parsed.message_id.as_deref(), Some("<d1@ex.com>"));
+        assert_eq!(parsed.bcc[0].addr, "secret@ex.com");
+        assert_eq!(parsed.in_reply_to.as_deref(), Some("<p@ex.com>"));
+        assert_eq!(parsed.references.as_deref(), Some("<o@ex.com> <p@ex.com>"));
+        assert_eq!(parsed.text, "Bonjour,\n\nÀ jeudi.");
+        // Half typed: the field stays as written, the others are parsed.
+        draft.to = vec![
+            Recipient::new(None, "paul@ex.com"),
+            Recipient::new(None, "zo"),
+        ];
+        let text = String::from_utf8(draft_message(&draft, "<d2@ex.com>").unwrap()).unwrap();
+        assert!(text.contains("To: paul@ex.com, zo\r\n"), "{text}");
+        assert_eq!(parse_body(text.as_bytes()).cc[0].addr, "chef@ex.com");
+        // Nobody yet: still a draft.
+        draft.to.clear();
+        draft.cc.clear();
+        draft.bcc.clear();
+        let parsed = parse_body(&draft_message(&draft, "<d3@ex.com>").unwrap());
+        assert!(parsed.to.is_empty());
+        assert_eq!(parsed.subject, "Réunion de jeudi");
     }
 
     #[test]
